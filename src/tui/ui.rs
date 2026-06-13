@@ -68,7 +68,7 @@ pub(crate) fn draw(frame: &mut Frame, view: Option<&DashboardView>, chrome: &Chr
         now,
         tz_offset: format::local_offset_secs(now),
         order: view.display_order(now),
-        headers_only: select::headers_only_mode(snapshot, &view.select_params, now),
+        headers_only: select::headers_only_mode(snapshot, &view.select_params, None, now),
     };
     let table_height = (snapshot.accounts.len().max(1) as u16).saturating_add(2);
     // Log console sits at the bottom, between activity and the keybar.
@@ -273,7 +273,7 @@ fn account_row<'a>(
     let snapshot = &view.snapshot;
     let params = &view.select_params;
     let now = ctx.now;
-    let is_current = snapshot.current.as_ref() == Some(&account.id);
+    let is_current = snapshot.is_current(&account.id);
     let gate = select::eligibility(account, params, now, ctx.headers_only);
 
     let marker = match (cursor, is_current) {
@@ -516,7 +516,7 @@ fn draw_summary(frame: &mut Frame, area: Rect, view: &DashboardView, ctx: &Frame
 
     // current + WHY (last committed switch).
     let mut current_spans = vec![label("current")];
-    match &snapshot.current {
+    match snapshot.representative_current() {
         Some(current) => {
             current_spans.push(Span::styled(
                 current.to_string(),
@@ -607,7 +607,7 @@ fn next_in_line(view: &DashboardView, ctx: &FrameCtx) -> Option<String> {
     ctx.order
         .iter()
         .map(|&i| &snapshot.accounts[i])
-        .filter(|a| snapshot.current.as_ref() != Some(&a.id))
+        .filter(|a| !snapshot.is_current(&a.id))
         .find(|a| select::eligibility(a, params, ctx.now, ctx.headers_only).is_none())
         .map(|a| a.id.to_string())
 }
@@ -683,8 +683,7 @@ fn draw_detail(
     let pos = match chrome.mode {
         Mode::Select { idx } => idx.min(ctx.order.len().saturating_sub(1)),
         Mode::Normal => snapshot
-            .current
-            .as_ref()
+            .representative_current()
             .and_then(|cur| {
                 ctx.order
                     .iter()
@@ -698,7 +697,7 @@ fn draw_detail(
     let params = &view.select_params;
     let now = ctx.now;
     let gate = select::eligibility(account, params, now, ctx.headers_only);
-    let is_current = snapshot.current.as_ref() == Some(&account.id);
+    let is_current = snapshot.is_current(&account.id);
 
     let mut lines: Vec<Line> = Vec::with_capacity(7);
     lines.push(Line::from(vec![

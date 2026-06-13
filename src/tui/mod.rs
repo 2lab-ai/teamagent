@@ -357,17 +357,18 @@ impl App {
         let Some(target) = order.get(idx).and_then(|&i| view.snapshot.accounts.get(i)) else {
             return;
         };
-        if view.snapshot.current.as_ref() == Some(&target.id) {
+        if view.snapshot.is_current(&target.id) {
             self.set_status(format!("{} is already active", target.id));
             return;
         }
-        let headers_only = select::headers_only_mode(&view.snapshot, &view.select_params, now);
+        let headers_only =
+            select::headers_only_mode(&view.snapshot, &view.select_params, None, now);
         if let Some(reason) = select::eligibility(target, &view.select_params, now, headers_only) {
             self.set_status(format!("cannot switch to {}: {reason:?}", target.id));
             return;
         }
         let target_id = target.id.clone();
-        let from = view.snapshot.current.clone();
+        let from = view.snapshot.representative_current().cloned();
         match &mut self.backend {
             Backend::Local(state) => {
                 match state.pool.switch_to(&target_id, &view.select_params, now) {

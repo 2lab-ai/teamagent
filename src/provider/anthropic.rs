@@ -93,27 +93,21 @@ impl Provider for AnthropicPassthrough {
     }
 
     /// Identity wrap. Extracts `model` and `stream` from the JSON body when
-    /// present (future routing keys) without touching the body bytes; a
-    /// non-JSON body simply yields no flags — passthrough never fails on
-    /// body shape.
+    /// present without touching the body bytes; a non-JSON body simply yields
+    /// no flags — passthrough never fails on body shape. `model` is now the
+    /// live backend-group routing key (see `routing.rs`); the extraction
+    /// itself is shared via `routing::model_from_body`.
     fn request_out(
         &self,
         anthropic_req: AnthropicRequest,
     ) -> Result<UnifiedRequest, ProviderError> {
-        let (model, stream) = match serde_json::from_slice::<serde_json::Value>(&anthropic_req.body)
-        {
-            Ok(value) => (
-                value
-                    .get("model")
-                    .and_then(|m| m.as_str())
-                    .map(str::to_string),
-                value
-                    .get("stream")
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(false),
-            ),
-            Err(_) => (None, false),
-        };
+        // `model` extraction is shared with the proxy's routing path (one
+        // source of truth: `routing::model_from_body`); `stream` stays local.
+        let model = crate::routing::model_from_body(&anthropic_req.body);
+        let stream = serde_json::from_slice::<serde_json::Value>(&anthropic_req.body)
+            .ok()
+            .and_then(|value| value.get("stream").and_then(serde_json::Value::as_bool))
+            .unwrap_or(false);
         Ok(UnifiedRequest {
             model,
             stream,

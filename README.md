@@ -172,6 +172,13 @@ Config lives at `~/.config/teamagent.json` (respects `$XDG_CONFIG_HOME`; overrid
     "usage_max_age_secs": 600,
     "refresh_ahead_secs": 25200
   },
+  "routing": {
+    "enabled": false,
+    "claude_models": [],
+    "codex_models": [],
+    "default_group": "claude",
+    "on_empty_group": "error"
+  },
   "accounts": [
     {
       "name": "user@example.com",
@@ -208,6 +215,48 @@ Selection happens when the current account becomes ineligible and on periodic ch
 3. Rank Codex accounts last so they behave as overflow/manual backends rather than consuming quota before healthy Claude accounts.
 4. Stick to the selected account until it crosses a threshold, its window resets, it 429s, or the user manually switches.
 5. Honor `retry-after` on 429. If every account is exhausted, return 429 with the soonest reset as `retry-after`.
+
+## Model routing
+
+By default (`routing.enabled = false`) the scheduler treats Codex accounts as a cross-group overflow pool: a request lands on the best Claude/API account and only spills to Codex when every Claude account is exhausted. The inbound `model` is ignored for account selection.
+
+Turn routing **on** (`routing.enabled = true`) to select the backend **group** by the request's `model` instead:
+
+- **claude group** — `oauth` + `apikey` accounts; models `claude-*`, `opus`, `sonnet`, `haiku`, `fable-5`.
+- **codex group** — `codex` accounts; models `gpt-*`, `gpt-5.5`, `codex`, `o1`/`o3`/`o4`.
+
+Within the matched group the existing scheduler picks the best eligible account, sticky **per group** (the Claude pick and the Codex pick advance independently). An unrecognized or absent model falls back to `default_group`.
+
+```json
+"routing": {
+  "enabled": true,
+  "claude_models": [],
+  "codex_models": [],
+  "default_group": "claude",
+  "on_empty_group": "error"
+}
+```
+
+| Key | Default | Meaning |
+|---|---|---|
+| `enabled` | `false` | Off = today's overflow behavior; on = model→group routing. |
+| `claude_models` | `[]` | Models routed to the claude group. Empty keeps the builtin rules; a non-empty list replaces them. |
+| `codex_models` | `[]` | Models routed to the codex group (same semantics). |
+| `default_group` | `"claude"` | Group for an unmatched / model-less request. |
+| `on_empty_group` | `"error"` | When the matched group has no configured account: `"error"` returns a 404 `not_found_error`; `"fallback"` falls back to the other group. |
+
+Override tokens in `claude_models` / `codex_models` are matched in order, first-match-wins, case-insensitively. A bare token is a **prefix** (`"gpt-"`); prefix it with `~` for a **substring** (`"~codex"`) or `=` for an **exact** match (`"=gpt-5.5"`).
+
+### Selecting the codex model from Claude Code
+
+The inbound `model` string **is** the selector — point Claude Code's model at a codex-group model and the proxy routes the request to a Codex account:
+
+```bash
+# Per-session: route this Claude Code session's requests to the codex group
+ANTHROPIC_MODEL=gpt-5.5 claude
+```
+
+or set the model in Claude Code's own model setting (e.g. `/model gpt-5.5`). The Codex provider pins the upstream model to `gpt-5.5` regardless of the exact codex-group model named, so any `gpt-*` / `codex` / `o1`–`o4` string that classifies to the codex group reaches the same upstream — the model string's only job here is to choose the group. `/teamagent/status` reports the per-group current accounts under `current_by_group` (and keeps a representative scalar `current` for back-compat).
 
 ## Codex (gpt-5.5) backend
 

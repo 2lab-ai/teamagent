@@ -10,5 +10,6 @@ pub mod dashboard;
 pub mod logging;
 pub mod provider;
 pub mod proxy;
+pub mod routing;
 pub mod scheduler;
 pub mod tui;

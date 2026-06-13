@@ -85,6 +85,7 @@ impl DashboardView {
                 id: AccountId(a.name.clone()),
                 healthy: a.healthy,
                 credential_kind: kind_static(&a.kind),
+                group: crate::routing::BackendGroup::from_kind(kind_static(&a.kind)),
                 five_hour: window_from_doc(&a.five_hour),
                 seven_day: window_from_doc(&a.seven_day),
                 cooldown_until: a.cooldown_until.map(secs_time),
@@ -97,10 +98,20 @@ impl DashboardView {
                 last_refresh_ms: a.last_refresh_ms,
             })
             .collect();
-        let snapshot = PoolSnapshot {
-            accounts,
-            current: doc.current.clone().map(AccountId),
-        };
+        // The remote dashboard doc carries a representative scalar `current`;
+        // rebuild the per-group map by placing it into its own group's slot
+        // (best-effort — the display only needs to know which row is active).
+        let mut current = std::collections::BTreeMap::new();
+        if let Some(name) = &doc.current {
+            let id = AccountId(name.clone());
+            let group = accounts
+                .iter()
+                .find(|a| a.id == id)
+                .map(|a| a.group)
+                .unwrap_or(crate::routing::BackendGroup::Claude);
+            current.insert(group, id);
+        }
+        let snapshot = PoolSnapshot { accounts, current };
         let session_totals: HashMap<String, Totals> = doc
             .accounts
             .iter()
@@ -334,7 +345,10 @@ mod tests {
         assert_eq!(view.port, 3456);
         assert_eq!(view.uptime, Duration::from_secs(7980));
         assert_eq!(view.display_version(), "0.1.0 (dev dev)");
-        assert_eq!(view.snapshot.current, Some(AccountId("a".into())));
+        assert_eq!(
+            view.snapshot.representative_current(),
+            Some(&AccountId("a".into()))
+        );
 
         let a = &view.snapshot.accounts[0];
         assert_eq!(a.credential_kind, "oauth");

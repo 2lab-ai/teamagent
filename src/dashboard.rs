@@ -490,7 +490,7 @@ pub(crate) fn account_status_blocked(
         "auth_failed"
     } else if cooling {
         "cooldown"
-    } else if snapshot.current.as_ref() == Some(&account.id) {
+    } else if snapshot.is_current(&account.id) {
         "active"
     } else {
         "ok"
@@ -530,7 +530,7 @@ pub(crate) fn dashboard_doc(
     now: SystemTime,
     meta: &DocMeta,
 ) -> DashboardDoc {
-    let headers_only = select::headers_only_mode(snapshot, params, now);
+    let headers_only = select::headers_only_mode(snapshot, params, None, now);
     let order = select::selection_order(snapshot, params, now);
     let accounts: Vec<AccountDoc> = order
         .iter()
@@ -583,7 +583,7 @@ pub(crate) fn dashboard_doc(
     let next_in_line = order
         .iter()
         .map(|&i| &snapshot.accounts[i])
-        .filter(|a| snapshot.current.as_ref() != Some(&a.id))
+        .filter(|a| !snapshot.is_current(&a.id))
         .find(|a| select::eligibility(a, params, now, headers_only).is_none())
         .map(|a| a.id.0.clone());
     let tick = meta.evaluate_tick_secs.max(1);
@@ -661,7 +661,7 @@ pub(crate) fn dashboard_doc(
         pid: meta.pid,
         uptime_secs: meta.uptime_secs,
         port: meta.port,
-        current: snapshot.current.as_ref().map(|c| c.0.clone()),
+        current: snapshot.representative_current().map(|c| c.0.clone()),
         upstream: meta.upstream.clone(),
         config_path: meta.config_path.clone(),
         select_params: SelectParamsDoc::from(params),
@@ -817,7 +817,7 @@ mod tests {
 
     fn seeded_doc() -> DashboardDoc {
         let pool = AccountPool::new(&[oauth_account("a"), oauth_account("b")]);
-        pool.evaluate(&params(), now());
+        pool.evaluate(None, &params(), now());
         pool.record_headers(
             &AccountId("a".into()),
             &ParsedRateLimitHeaders {

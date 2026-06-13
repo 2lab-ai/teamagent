@@ -32,6 +32,7 @@ use super::server::AppState;
 use super::sse::{self, SseTransform as _};
 use crate::config::AccountCredential;
 use crate::provider::{anthropic, AnthropicRequest, Provider as _, ProviderRequest};
+use crate::routing::BackendGroup;
 use crate::scheduler::select::{self, Decision};
 use crate::scheduler::{headers as rl_headers, AccountId};
 use crate::tui::{ActivityEvent, TokenCounts};
@@ -174,6 +175,13 @@ struct ForwardContext {
     /// Correlates RequestStarted → Routed → Finished in the activity feed.
     activity_id: u64,
     started: std::time::Instant,
+    /// The model named in the request body (for the routing log line).
+    model: Option<String>,
+    /// The backend group this request routes to, OR `None` when routing is
+    /// disabled (the legacy single-slot / cross-group-overflow path). When
+    /// `Some`, the scheduler is filtered to that group and the leased
+    /// credential must belong to it.
+    group: Option<BackendGroup>,
 }
 
 impl ForwardContext {
@@ -254,6 +262,12 @@ fn exhausted_response(retry_after: Option<Duration>, accounts: usize) -> Respons
     response
 }
 
+/// Routing dead-end: the model's backend group has no configured account and
+/// `on_empty_group="error"` — a clean Anthropic-shaped 404 not_found_error.
+fn not_found_response(message: &str) -> Response {
+    error_response(StatusCode::NOT_FOUND, "not_found_error", message)
+}
+
 /// Transient upstream failure: 502 + `Connection: close` (see module docs —
 /// the axum-feasible equivalent of Node's socket destroy).
 fn transient_response(detail: &str) -> Response {
@@ -307,6 +321,15 @@ pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response 
         }
     };
     let log_enabled = state.logger.is_some();
+    // Parse the model once (body is buffered) and classify to a backend group.
+    // Routing disabled ⇒ group = None (legacy single-slot path); the
+    // classifier is not consulted on the forward path in that case.
+    let model = crate::routing::model_from_body(&body);
+    let group = if state.config.routing.enabled {
+        Some(state.classifier.classify(model.as_deref()))
+    } else {
+        None
+    };
     let mut ctx = ForwardContext {
         method: parts.method,
         path_query,
@@ -321,6 +344,8 @@ pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response 
         sections: Vec::new(),
         activity_id,
         started,
+        model,
+        group,
     };
     if log_enabled && !ctx.body.is_empty() {
         ctx.log(format!(
@@ -334,16 +359,25 @@ pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response 
 
 async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Response {
     let params = state.select_params();
-    let accounts = state.pool.snapshot().accounts.len();
+    let snapshot = state.pool.snapshot();
+    let accounts = snapshot.accounts.len();
     let max_switches = accounts.max(1);
     let mut switches = 0usize;
     let mut same_account_waits = 0u32;
     // Accounts already granted their one forced post-401 refresh.
     let mut force_refreshed: HashSet<AccountId> = HashSet::new();
 
+    // Resolve the effective routing group, applying `on_empty_group` when the
+    // model's group has no configured account. `None` = legacy path.
+    let group = match resolve_group(state, ctx, &snapshot) {
+        Ok(group) => group,
+        Err(response) => return *response,
+    };
+
     loop {
-        // 1. Lease the current account (evaluate on demand when none).
-        let lease = match acquire_lease(state, &params) {
+        // 1. Lease the current account for the group (evaluate on demand when
+        // none).
+        let lease = match acquire_lease(state, group, &params) {
             Ok(lease) => lease,
             Err(retry_after) => {
                 ctx.log("=== ERROR ===\nall accounts exhausted".to_string());
@@ -358,6 +392,44 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
         };
         let account = lease.account_id().clone();
         let mut credential = lease.credential().clone();
+        // Routing invariant: when a group filter is active the leased
+        // credential MUST belong to that group — a mismatch is a routing bug
+        // (the scheduler handed back an out-of-group account), never served.
+        if let Some(group) = group {
+            let leased_group = BackendGroup::from_kind(credential.kind());
+            if leased_group != group {
+                tracing::error!(
+                    account = %account, ?group, ?leased_group,
+                    "routing bug: leased credential does not match the request group"
+                );
+                ctx.log(format!(
+                    "=== ERROR ===\nrouting bug: {account} is {leased_group} but request routed to {group}"
+                ));
+                ctx.flush_log(state);
+                drop(lease);
+                ctx.emit_finished(
+                    state,
+                    Some(&account),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    None,
+                );
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "proxy_error",
+                    "internal routing error: account/group mismatch",
+                );
+            }
+        }
+        // One-line routing trace: model → group → account.
+        tracing::info!(
+            model = ctx.model.as_deref().unwrap_or("<none>"),
+            group = group.map(|g| g.as_str()).unwrap_or("legacy"),
+            account = %account,
+            "routing: model={} -> group={} -> account={}",
+            ctx.model.as_deref().unwrap_or("<none>"),
+            group.map(|g| g.as_str()).unwrap_or("legacy"),
+            account,
+        );
         state.emit(ActivityEvent::RequestRouted {
             id: ctx.activity_id,
             account: account.0.clone(),
@@ -398,7 +470,16 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
         // 3. Codex accounts serve the Messages API only: count_tokens is
         // answered locally with a naive estimate (no upstream equivalent);
         // any other endpoint is a clear 501.
-        let is_codex = matches!(credential, AccountCredential::Codex { .. });
+        //
+        // With routing ON the codex path is driven by the request's GROUP
+        // (`group == Codex`) — which, by the invariant asserted above, always
+        // matches the leased credential's kind. With routing OFF (`group` is
+        // `None`) it falls back to the legacy credential check (codex stays
+        // the cross-group overflow pool).
+        let is_codex = match group {
+            Some(g) => g == BackendGroup::Codex,
+            None => matches!(credential, AccountCredential::Codex { .. }),
+        };
         if is_codex {
             let path = ctx.path_query.split('?').next().unwrap_or("").to_string();
             if path == "/v1/messages/count_tokens" {
@@ -510,7 +591,7 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
         if !parsed.is_empty() {
             let now = SystemTime::now();
             state.pool.record_headers(&account, &parsed, now);
-            reevaluate_if_current_ineligible(state, &params, &account, now);
+            reevaluate_if_current_ineligible(state, group, &params, &account, now);
         }
 
         // 5. Taxonomy.
@@ -633,23 +714,25 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
 /// `AccountSwitched` when a switch commits.
 fn reevaluate_if_current_ineligible(
     state: &AppState,
+    group: Option<BackendGroup>,
     params: &select::SelectParams,
     account: &AccountId,
     now: SystemTime,
 ) {
+    let slot = group.unwrap_or(BackendGroup::Claude);
     let snapshot = state.pool.snapshot();
-    if snapshot.current.as_ref() != Some(account) {
+    if snapshot.current.get(&slot) != Some(account) {
         return;
     }
     let Some(target) = snapshot.accounts.iter().find(|a| &a.id == account) else {
         return;
     };
-    let headers_only = select::headers_only_mode(&snapshot, params, now);
+    let headers_only = select::headers_only_mode(&snapshot, params, group, now);
     let Some(reason) = select::eligibility(target, params, now, headers_only) else {
         return; // still eligible — session stickiness holds
     };
-    let before = snapshot.current.clone();
-    if let Decision::Switch { to } = state.pool.evaluate(params, now) {
+    let before = snapshot.current.get(&slot).cloned();
+    if let Decision::Switch { to } = state.pool.evaluate(group, params, now) {
         tracing::info!(from = %account, to = %to, ?reason, "current account became ineligible; switched");
         state.emit(ActivityEvent::AccountSwitched {
             from: before.map(|id| id.0),
@@ -659,21 +742,69 @@ fn reevaluate_if_current_ineligible(
     }
 }
 
-/// Lease the current account; when that fails, run one selection pass and
-/// try once more. `Err` carries the soonest-reset hint for the client 429.
+/// Lease the current account for `group`; when that fails, run one selection
+/// pass and try once more. `Err` carries the soonest-reset hint for the
+/// client 429.
 fn acquire_lease(
     state: &AppState,
+    group: Option<BackendGroup>,
     params: &crate::scheduler::select::SelectParams,
 ) -> Result<crate::scheduler::AccountLease, Option<Duration>> {
-    if let Ok(lease) = state.pool.lease_current() {
+    if let Ok(lease) = state.pool.lease_for(group) {
         return Ok(lease);
     }
-    match state.pool.evaluate(params, SystemTime::now()) {
+    match state.pool.evaluate(group, params, SystemTime::now()) {
         Decision::Exhausted { retry_after } => Err(retry_after),
         Decision::Stay | Decision::Switch { .. } => {
-            state.pool.lease_current().map_err(|err| err.retry_after)
+            state.pool.lease_for(group).map_err(|err| err.retry_after)
         }
     }
+}
+
+/// Resolve the effective routing group for a request, applying the
+/// `on_empty_group` policy. Returns:
+/// - `Ok(None)` — routing disabled (legacy single-slot path).
+/// - `Ok(Some(group))` — routing on; the model's group has ≥1 configured
+///   account (or `on_empty_group="fallback"` redirected to a group that does).
+/// - `Err(response)` — `on_empty_group="error"` and the matched group has no
+///   configured account: a clean Anthropic-shaped 404 not_found_error. The
+///   other group's accounts are left untouched.
+fn resolve_group(
+    state: &AppState,
+    ctx: &ForwardContext,
+    snapshot: &crate::scheduler::PoolSnapshot,
+) -> Result<Option<BackendGroup>, Box<Response>> {
+    let Some(group) = ctx.group else {
+        return Ok(None); // routing disabled
+    };
+    let has_account = |g: BackendGroup| snapshot.accounts.iter().any(|a| a.group == g);
+    if has_account(group) {
+        return Ok(Some(group));
+    }
+    // Matched group is empty — apply the policy.
+    let model = ctx.model.as_deref().unwrap_or("<none>");
+    if state
+        .config
+        .routing
+        .on_empty_group
+        .eq_ignore_ascii_case("fallback")
+    {
+        let other = match group {
+            BackendGroup::Claude => BackendGroup::Codex,
+            BackendGroup::Codex => BackendGroup::Claude,
+        };
+        if has_account(other) {
+            tracing::info!(
+                model, from = %group, to = %other,
+                "routing: matched group empty; on_empty_group=fallback → other group"
+            );
+            return Ok(Some(other));
+        }
+        // Neither group has an account — fall through to the 404.
+    }
+    let message = format!("no {group} account configured for model {model}");
+    tracing::warn!(model, %group, "routing: {message}");
+    Err(Box::new(not_found_response(&message)))
 }
 
 /// Expiry of a refreshable (oauth-style) credential: anthropic `Oauth` and
@@ -1554,7 +1685,7 @@ mod tests {
         state.config_path = None; // never touch the real user config in tests
         state
             .pool
-            .evaluate(&state.select_params(), SystemTime::now());
+            .evaluate(None, &state.select_params(), SystemTime::now());
         state
     }
 
@@ -1652,7 +1783,7 @@ mod tests {
             .find(|acct| acct.id.0 == "a")
             .expect("a");
         assert!(a.cooldown_until.is_some(), "a parked by record_429");
-        assert_eq!(snapshot.current, Some(AccountId("b".into())));
+        assert_eq!(snapshot.legacy_current(), Some(&AccountId("b".into())));
     }
 
     #[tokio::test]
@@ -1691,7 +1822,7 @@ mod tests {
             snapshot.accounts[0].cooldown_until.is_none(),
             "short wait does not park"
         );
-        assert_eq!(snapshot.current, Some(AccountId("a".into())));
+        assert_eq!(snapshot.legacy_current(), Some(&AccountId("a".into())));
     }
 
     #[tokio::test]
@@ -1800,7 +1931,7 @@ mod tests {
             .find(|acct| acct.id.0 == "a")
             .expect("a");
         assert!(!a.healthy, "a marked AuthFailed after the second 401");
-        assert_eq!(snapshot.current, Some(AccountId("b".into())));
+        assert_eq!(snapshot.legacy_current(), Some(&AccountId("b".into())));
     }
 
     #[tokio::test]

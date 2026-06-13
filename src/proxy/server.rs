@@ -98,6 +98,11 @@ pub struct AppState {
     /// The OpenAI Codex provider (Responses API translation) for
     /// `type: "codex"` accounts. Holds the per-process session id.
     pub codex: Arc<crate::provider::codex::CodexProvider>,
+    /// Model→backend-group classifier, built from `config.routing`. When
+    /// routing is disabled it is the builtin classifier and is never consulted
+    /// for routing (forward passes `group = None`); it is still held so the
+    /// status/eval paths can ask whether routing is on.
+    pub classifier: Arc<crate::routing::Classifier>,
     /// Coalesces concurrent OAuth refreshes per account.
     pub refresher: Arc<RefreshCoalescer>,
     /// Per-account relayed-traffic totals for `/teamagent/status`.
@@ -155,6 +160,14 @@ impl AppState {
         let codex = Arc::new(crate::provider::codex::CodexProvider::new(
             config.codex.upstream.clone(),
         ));
+        // The classifier is built from config.routing whether or not routing
+        // is enabled (it is simply not consulted on the forward path while
+        // disabled — forward passes group = None).
+        let classifier = Arc::new(crate::routing::Classifier::from_config(
+            &config.routing.claude_models,
+            &config.routing.codex_models,
+            &config.routing.default_group,
+        ));
         // A non-default upstream (staging, e2e mock) must also receive the
         // proxy's OWN token refreshes — otherwise refresh traffic would leak
         // to the production endpoint while everything else is redirected.
@@ -172,6 +185,7 @@ impl AppState {
             logger,
             provider,
             codex,
+            classifier,
             refresher: Arc::new(refresher),
             totals: Arc::new(UsageTotals::default()),
             config_path: crate::config::config_path().ok(),
@@ -277,12 +291,16 @@ pub async fn serve(
     .with_events(state.events.clone());
     poller.tick(SystemTime::now()).await;
 
-    // Initial selection so the first request doesn't pay for it.
-    state.pool.evaluate(&params, SystemTime::now());
-    if let Some(current) = state.pool.snapshot().current {
+    // Initial selection so the first request doesn't pay for it. Evaluate
+    // every backend group that has at least one account (with routing
+    // disabled this is just the legacy slot — `evaluate(None, ..)`).
+    for group in eval_groups(&state.pool, state.config.routing.enabled) {
+        state.pool.evaluate(group, &params, SystemTime::now());
+    }
+    if let Some(current) = state.pool.snapshot().representative_current() {
         state.emit(ActivityEvent::AccountSwitched {
             from: None,
-            to: current.0,
+            to: current.0.clone(),
             reason: Some("initial selection".into()),
         });
     }
@@ -303,21 +321,25 @@ pub async fn serve(
 
     let tick_pool = state.pool.clone();
     let tick_events = state.events.clone();
+    let tick_routing_enabled = state.config.routing.enabled;
     let tick_task = tokio::spawn(async move {
         let mut interval = tokio::time::interval(EVALUATE_TICK);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
-            let before = tick_pool.snapshot().current;
-            let decision = tick_pool.evaluate(&params, SystemTime::now());
-            tracing::debug!(?decision, "evaluation tick");
-            if let crate::scheduler::select::Decision::Switch { to } = decision {
-                if let Some(events) = &tick_events {
-                    let _ = events.try_send(ActivityEvent::AccountSwitched {
-                        from: before.map(|id| id.0),
-                        to: to.0,
-                        reason: Some("re-evaluation".into()),
-                    });
+            for group in eval_groups(&tick_pool, tick_routing_enabled) {
+                let slot = group.unwrap_or(crate::routing::BackendGroup::Claude);
+                let before = tick_pool.snapshot().current.get(&slot).cloned();
+                let decision = tick_pool.evaluate(group, &params, SystemTime::now());
+                tracing::debug!(?group, ?decision, "evaluation tick");
+                if let crate::scheduler::select::Decision::Switch { to } = decision {
+                    if let Some(events) = &tick_events {
+                        let _ = events.try_send(ActivityEvent::AccountSwitched {
+                            from: before.map(|id| id.0),
+                            to: to.0,
+                            reason: Some("re-evaluation".into()),
+                        });
+                    }
                 }
             }
         }
@@ -353,6 +375,26 @@ pub async fn serve(
         fold_task.abort();
     }
     result.map_err(ProxyError::Io)
+}
+
+/// The set of group filters to evaluate on each scheduler tick. With routing
+/// DISABLED this is a single `[None]` — the legacy single-slot path, byte-for
+/// -byte the old behavior. With routing ENABLED it is one `Some(group)` per
+/// distinct backend group that has at least one account in the pool, so each
+/// group's sticky slot is kept current independently. Groups with no accounts
+/// are skipped (nothing to select).
+pub fn eval_groups(
+    pool: &AccountPool,
+    routing_enabled: bool,
+) -> Vec<Option<crate::routing::BackendGroup>> {
+    if !routing_enabled {
+        return vec![None];
+    }
+    let mut groups: Vec<crate::routing::BackendGroup> =
+        pool.snapshot().accounts.iter().map(|a| a.group).collect();
+    groups.sort();
+    groups.dedup();
+    groups.into_iter().map(Some).collect()
 }
 
 /// One background-refresh pass (A2): refresh every HEALTHY oauth-style
@@ -509,7 +551,7 @@ pub fn status_json(
         }),
         None => serde_json::Value::Null,
     };
-    let headers_only = crate::scheduler::select::headers_only_mode(snapshot, params, now);
+    let headers_only = crate::scheduler::select::headers_only_mode(snapshot, params, None, now);
     let accounts: Vec<serde_json::Value> =
         crate::scheduler::select::selection_order(snapshot, params, now)
             .into_iter()
@@ -521,7 +563,7 @@ pub fn status_json(
                     "auth_failed"
                 } else if cooling {
                     "cooldown"
-                } else if snapshot.current.as_ref() == Some(&account.id) {
+                } else if snapshot.is_current(&account.id) {
                     "active"
                 } else {
                     "ok"
@@ -556,12 +598,21 @@ pub fn status_json(
                 })
             })
             .collect();
+    // Additive: `current` stays a representative scalar (claude slot if
+    // present, else codex) for back-compat with older CLI parsers; the new
+    // `current_by_group` object exposes the per-group sticky slots.
+    let current_by_group: serde_json::Map<String, serde_json::Value> = snapshot
+        .current
+        .iter()
+        .map(|(group, id)| (group.as_str().to_string(), serde_json::json!(id.0)))
+        .collect();
     serde_json::json!({
         "version": crate::build_info::version_string(),
         "pid": meta.pid,
         "uptime_secs": meta.uptime_secs,
         "port": meta.port,
-        "current": snapshot.current.as_ref().map(|c| c.0.clone()),
+        "current": snapshot.representative_current().map(|c| c.0.clone()),
+        "current_by_group": current_by_group,
         "accounts": accounts,
     })
 }
@@ -630,11 +681,15 @@ async fn switch_endpoint(
 ) -> Response {
     let target = AccountId(body.account.clone());
     let now = SystemTime::now();
-    let from = state.pool.snapshot().current;
+    let from = state
+        .pool
+        .snapshot()
+        .representative_current()
+        .map(|c| c.0.clone());
     match state.pool.switch_to(&target, &state.select_params(), now) {
         Ok(()) => {
             state.emit(ActivityEvent::AccountSwitched {
-                from: from.map(|id| id.0),
+                from,
                 to: target.0.clone(),
                 reason: Some("manual".into()),
             });
@@ -821,7 +876,7 @@ mod tests {
     fn status_json_shape_covers_name_type_status_windows_and_totals() {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
         let pool = AccountPool::new(&[oauth_account("a"), apikey_account("k")]);
-        pool.evaluate(&params(), now);
+        pool.evaluate(None, &params(), now);
         pool.record_headers(
             &AccountId("a".into()),
             &ParsedRateLimitHeaders {
@@ -902,7 +957,7 @@ mod tests {
             *last_refresh_ms = Some(999_820_000); // 3m before `now`
         }
         let pool = AccountPool::new(&[account, apikey_account("k")]);
-        pool.evaluate(&params(), now);
+        pool.evaluate(None, &params(), now);
         let meta = ServerMeta {
             pid: 1,
             uptime_secs: 0,

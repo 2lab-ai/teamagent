@@ -11,13 +11,22 @@ pub mod select;
 pub mod usage;
 pub mod window;
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime};
 
 use crate::config::{AccountConfig, AccountCredential};
+use crate::routing::BackendGroup;
 use headers::{ParsedRateLimitHeaders, WindowReading};
 use usage::UsageSnapshot;
 use window::{QuotaWindow, WindowSource};
+
+/// The group slot used for the legacy (routing-disabled) selection path:
+/// when callers pass `group = None`, a SINGLE shared current slot is used so
+/// behavior is byte-for-byte unchanged. `Claude` is that slot. Routing-on
+/// callers always pass `Some(group)`, so the legacy slot never coexists with
+/// real per-group slots in one process.
+const LEGACY_GROUP: BackendGroup = BackendGroup::Claude;
 
 /// Heuristic cooldown applied to a 429 without `retry-after` (soma-work
 /// default: 60 minutes). Self-healed early by fresh data showing capacity.
@@ -138,9 +147,12 @@ impl AccountState {
 #[derive(Debug, Clone, Default)]
 pub struct PoolState {
     pub accounts: Vec<AccountState>,
-    /// Currently selected account (session stickiness). `None` until the
-    /// first selection or when every account is exhausted.
-    pub current: Option<AccountId>,
+    /// Currently selected account PER backend group (session stickiness,
+    /// independent per group). A group is absent until its first selection
+    /// and removed when its accounts are all exhausted. With routing
+    /// disabled only the [`LEGACY_GROUP`] slot is ever populated, so the map
+    /// degenerates to the single-current-slot behavior of before.
+    pub current: BTreeMap<BackendGroup, AccountId>,
 }
 
 /// Switch failed; nothing was mutated.
@@ -165,7 +177,7 @@ impl PoolState {
     pub fn from_accounts(accounts: &[AccountConfig]) -> Self {
         Self {
             accounts: accounts.iter().map(AccountState::fresh).collect(),
-            current: None,
+            current: BTreeMap::new(),
         }
     }
 
@@ -296,14 +308,16 @@ impl PoolState {
     /// in-flight leases — they keep their pinned credential until Drop.
     pub fn commit_switch(
         &mut self,
+        group: Option<BackendGroup>,
         expected_current: Option<&AccountId>,
         target: &AccountId,
         params: &select::SelectParams,
         now: SystemTime,
     ) -> Result<(), SwitchError> {
-        if self.current.as_ref() != expected_current {
+        let slot = group.unwrap_or(LEGACY_GROUP);
+        if self.current.get(&slot) != expected_current {
             return Err(SwitchError::CurrentChanged {
-                actual: self.current.clone(),
+                actual: self.current.get(&slot).cloned(),
             });
         }
         let snapshot = self.snapshot();
@@ -312,14 +326,14 @@ impl PoolState {
             .iter()
             .find(|a| &a.id == target)
             .ok_or_else(|| SwitchError::UnknownAccount(target.clone()))?;
-        let headers_only = select::headers_only_mode(&snapshot, params, now);
+        let headers_only = select::headers_only_mode(&snapshot, params, group, now);
         if let Some(reason) = select::eligibility(target_snapshot, params, now, headers_only) {
             return Err(SwitchError::TargetIneligible {
                 account: target.clone(),
                 reason,
             });
         }
-        self.current = Some(target.clone());
+        self.current.insert(slot, target.clone());
         Ok(())
     }
 
@@ -333,6 +347,7 @@ impl PoolState {
                     id: a.id.clone(),
                     healthy: a.health == AccountHealth::Healthy,
                     credential_kind: a.credential.kind(),
+                    group: BackendGroup::from_kind(a.credential.kind()),
                     five_hour: a.five_hour,
                     seven_day: a.seven_day,
                     cooldown_until: a.cooldown_until,
@@ -355,12 +370,45 @@ impl PoolState {
     }
 }
 
+impl PoolSnapshot {
+    /// The current account for one backend group, if any.
+    pub fn current_for_group(&self, group: BackendGroup) -> Option<&AccountId> {
+        self.current.get(&group)
+    }
+
+    /// The current account for the legacy / group-less path (routing
+    /// disabled): the [`LEGACY_GROUP`] slot.
+    pub fn legacy_current(&self) -> Option<&AccountId> {
+        self.current.get(&LEGACY_GROUP)
+    }
+
+    /// A single representative current account for scalar status output and
+    /// for the many display readers that show "the" active account: the
+    /// claude-group slot if present, else the codex-group slot. With routing
+    /// disabled this is exactly the legacy current.
+    pub fn representative_current(&self) -> Option<&AccountId> {
+        self.current
+            .get(&BackendGroup::Claude)
+            .or_else(|| self.current.get(&BackendGroup::Codex))
+    }
+
+    /// Whether `id` is the current account in ANY group — the predicate the
+    /// display layer uses to mark the active row(s).
+    pub fn is_current(&self, id: &AccountId) -> bool {
+        self.current.values().any(|c| c == id)
+    }
+}
+
 /// Read-only projection of one account for selection / status.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AccountSnapshot {
     pub id: AccountId,
     pub healthy: bool,
     pub credential_kind: &'static str,
+    /// Backend group this account belongs to, derived from `credential_kind`
+    /// (codex credential → Codex, oauth/apikey → Claude). The selector's
+    /// group filter and per-group stickiness key off this.
+    pub group: BackendGroup,
     pub five_hour: Option<QuotaWindow>,
     pub seven_day: Option<QuotaWindow>,
     pub cooldown_until: Option<SystemTime>,
@@ -381,7 +429,8 @@ pub struct AccountSnapshot {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct PoolSnapshot {
     pub accounts: Vec<AccountSnapshot>,
-    pub current: Option<AccountId>,
+    /// Current account per backend group (see [`PoolState::current`]).
+    pub current: BTreeMap<BackendGroup, AccountId>,
 }
 
 /// Shared handle around `PoolState`. Cheap to clone; every method takes the
@@ -426,19 +475,24 @@ impl AccountPool {
             .map(|a| a.credential.clone())
     }
 
-    /// Lease the CURRENT account for one request: clones its credential and
+    /// Lease the CURRENT account for one request within `group` (or the
+    /// legacy single slot when `group` is `None`): clones its credential and
     /// increments `in_flight`. The lease pins the account for the request's
     /// lifetime — switching away never affects live leases. Errors when no
-    /// account is selected or the current one is hard-down (auth failure /
-    /// active cooldown); threshold drift is left to the evaluation tick,
-    /// per session stickiness.
-    pub fn lease_current(&self) -> Result<AccountLease, NoAccountAvailable> {
+    /// account is selected for the group or the current one is hard-down
+    /// (auth failure / active cooldown); threshold drift is left to the
+    /// evaluation tick, per session stickiness.
+    pub fn lease_for(
+        &self,
+        group: Option<BackendGroup>,
+    ) -> Result<AccountLease, NoAccountAvailable> {
+        let slot = group.unwrap_or(LEGACY_GROUP);
         let now = SystemTime::now();
         let mut state = self.write();
         let no_account = |state: &PoolState| NoAccountAvailable {
             retry_after: select::soonest_reset(&state.snapshot(), now),
         };
-        let Some(current) = state.current.clone() else {
+        let Some(current) = state.current.get(&slot).cloned() else {
             return Err(no_account(&state));
         };
         let unusable = match state.accounts.iter().find(|a| a.id == current) {
@@ -471,14 +525,21 @@ impl AccountPool {
     /// per-request. Snapshot, decision, and commit happen under ONE write
     /// lock, so the CAS cannot race (the CAS in `commit_switch` still guards
     /// direct external callers).
-    pub fn evaluate(&self, params: &select::SelectParams, now: SystemTime) -> select::Decision {
+    pub fn evaluate(
+        &self,
+        group: Option<BackendGroup>,
+        params: &select::SelectParams,
+        now: SystemTime,
+    ) -> select::Decision {
+        let slot = group.unwrap_or(LEGACY_GROUP);
         let mut state = self.write();
         let snapshot = state.snapshot();
-        let decision = select::pick(&snapshot, params, now);
+        let decision = select::pick(&snapshot, params, group, now);
         match &decision {
             select::Decision::Stay => decision,
             select::Decision::Switch { to } => {
-                match state.commit_switch(snapshot.current.as_ref(), to, params, now) {
+                let expected = snapshot.current.get(&slot);
+                match state.commit_switch(group, expected, to, params, now) {
                     Ok(()) => decision,
                     // Unreachable while the write lock is held (pick and
                     // commit see the same state) — degrade honestly anyway.
@@ -491,9 +552,9 @@ impl AccountPool {
                 }
             }
             select::Decision::Exhausted { .. } => {
-                // Nothing usable: clear `current` so lease_current refuses
-                // until a later evaluation finds capacity again.
-                state.current = None;
+                // Nothing usable in this group: clear its slot so lease_for
+                // refuses until a later evaluation finds capacity again.
+                state.current.remove(&slot);
                 decision
             }
         }
@@ -512,8 +573,20 @@ impl AccountPool {
         now: SystemTime,
     ) -> Result<(), SwitchError> {
         let mut state = self.write();
-        let expected = state.current.clone();
-        state.commit_switch(expected.as_ref(), target, params, now)
+        // A manual switch lands the target into ITS OWN group's slot (derived
+        // from the target's credential kind) — so switching a codex account
+        // never displaces the claude slot and vice versa. An unknown target
+        // is reported by commit_switch.
+        let group = state
+            .accounts
+            .iter()
+            .find(|a| &a.id == target)
+            .map(|a| BackendGroup::from_kind(a.credential.kind()));
+        let Some(group) = group else {
+            return Err(SwitchError::UnknownAccount(target.clone()));
+        };
+        let expected = state.current.get(&group).cloned();
+        state.commit_switch(Some(group), expected.as_ref(), target, params, now)
     }
 
     pub fn record_headers(
@@ -569,11 +642,11 @@ impl AccountPool {
                 }
             })
             .collect();
-        if let Some(current) = &state.current {
-            if !next.iter().any(|a| &a.id == current) {
-                state.current = None;
-            }
-        }
+        // Drop any group slot whose current account no longer exists; other
+        // slots keep their sticky selection.
+        state
+            .current
+            .retain(|_, current| next.iter().any(|a| &a.id == current));
         state.accounts = next;
     }
 }
@@ -684,7 +757,7 @@ mod tests {
     fn from_accounts_starts_cold_and_healthy() {
         let state = PoolState::from_accounts(&[oauth_account("a"), apikey_account("b")]);
         assert_eq!(state.accounts.len(), 2);
-        assert!(state.current.is_none());
+        assert!(state.current.is_empty());
         for acct in &state.accounts {
             assert_eq!(acct.health, AccountHealth::Healthy);
             assert!(acct.five_hour.is_none());
@@ -853,12 +926,22 @@ mod tests {
         }
     }
 
+    /// Legacy (routing-disabled) current — these tests drive the `None`
+    /// group, so the single legacy slot holds the selection.
+    fn legacy(state: &PoolState) -> Option<AccountId> {
+        state.current.get(&LEGACY_GROUP).cloned()
+    }
+
+    fn snap_legacy(pool: &AccountPool) -> Option<AccountId> {
+        pool.snapshot().legacy_current().cloned()
+    }
+
     #[test]
     fn commit_switch_cas_aborts_on_changed_current() {
         let mut state = PoolState::from_accounts(&[oauth_account("a"), oauth_account("b")]);
-        state.current = Some(id("a"));
+        state.current.insert(LEGACY_GROUP, id("a"));
         let err = state
-            .commit_switch(None, &id("b"), &params(), now())
+            .commit_switch(None, None, &id("b"), &params(), now())
             .unwrap_err();
         assert_eq!(
             err,
@@ -866,14 +949,14 @@ mod tests {
                 actual: Some(id("a")),
             }
         );
-        assert_eq!(state.current, Some(id("a")), "nothing mutated on abort");
+        assert_eq!(legacy(&state), Some(id("a")), "nothing mutated on abort");
     }
 
     #[test]
     fn commit_switch_rejects_unknown_target() {
         let mut state = PoolState::from_accounts(&[oauth_account("a")]);
         let err = state
-            .commit_switch(None, &id("ghost"), &params(), now())
+            .commit_switch(None, None, &id("ghost"), &params(), now())
             .unwrap_err();
         assert_eq!(err, SwitchError::UnknownAccount(id("ghost")));
     }
@@ -884,7 +967,7 @@ mod tests {
         // Target b 429s between selection and commit.
         state.record_429(&id("b"), Some(Duration::from_secs(60)), now());
         let err = state
-            .commit_switch(None, &id("b"), &params(), now())
+            .commit_switch(None, None, &id("b"), &params(), now())
             .unwrap_err();
         assert_eq!(
             err,
@@ -893,26 +976,26 @@ mod tests {
                 reason: IneligibleReason::CoolingDown,
             }
         );
-        assert!(state.current.is_none());
+        assert!(legacy(&state).is_none());
     }
 
     #[test]
     fn commit_switch_applies_on_clean_cas() {
         let mut state = PoolState::from_accounts(&[oauth_account("a"), oauth_account("b")]);
-        state.current = Some(id("a"));
-        let current = state.current.clone();
+        state.current.insert(LEGACY_GROUP, id("a"));
+        let current = legacy(&state);
         state
-            .commit_switch(current.as_ref(), &id("b"), &params(), now())
+            .commit_switch(None, current.as_ref(), &id("b"), &params(), now())
             .unwrap();
-        assert_eq!(state.current, Some(id("b")));
+        assert_eq!(legacy(&state), Some(id("b")));
     }
 
     #[test]
     fn evaluate_initial_selection_commits() {
         let pool = AccountPool::new(&[oauth_account("a")]);
-        let decision = pool.evaluate(&params(), now());
+        let decision = pool.evaluate(None, &params(), now());
         assert_eq!(decision, Decision::Switch { to: id("a") });
-        assert_eq!(pool.snapshot().current, Some(id("a")));
+        assert_eq!(snap_legacy(&pool), Some(id("a")));
     }
 
     #[test]
@@ -920,37 +1003,37 @@ mod tests {
         let pool = AccountPool::new(&[oauth_account("a"), oauth_account("b")]);
         // a wins the initial id tiebreak.
         assert_eq!(
-            pool.evaluate(&params(), now()),
+            pool.evaluate(None, &params(), now()),
             Decision::Switch { to: id("a") }
         );
-        assert_eq!(pool.evaluate(&params(), now()), Decision::Stay);
+        assert_eq!(pool.evaluate(None, &params(), now()), Decision::Stay);
         pool.record_429(&id("a"), Some(Duration::from_secs(120)), now());
         assert_eq!(
-            pool.evaluate(&params(), now()),
+            pool.evaluate(None, &params(), now()),
             Decision::Switch { to: id("b") }
         );
-        assert_eq!(pool.snapshot().current, Some(id("b")));
+        assert_eq!(snap_legacy(&pool), Some(id("b")));
     }
 
     #[test]
     fn evaluate_exhausted_clears_current_and_reports_reset() {
         let pool = AccountPool::new(&[oauth_account("a")]);
         assert_eq!(
-            pool.evaluate(&params(), now()),
+            pool.evaluate(None, &params(), now()),
             Decision::Switch { to: id("a") }
         );
         pool.record_429(&id("a"), Some(Duration::from_secs(2)), now());
         assert_eq!(
-            pool.evaluate(&params(), now()),
+            pool.evaluate(None, &params(), now()),
             Decision::Exhausted {
                 retry_after: Some(Duration::from_secs(2)),
             }
         );
-        assert!(pool.snapshot().current.is_none());
-        assert!(pool.lease_current().is_err());
+        assert!(snap_legacy(&pool).is_none());
+        assert!(pool.lease_for(None).is_err());
         // After the park expires the account is selectable again.
         assert_eq!(
-            pool.evaluate(&params(), at(NOW_SECS + 3)),
+            pool.evaluate(None, &params(), at(NOW_SECS + 3)),
             Decision::Switch { to: id("a") }
         );
     }
@@ -958,12 +1041,12 @@ mod tests {
     #[test]
     fn switch_to_eligible_target_commits_and_refuses_ineligible() {
         let pool = AccountPool::new(&[oauth_account("a"), oauth_account("b")]);
-        pool.evaluate(&params(), now());
-        assert_eq!(pool.snapshot().current, Some(id("a")));
+        pool.evaluate(None, &params(), now());
+        assert_eq!(snap_legacy(&pool), Some(id("a")));
 
         // Eligible target: manual switch commits.
         pool.switch_to(&id("b"), &params(), now()).unwrap();
-        assert_eq!(pool.snapshot().current, Some(id("b")));
+        assert_eq!(snap_legacy(&pool), Some(id("b")));
 
         // Ineligible target (parked by a 429): refused, current unchanged.
         pool.record_429(&id("a"), Some(Duration::from_secs(60)), now());
@@ -975,7 +1058,7 @@ mod tests {
                 reason: IneligibleReason::CoolingDown,
             }
         );
-        assert_eq!(pool.snapshot().current, Some(id("b")));
+        assert_eq!(snap_legacy(&pool), Some(id("b")));
 
         // Unknown target: refused.
         let err = pool.switch_to(&id("ghost"), &params(), now()).unwrap_err();
@@ -985,12 +1068,12 @@ mod tests {
     #[test]
     fn switch_to_does_not_cancel_in_flight_leases() {
         let pool = AccountPool::new(&[oauth_account("a"), oauth_account("b")]);
-        pool.evaluate(&params(), now());
-        let lease = pool.lease_current().unwrap();
+        pool.evaluate(None, &params(), now());
+        let lease = pool.lease_for(None).unwrap();
         assert_eq!(lease.account_id(), &id("a"));
 
         pool.switch_to(&id("b"), &params(), now()).unwrap();
-        assert_eq!(pool.snapshot().current, Some(id("b")));
+        assert_eq!(snap_legacy(&pool), Some(id("b")));
         assert_eq!(
             pool.snapshot().accounts[0].in_flight,
             1,
@@ -1003,8 +1086,8 @@ mod tests {
     #[test]
     fn lease_pins_credential_across_switch_and_refresh() {
         let pool = AccountPool::new(&[oauth_account("a"), oauth_account("b")]);
-        pool.evaluate(&params(), now());
-        let lease = pool.lease_current().unwrap();
+        pool.evaluate(None, &params(), now());
+        let lease = pool.lease_for(None).unwrap();
         assert_eq!(lease.account_id(), &id("a"));
         assert_eq!(pool.snapshot().accounts[0].in_flight, 1);
 
@@ -1021,8 +1104,8 @@ mod tests {
             },
         );
         pool.record_429(&id("a"), Some(Duration::from_secs(60)), now());
-        pool.evaluate(&params(), now());
-        assert_eq!(pool.snapshot().current, Some(id("b")));
+        pool.evaluate(None, &params(), now());
+        assert_eq!(snap_legacy(&pool), Some(id("b")));
         match lease.credential() {
             AccountCredential::Oauth { access_token, .. } => {
                 assert_eq!(access_token, "at-a", "lease keeps the credential clone");
@@ -1039,36 +1122,126 @@ mod tests {
     }
 
     #[test]
-    fn lease_current_without_selection_reports_soonest_reset() {
+    fn lease_for_without_selection_reports_soonest_reset() {
         let pool = AccountPool::new(&[oauth_account("a")]);
         pool.record_429(&id("a"), Some(Duration::from_secs(3600)), SystemTime::now());
-        let err = pool.lease_current().unwrap_err();
+        let err = pool.lease_for(None).unwrap_err();
         assert!(err.retry_after.is_some());
     }
 
     #[test]
-    fn lease_current_refuses_cooling_current() {
+    fn lease_for_refuses_cooling_current() {
         let pool = AccountPool::new(&[oauth_account("a")]);
-        pool.evaluate(&params(), now());
-        // Park far in the future relative to the real clock used by lease_current.
+        pool.evaluate(None, &params(), now());
+        // Park far in the future relative to the real clock used by lease_for.
         pool.record_429(&id("a"), Some(Duration::from_secs(3600)), SystemTime::now());
-        assert!(pool.lease_current().is_err());
+        assert!(pool.lease_for(None).is_err());
     }
 
     #[test]
     fn reload_preserves_state_and_clears_removed_current() {
         let pool = AccountPool::new(&[oauth_account("a"), oauth_account("b")]);
-        pool.evaluate(&params(), now());
-        assert_eq!(pool.snapshot().current, Some(id("a")));
+        pool.evaluate(None, &params(), now());
+        assert_eq!(snap_legacy(&pool), Some(id("a")));
         pool.record_429(&id("b"), Some(Duration::from_secs(60)), now());
 
         // Drop a, keep b (cooldown must survive), add c.
         pool.reload_accounts(&[oauth_account("b"), oauth_account("c")]);
         let snapshot = pool.snapshot();
-        assert!(snapshot.current.is_none(), "removed current is cleared");
+        assert!(
+            snapshot.legacy_current().is_none(),
+            "removed current is cleared"
+        );
         let b = snapshot.accounts.iter().find(|a| a.id == id("b")).unwrap();
         assert!(b.cooldown_until.is_some(), "surviving account keeps state");
         assert!(snapshot.accounts.iter().any(|a| a.id == id("c")));
         assert!(!snapshot.accounts.iter().any(|a| a.id == id("a")));
+    }
+
+    // ---- per-group sticky (routing enabled) ----
+
+    fn codex_account(name: &str) -> AccountConfig {
+        AccountConfig {
+            name: name.to_string(),
+            credential: AccountCredential::Codex {
+                account_id: format!("acct-{name}"),
+                access_token: format!("at-{name}"),
+                refresh_token: format!("rt-{name}"),
+                expires_at_ms: 0,
+                last_refresh_ms: None,
+            },
+        }
+    }
+
+    #[test]
+    fn evaluate_keeps_independent_current_per_group() {
+        let pool = AccountPool::new(&[oauth_account("a"), codex_account("cx")]);
+        // Selecting the claude group lands on the oauth account; selecting the
+        // codex group lands on the codex account — independent slots.
+        assert_eq!(
+            pool.evaluate(Some(BackendGroup::Claude), &params(), now()),
+            Decision::Switch { to: id("a") }
+        );
+        assert_eq!(
+            pool.evaluate(Some(BackendGroup::Codex), &params(), now()),
+            Decision::Switch { to: id("cx") }
+        );
+        let snapshot = pool.snapshot();
+        assert_eq!(
+            snapshot.current_for_group(BackendGroup::Claude),
+            Some(&id("a"))
+        );
+        assert_eq!(
+            snapshot.current_for_group(BackendGroup::Codex),
+            Some(&id("cx"))
+        );
+    }
+
+    #[test]
+    fn group_filtered_evaluate_only_selects_in_group() {
+        let pool = AccountPool::new(&[oauth_account("a"), codex_account("cx")]);
+        // The codex group only ever selects the codex account, never the
+        // claude one, even though it would win on id order.
+        assert_eq!(
+            pool.evaluate(Some(BackendGroup::Codex), &params(), now()),
+            Decision::Switch { to: id("cx") }
+        );
+        // Lease for the codex group returns the codex account.
+        let lease = pool.lease_for(Some(BackendGroup::Codex)).unwrap();
+        assert_eq!(lease.account_id(), &id("cx"));
+    }
+
+    #[test]
+    fn empty_group_evaluates_to_exhausted() {
+        // Only a claude account exists; the codex group has nothing.
+        let pool = AccountPool::new(&[oauth_account("a")]);
+        assert_eq!(
+            pool.evaluate(Some(BackendGroup::Codex), &params(), now()),
+            Decision::Exhausted { retry_after: None }
+        );
+        assert!(pool.lease_for(Some(BackendGroup::Codex)).is_err());
+        // The claude group is unaffected.
+        assert_eq!(
+            pool.evaluate(Some(BackendGroup::Claude), &params(), now()),
+            Decision::Switch { to: id("a") }
+        );
+    }
+
+    #[test]
+    fn switch_to_sets_targets_own_group_slot() {
+        let pool = AccountPool::new(&[oauth_account("a"), codex_account("cx")]);
+        pool.evaluate(Some(BackendGroup::Claude), &params(), now());
+        // Manually switching to the codex account sets the CODEX slot, leaving
+        // the claude slot intact.
+        pool.switch_to(&id("cx"), &params(), now()).unwrap();
+        let snapshot = pool.snapshot();
+        assert_eq!(
+            snapshot.current_for_group(BackendGroup::Claude),
+            Some(&id("a"))
+        );
+        assert_eq!(
+            snapshot.current_for_group(BackendGroup::Codex),
+            Some(&id("cx"))
+        );
     }
 }

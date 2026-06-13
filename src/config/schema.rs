@@ -32,6 +32,10 @@ pub struct Config {
     pub codex: CodexConfig,
     #[serde(default)]
     pub scheduler: SchedulerConfig,
+    /// Model→backend-group routing (default: disabled — exactly today's
+    /// overflow behavior). See [`RoutingConfig`].
+    #[serde(default)]
+    pub routing: RoutingConfig,
     #[serde(default)]
     pub accounts: Vec<AccountConfig>,
 }
@@ -44,7 +48,52 @@ impl Default for Config {
             upstream: default_upstream(),
             codex: CodexConfig::default(),
             scheduler: SchedulerConfig::default(),
+            routing: RoutingConfig::default(),
             accounts: Vec::new(),
+        }
+    }
+}
+
+/// Model→backend-group routing config. When `enabled` is false (the
+/// default), routing is OFF and the scheduler behaves exactly as before:
+/// no group filter anywhere, codex accounts stay the cross-group overflow
+/// pool. When `enabled` is true, an inbound request's `model` selects a
+/// backend group (claude vs codex) and the scheduler picks within that
+/// group, sticky per group.
+///
+/// Empty `claude_models` / `codex_models` keep the builtin rules for that
+/// group (see [`crate::routing::Classifier`]); a non-empty list replaces the
+/// builtins for that group. All fields are additive (`#[serde(default)]`),
+/// so a config written before routing existed loads with `enabled = false`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoutingConfig {
+    /// Master switch. `false` (default) = today's behavior, no group filter.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Models routed to the claude group (empty → builtin claude rules).
+    #[serde(default)]
+    pub claude_models: Vec<String>,
+    /// Models routed to the codex group (empty → builtin codex rules).
+    #[serde(default)]
+    pub codex_models: Vec<String>,
+    /// Group an unmatched / model-less request routes to. Default `"claude"`.
+    #[serde(default = "default_routing_group")]
+    pub default_group: String,
+    /// What to do when the matched group has no eligible/configured account:
+    /// `"error"` (default) returns a clean 404 not_found_error; `"fallback"`
+    /// falls back to the other group's normal selection.
+    #[serde(default = "default_on_empty_group")]
+    pub on_empty_group: String,
+}
+
+impl Default for RoutingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            claude_models: Vec::new(),
+            codex_models: Vec::new(),
+            default_group: default_routing_group(),
+            on_empty_group: default_on_empty_group(),
         }
     }
 }
@@ -354,4 +403,12 @@ fn default_usage_max_age_secs() -> u64 {
 
 fn default_refresh_ahead_secs() -> u64 {
     7 * 3600
+}
+
+fn default_routing_group() -> String {
+    "claude".to_string()
+}
+
+fn default_on_empty_group() -> String {
+    "error".to_string()
 }

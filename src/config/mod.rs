@@ -9,7 +9,8 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 pub use schema::{
-    AccountConfig, AccountCredential, CodexConfig, Config, ProxyConfig, SchedulerConfig, Upsert,
+    AccountConfig, AccountCredential, CodexConfig, Config, ProxyConfig, RoutingConfig,
+    SchedulerConfig, Upsert,
 };
 
 /// Environment variable overriding the config file location.
@@ -385,6 +386,40 @@ mod tests {
         let config: Config = serde_json::from_str(r#"{ "version": 1 }"#).expect("parse");
         assert_eq!(config.codex.upstream, schema::DEFAULT_CODEX_UPSTREAM);
         assert_eq!(config.codex.token_url, schema::DEFAULT_CODEX_TOKEN_URL);
+    }
+
+    #[test]
+    fn routing_config_is_additive_and_defaults_to_disabled() {
+        // A config written before routing existed (no `routing` key) loads
+        // with routing OFF — the backward-compat guarantee. enabled=false ⇒
+        // exactly today's behavior.
+        let config: Config =
+            serde_json::from_str(r#"{ "version": 1 }"#).expect("old config parses");
+        assert!(!config.routing.enabled, "routing defaults to disabled");
+        assert_eq!(config.routing.default_group, "claude");
+        assert_eq!(config.routing.on_empty_group, "error");
+        assert!(config.routing.claude_models.is_empty());
+        assert!(config.routing.codex_models.is_empty());
+
+        // An explicit routing block round-trips through save→load.
+        let raw = r#"{
+            "version": 1,
+            "routing": {
+                "enabled": true,
+                "codex_models": ["gpt-", "~codex"],
+                "default_group": "codex",
+                "on_empty_group": "fallback"
+            }
+        }"#;
+        let config: Config = serde_json::from_str(raw).expect("routing config parses");
+        assert!(config.routing.enabled);
+        assert_eq!(config.routing.codex_models, vec!["gpt-", "~codex"]);
+        assert_eq!(config.routing.default_group, "codex");
+        assert_eq!(config.routing.on_empty_group, "fallback");
+        let reparsed: Config =
+            serde_json::from_str(&serde_json::to_string(&config).expect("serialize"))
+                .expect("re-parse");
+        assert_eq!(reparsed.routing, config.routing);
     }
 
     #[test]

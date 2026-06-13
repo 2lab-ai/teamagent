@@ -119,9 +119,16 @@ has no usage poller, so staleness does not gate it; quota thresholds still gate 
 ## Provider dispatch and request flow
 
 1. Buffer incoming request body and create an activity item.
-2. Acquire an `AccountLease`; the selected credential determines provider:
+2. Acquire an `AccountLease`. When `routing.enabled` (see `routing.rs`), the request's
+   `model` first selects a backend **group** (claude vs codex; the model field — previously
+   only carried through `UnifiedRequest` as a future routing key — now drives selection), the
+   scheduler is filtered to that group, and the lease is sticky per group. The leased
+   credential then determines the provider:
    - `oauth` / `apikey` → `AnthropicPassthrough`.
    - `codex` → `CodexProvider`.
+
+   With routing disabled (default) no group filter is applied: a single legacy current slot is
+   used and codex stays the cross-group overflow pool — exactly the prior behavior.
 3. Refresh credential if near expiry; on one 401, force refresh and retry once.
 4. Build provider request:
    - Anthropic: identity body, inject Bearer or x-api-key.
@@ -161,6 +168,13 @@ has no usage poller, so staleness does not gate it; quota thresholds still gate 
     "usage_poll_secs": 300,
     "usage_max_age_secs": 600,
     "refresh_ahead_secs": 25200
+  },
+  "routing": {            // model→backend-group routing; all keys default-able
+    "enabled": false,    // false = today's overflow behavior (no group filter)
+    "claude_models": [],  // empty = builtin rules; non-empty replaces them
+    "codex_models": [],
+    "default_group": "claude",   // unmatched / model-less request lands here
+    "on_empty_group": "error"    // "error" = 404 not_found_error; "fallback" = other group
   },
   "accounts": [
     { "name": "a@x.com", "type": "oauth", "account_uuid": "...",

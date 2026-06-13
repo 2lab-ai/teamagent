@@ -266,7 +266,7 @@ async fn threshold_crossing_switches_next_request_but_not_in_flight() {
     )
     .await;
     assert_eq!(
-        proxy.pool.snapshot().current,
+        proxy.pool.snapshot().legacy_current().cloned(),
         Some(AccountId("a".into())),
         "initial selection lands on a (stable id order, cold pool)"
     );
@@ -291,7 +291,7 @@ async fn threshold_crossing_switches_next_request_but_not_in_flight() {
     // happens on header receipt, before the body finishes streaming).
     let mut switched = false;
     for _ in 0..100 {
-        if proxy.pool.snapshot().current == Some(AccountId("b".into())) {
+        if proxy.pool.snapshot().legacy_current().cloned() == Some(AccountId("b".into())) {
             switched = true;
             break;
         }
@@ -355,7 +355,7 @@ async fn scheduler_picks_account_with_sooner_seven_day_reset() {
     .await;
 
     assert_eq!(
-        proxy.pool.snapshot().current,
+        proxy.pool.snapshot().legacy_current().cloned(),
         Some(AccountId("b".into())),
         "initial selection ranks by soonest 7d reset"
     );
@@ -1357,7 +1357,7 @@ async fn dashboard_endpoint_serves_the_attach_document() {
     )
     .await;
     assert_eq!(
-        proxy.pool.snapshot().current,
+        proxy.pool.snapshot().legacy_current().cloned(),
         Some(AccountId("b".into())),
         "initial selection ranks by soonest 7d reset"
     );
@@ -1477,7 +1477,10 @@ async fn switch_endpoint_switches_current_account() {
         vec![oauth_account("a", "at-a"), oauth_account("b", "at-b")],
     )
     .await;
-    assert_eq!(proxy.pool.snapshot().current, Some(AccountId("a".into())));
+    assert_eq!(
+        proxy.pool.snapshot().legacy_current().cloned(),
+        Some(AccountId("a".into()))
+    );
 
     let client = reqwest::Client::new();
     // Loopback peer with a deliberately wrong key: still accepted (exempt),
@@ -1494,7 +1497,7 @@ async fn switch_endpoint_switches_current_account() {
     assert_eq!(body["ok"], true);
     assert_eq!(body["current"], "b");
     assert_eq!(
-        proxy.pool.snapshot().current,
+        proxy.pool.snapshot().legacy_current().cloned(),
         Some(AccountId("b".into())),
         "the pool's current account moved to b"
     );
@@ -1510,7 +1513,7 @@ async fn switch_endpoint_switches_current_account() {
     let body: serde_json::Value = response.json().await.expect("error json");
     assert_eq!(body["error"]["type"], "proxy_error");
     assert_eq!(
-        proxy.pool.snapshot().current,
+        proxy.pool.snapshot().legacy_current().cloned(),
         Some(AccountId("b".into())),
         "a refused switch leaves the current account unchanged"
     );
@@ -1553,7 +1556,211 @@ async fn shutdown_endpoint_stops_the_server() {
 }
 
 // ---------------------------------------------------------------------------
-// 11. Brew install (manual)
+// 11. Model-aware backend-group routing
+// ---------------------------------------------------------------------------
+
+/// Mixed claude+codex config with model routing ENABLED, both codex
+/// endpoints pointed at the mock. `on_empty` selects the empty-group policy.
+fn routing_config(mock: &MockUpstream, accounts: Vec<AccountConfig>, on_empty: &str) -> Config {
+    let mut config = Config {
+        upstream: mock.base_url(),
+        accounts,
+        ..Default::default()
+    };
+    config.codex.upstream = mock.base_url();
+    config.codex.token_url = format!("{}/v1/oauth/token", mock.base_url());
+    config.routing.enabled = true;
+    config.routing.on_empty_group = on_empty.to_string();
+    config
+}
+
+/// Routing on: a `{"model":"gpt-5.5"}` request is routed to the CODEX group
+/// and served by the codex account — the upstream sees a translated
+/// Responses-API request with codex headers + the codex bearer, never the
+/// claude account.
+#[tokio::test]
+async fn gpt_5_5_request_leases_codex_account() {
+    let mock = MockUpstream::spawn().await;
+    mock.push(ScriptedResponse::sse_codex(CODEX_LIVE_SSE, 64, &[]));
+    let proxy = Proxy::spawn_config(routing_config(
+        &mock,
+        vec![
+            oauth_account("claude-acct", "at-claude"),
+            codex_account("codex-acct", "at-codex"),
+        ],
+        "error",
+    ))
+    .await;
+
+    let client = reqwest::Client::new();
+    let response = post_messages(
+        &client,
+        &proxy,
+        r#"{"model":"gpt-5.5","stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+    )
+    .await;
+    assert_eq!(response.status(), 200, "gpt-5.5 routed to a codex account");
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok()),
+        Some("text/event-stream"),
+        "codex stream translated to Anthropic SSE"
+    );
+    let _ = response.bytes().await.expect("body");
+
+    // The codex account served it: upstream saw the Responses path, the codex
+    // bearer, and codex headers — the claude account was never touched.
+    let seen = mock.seen();
+    assert_eq!(seen.len(), 1, "exactly one upstream request");
+    assert_eq!(seen[0].path, "/responses", "served by the codex provider");
+    assert_eq!(
+        seen[0].authorization.as_deref(),
+        Some("Bearer at-codex"),
+        "leased the CODEX account, not the claude account"
+    );
+    assert_eq!(
+        seen[0].chatgpt_account_id.as_deref(),
+        Some("acct-codex-acct")
+    );
+    let upstream_body: serde_json::Value = serde_json::from_slice(&seen[0].body).expect("json");
+    assert_eq!(
+        upstream_body["model"], "gpt-5.5",
+        "codex provider pins gpt-5.5 upstream"
+    );
+
+    // The codex slot is current; the claude slot is independent.
+    let snapshot = proxy.pool.snapshot();
+    assert_eq!(
+        snapshot
+            .current_for_group(teamagent::routing::BackendGroup::Codex)
+            .map(|c| c.0.as_str()),
+        Some("codex-acct")
+    );
+}
+
+/// Routing on: an `{"model":"opus"}` request is routed to the CLAUDE group
+/// and served by the oauth account via the Anthropic passthrough — the
+/// upstream sees the claude account's bearer, body byte-identical.
+#[tokio::test]
+async fn opus_request_leases_claude_account() {
+    const UPSTREAM_BODY: &str = r#"{"id":"msg_opus","type":"message"}"#;
+    let mock = MockUpstream::spawn().await;
+    mock.push(ScriptedResponse::ok(UPSTREAM_BODY));
+    let proxy = Proxy::spawn_config(routing_config(
+        &mock,
+        vec![
+            oauth_account("claude-acct", "at-claude"),
+            codex_account("codex-acct", "at-codex"),
+        ],
+        "error",
+    ))
+    .await;
+
+    let client = reqwest::Client::new();
+    let response = post_messages(
+        &client,
+        &proxy,
+        r#"{"model":"opus","messages":[{"role":"user","content":"hi"}]}"#,
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+    let body = response.bytes().await.expect("body");
+    assert_eq!(body.as_ref(), UPSTREAM_BODY.as_bytes(), "passthrough relay");
+
+    let seen = mock.seen();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].path, "/v1/messages", "Anthropic passthrough path");
+    assert_eq!(
+        seen[0].authorization.as_deref(),
+        Some("Bearer at-claude"),
+        "leased the CLAUDE account, not the codex account"
+    );
+
+    let snapshot = proxy.pool.snapshot();
+    assert_eq!(
+        snapshot
+            .current_for_group(teamagent::routing::BackendGroup::Claude)
+            .map(|c| c.0.as_str()),
+        Some("claude-acct")
+    );
+}
+
+/// Routing DISABLED is exactly today's behavior: with a claude + codex
+/// account, a `gpt-5.5` request still lands on the anthropic (claude) account
+/// — codex stays the cross-group overflow pool (cold codex ranks last), so
+/// the model string is irrelevant and the request is a plain passthrough.
+#[tokio::test]
+async fn routing_disabled_preserves_overflow_behavior() {
+    const UPSTREAM_BODY: &str = r#"{"id":"msg_legacy","type":"message"}"#;
+    let mock = MockUpstream::spawn().await;
+    mock.push(ScriptedResponse::ok(UPSTREAM_BODY));
+    // codex_config keeps routing.enabled at its default (false).
+    let proxy = Proxy::spawn_config(codex_config(
+        &mock,
+        vec![
+            oauth_account("claude-acct", "at-claude"),
+            codex_account("codex-acct", "at-codex"),
+        ],
+    ))
+    .await;
+
+    let client = reqwest::Client::new();
+    let response = post_messages(&client, &proxy, r#"{"model":"gpt-5.5"}"#).await;
+    assert_eq!(response.status(), 200);
+    let body = response.bytes().await.expect("body");
+    assert_eq!(body.as_ref(), UPSTREAM_BODY.as_bytes());
+
+    let seen = mock.seen();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(
+        seen[0].path, "/v1/messages",
+        "no routing → Anthropic passthrough, NOT /responses"
+    );
+    assert_eq!(
+        seen[0].authorization.as_deref(),
+        Some("Bearer at-claude"),
+        "overflow behavior: gpt-5.5 lands on the anthropic account, codex is overflow"
+    );
+}
+
+/// Routing on + `on_empty_group="error"`: a `gpt-5.5` request when only a
+/// claude account is configured returns a clean Anthropic 404 not_found_error
+/// and NEVER touches the claude account.
+#[tokio::test]
+async fn empty_codex_group_errors() {
+    let mock = MockUpstream::spawn().await;
+    let proxy = Proxy::spawn_config(routing_config(
+        &mock,
+        vec![oauth_account("claude-acct", "at-claude")],
+        "error",
+    ))
+    .await;
+
+    let client = reqwest::Client::new();
+    let response = post_messages(&client, &proxy, r#"{"model":"gpt-5.5"}"#).await;
+    assert_eq!(response.status(), 404, "empty codex group → 404");
+    let value: serde_json::Value =
+        serde_json::from_slice(&response.bytes().await.expect("body")).expect("json");
+    assert_eq!(value["error"]["type"], "not_found_error");
+    assert!(
+        value["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("codex"),
+        "message names the missing group"
+    );
+
+    // The claude account was never leased.
+    assert!(
+        mock.seen().is_empty(),
+        "claude account untouched by an empty-codex-group request"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 12. Brew install (manual)
 // ---------------------------------------------------------------------------
 
 /// Acceptance #9: `brew install 2lab-ai/tap/teamagent-preview` installs a

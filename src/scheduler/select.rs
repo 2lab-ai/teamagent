@@ -9,6 +9,7 @@ use std::time::{Duration, SystemTime};
 
 use super::{AccountId, AccountSnapshot, PoolSnapshot};
 use crate::config::SchedulerConfig;
+use crate::routing::BackendGroup;
 
 /// Selection thresholds, derived from `SchedulerConfig`.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -129,10 +130,23 @@ pub fn freshest_live_fetch(account: &AccountSnapshot, now: SystemTime) -> Option
 /// 429-driven behavior — better to try a stale account (upstream will 429 if
 /// it's actually exhausted) than to refuse service because the usage
 /// endpoint is down.
-pub fn headers_only_mode(snapshot: &PoolSnapshot, params: &SelectParams, now: SystemTime) -> bool {
+///
+/// `group` scopes the decision to one backend group when `Some` (routing on)
+/// — staleness in the codex group must not flip the claude group into
+/// headers-only mode and vice versa. `None` (routing off) considers every
+/// account, exactly as before.
+pub fn headers_only_mode(
+    snapshot: &PoolSnapshot,
+    params: &SelectParams,
+    group: Option<BackendGroup>,
+    now: SystemTime,
+) -> bool {
     let mut any_eligible = false;
     let mut any_stale_only = false;
     for account in &snapshot.accounts {
+        if !in_group(account, group) {
+            continue;
+        }
         match eligibility(account, params, now, false) {
             None => any_eligible = true,
             Some(IneligibleReason::UsageStale) => any_stale_only = true,
@@ -142,34 +156,62 @@ pub fn headers_only_mode(snapshot: &PoolSnapshot, params: &SelectParams, now: Sy
     !any_eligible && any_stale_only
 }
 
+/// Whether an account is in the selection scope: every account when `group`
+/// is `None` (routing off), only same-group accounts when `Some`.
+fn in_group(account: &AccountSnapshot, group: Option<BackendGroup>) -> bool {
+    group.is_none_or(|g| account.group == g)
+}
+
 /// THE selection algorithm (FR3): gate, then rank eligible accounts by
 /// soonest 7d `resets_at` (use-it-or-lose-it), tiebreak lower 5h effective
 /// utilization, then stable id order.
 ///
-/// Stickiness contract: if the snapshot's `current` is still eligible this
+/// Stickiness contract: if the group's `current` is still eligible this
 /// returns `Stay` even when another account would rank higher. A missing 5h
 /// window means a cold account (utilization 0, immediately eligible).
-pub fn pick(snapshot: &PoolSnapshot, params: &SelectParams, now: SystemTime) -> Decision {
-    let headers_only = headers_only_mode(snapshot, params, now);
+///
+/// `group` scopes selection to one backend group when `Some` (routing on):
+/// only same-group accounts are eligible, stickiness keys off that group's
+/// current slot, and the codex `tier`-last rank rule becomes a no-op (every
+/// candidate is already in-group). `None` (routing off) keeps the legacy
+/// behavior: all accounts considered, the single legacy current slot, codex
+/// kept as the cross-group overflow tier.
+pub fn pick(
+    snapshot: &PoolSnapshot,
+    params: &SelectParams,
+    group: Option<BackendGroup>,
+    now: SystemTime,
+) -> Decision {
+    let headers_only = headers_only_mode(snapshot, params, group, now);
     let eligible: Vec<&AccountSnapshot> = snapshot
         .accounts
         .iter()
+        .filter(|a| in_group(a, group))
         .filter(|a| eligibility(a, params, now, headers_only).is_none())
         .collect();
 
-    if let Some(current) = &snapshot.current {
+    if let Some(current) = group_current(snapshot, group) {
         if eligible.iter().any(|a| &a.id == current) {
             return Decision::Stay;
         }
     }
 
-    match eligible.into_iter().min_by(|a, b| rank(a, b, now)) {
+    match eligible.into_iter().min_by(|a, b| rank(a, b, group, now)) {
         Some(best) => Decision::Switch {
             to: best.id.clone(),
         },
         None => Decision::Exhausted {
             retry_after: soonest_reset(snapshot, now),
         },
+    }
+}
+
+/// The current account for the active selection scope: the group's slot when
+/// `Some`, the legacy slot when `None`.
+fn group_current(snapshot: &PoolSnapshot, group: Option<BackendGroup>) -> Option<&AccountId> {
+    match group {
+        Some(g) => snapshot.current_for_group(g),
+        None => snapshot.legacy_current(),
     }
 }
 
@@ -180,11 +222,23 @@ pub fn pick(snapshot: &PoolSnapshot, params: &SelectParams, now: SystemTime) -> 
 /// leftover quota evaporates), then lower 5h effective utilization, then
 /// stable id. Accounts with no live 7d window rank AFTER accounts with a
 /// known reset — unknown expiry can't be use-it-or-lose-it prioritized.
-fn rank(a: &AccountSnapshot, b: &AccountSnapshot, now: SystemTime) -> Ordering {
-    let tier = |x: &AccountSnapshot| u8::from(x.credential_kind == "codex");
-    let by_tier = tier(a).cmp(&tier(b));
-    if by_tier != Ordering::Equal {
-        return by_tier;
+///
+/// Under a group filter (`group.is_some()`, routing on) the codex `tier`-last
+/// rule is a NO-OP: every candidate is already in the same group, so there is
+/// no cross-group overflow to demote. It is kept for the `None` (legacy) path
+/// where codex is the cross-group overflow tier.
+fn rank(
+    a: &AccountSnapshot,
+    b: &AccountSnapshot,
+    group: Option<BackendGroup>,
+    now: SystemTime,
+) -> Ordering {
+    if group.is_none() {
+        let tier = |x: &AccountSnapshot| u8::from(x.credential_kind == "codex");
+        let by_tier = tier(a).cmp(&tier(b));
+        if by_tier != Ordering::Equal {
+            return by_tier;
+        }
     }
     let reset_a = live_reset(&a.seven_day, now);
     let reset_b = live_reset(&b.seven_day, now);
@@ -224,12 +278,16 @@ pub fn selection_order(
     params: &SelectParams,
     now: SystemTime,
 ) -> Vec<usize> {
-    let headers_only = headers_only_mode(snapshot, params, now);
+    // The display lists ALL accounts (across groups), so it ranks with the
+    // legacy comparator (codex overflow last) and treats an account as
+    // "current" if it is the current pick for ANY group.
+    let group = None;
+    let headers_only = headers_only_mode(snapshot, params, group, now);
     let mut current: Vec<usize> = Vec::new();
     let mut eligible: Vec<usize> = Vec::new();
     let mut ineligible: Vec<usize> = Vec::new();
     for (idx, account) in snapshot.accounts.iter().enumerate() {
-        if snapshot.current.as_ref() == Some(&account.id) {
+        if snapshot.is_current(&account.id) {
             current.push(idx);
         } else if eligibility(account, params, now, headers_only).is_none() {
             eligible.push(idx);
@@ -237,7 +295,7 @@ pub fn selection_order(
             ineligible.push(idx);
         }
     }
-    eligible.sort_by(|&a, &b| rank(&snapshot.accounts[a], &snapshot.accounts[b], now));
+    eligible.sort_by(|&a, &b| rank(&snapshot.accounts[a], &snapshot.accounts[b], group, now));
     current
         .into_iter()
         .chain(eligible)
@@ -381,6 +439,7 @@ mod tests {
             id: AccountId(id.to_string()),
             healthy: true,
             credential_kind: "oauth",
+            group: BackendGroup::Claude,
             five_hour: None,
             seven_day: None,
             cooldown_until: None,
@@ -391,10 +450,16 @@ mod tests {
         }
     }
 
+    /// Build a snapshot whose legacy current slot is `current` (the
+    /// routing-disabled path these tests exercise).
     fn pool(accounts: Vec<AccountSnapshot>, current: Option<&str>) -> PoolSnapshot {
+        let mut map = std::collections::BTreeMap::new();
+        if let Some(c) = current {
+            map.insert(BackendGroup::Claude, AccountId(c.to_string()));
+        }
         PoolSnapshot {
             accounts,
-            current: current.map(|c| AccountId(c.to_string())),
+            current: map,
         }
     }
 
@@ -531,7 +596,7 @@ mod tests {
         a.seven_day = Some(window(0.5, 48 * HOUR));
         let mut b = account("b");
         b.seven_day = Some(window(0.5, 12 * HOUR)); // resets sooner: use it or lose it
-        let decision = pick(&pool(vec![a, b], None), &params(), now());
+        let decision = pick(&pool(vec![a, b], None), &params(), None, now());
         assert_eq!(decision, Decision::Switch { to: id("b") });
     }
 
@@ -543,7 +608,7 @@ mod tests {
         let mut b = account("b");
         b.seven_day = Some(window(0.5, 24 * HOUR));
         b.five_hour = Some(window(0.20, HOUR));
-        let decision = pick(&pool(vec![a, b], None), &params(), now());
+        let decision = pick(&pool(vec![a, b], None), &params(), None, now());
         assert_eq!(decision, Decision::Switch { to: id("b") });
     }
 
@@ -552,6 +617,7 @@ mod tests {
         let decision = pick(
             &pool(vec![account("bravo"), account("alpha")], None),
             &params(),
+            None,
             now(),
         );
         assert_eq!(decision, Decision::Switch { to: id("alpha") });
@@ -562,7 +628,7 @@ mod tests {
         let cold = account("aaa"); // would win an id tiebreak
         let mut known = account("zzz");
         known.seven_day = Some(window(0.5, 24 * HOUR));
-        let decision = pick(&pool(vec![cold, known], None), &params(), now());
+        let decision = pick(&pool(vec![cold, known], None), &params(), None, now());
         assert_eq!(
             decision,
             Decision::Switch { to: id("zzz") },
@@ -573,6 +639,7 @@ mod tests {
     fn codex_account(id: &str) -> AccountSnapshot {
         let mut a = account(id);
         a.credential_kind = "codex";
+        a.group = BackendGroup::Codex;
         a
     }
 
@@ -582,7 +649,7 @@ mod tests {
         // override that: codex is the overflow pool, never the default pick.
         let codex = codex_account("aaa");
         let anthropic = account("zzz");
-        let decision = pick(&pool(vec![codex, anthropic], None), &params(), now());
+        let decision = pick(&pool(vec![codex, anthropic], None), &params(), None, now());
         assert_eq!(decision, Decision::Switch { to: id("zzz") });
     }
 
@@ -591,7 +658,7 @@ mod tests {
         let codex = codex_account("a-codex");
         let mut anthropic = account("b-known");
         anthropic.seven_day = Some(window(0.5, 48 * HOUR));
-        let decision = pick(&pool(vec![codex, anthropic], None), &params(), now());
+        let decision = pick(&pool(vec![codex, anthropic], None), &params(), None, now());
         assert_eq!(decision, Decision::Switch { to: id("b-known") });
     }
 
@@ -600,7 +667,7 @@ mod tests {
         let codex = codex_account("codex");
         let mut over = account("anthropic");
         over.five_hour = Some(window(0.95, HOUR));
-        let decision = pick(&pool(vec![codex, over], None), &params(), now());
+        let decision = pick(&pool(vec![codex, over], None), &params(), None, now());
         assert_eq!(
             decision,
             Decision::Switch { to: id("codex") },
@@ -626,6 +693,95 @@ mod tests {
         assert_eq!(ordered_ids(&snapshot), vec!["b-anthropic", "a-codex"]);
     }
 
+    // ---- group filter (routing enabled) ----
+
+    /// Build a snapshot whose per-group current slots are set explicitly.
+    fn pool_with_groups(
+        accounts: Vec<AccountSnapshot>,
+        slots: &[(BackendGroup, &str)],
+    ) -> PoolSnapshot {
+        let mut current = std::collections::BTreeMap::new();
+        for (g, c) in slots {
+            current.insert(*g, AccountId(c.to_string()));
+        }
+        PoolSnapshot { accounts, current }
+    }
+
+    #[test]
+    fn group_filter_picks_only_in_group_account() {
+        // "aaa" (codex) would win id order, but the claude group must pick the
+        // claude account; the codex group must pick the codex account.
+        let codex = codex_account("aaa");
+        let claude = account("zzz");
+        let snapshot = pool(vec![codex, claude], None);
+        assert_eq!(
+            pick(&snapshot, &params(), Some(BackendGroup::Claude), now()),
+            Decision::Switch { to: id("zzz") },
+            "claude group ignores the codex account"
+        );
+        assert_eq!(
+            pick(&snapshot, &params(), Some(BackendGroup::Codex), now()),
+            Decision::Switch { to: id("aaa") },
+            "codex group ignores the claude account"
+        );
+    }
+
+    #[test]
+    fn group_filter_codex_tier_rule_is_a_no_op_under_filter() {
+        // Two codex accounts: under the codex group filter the tier rule is a
+        // no-op, so ranking falls through to id order ("a" before "z").
+        let a = codex_account("a");
+        let z = codex_account("z");
+        let snapshot = pool(vec![z, a], None);
+        assert_eq!(
+            pick(&snapshot, &params(), Some(BackendGroup::Codex), now()),
+            Decision::Switch { to: id("a") }
+        );
+    }
+
+    #[test]
+    fn group_stickiness_is_independent_per_group() {
+        // Claude slot points at the claude account, codex slot at the codex
+        // account: each group stays on its own sticky pick even though a
+        // higher-ranked account exists in the other group.
+        let claude = account("claude-cur");
+        let claude_alt = account("claude-alt");
+        let codex = codex_account("codex-cur");
+        let snapshot = pool_with_groups(
+            vec![claude, claude_alt, codex],
+            &[
+                (BackendGroup::Claude, "claude-cur"),
+                (BackendGroup::Codex, "codex-cur"),
+            ],
+        );
+        assert_eq!(
+            pick(&snapshot, &params(), Some(BackendGroup::Claude), now()),
+            Decision::Stay,
+            "claude group stays on its sticky current"
+        );
+        assert_eq!(
+            pick(&snapshot, &params(), Some(BackendGroup::Codex), now()),
+            Decision::Stay,
+            "codex group stays on its sticky current, independent of claude"
+        );
+    }
+
+    #[test]
+    fn empty_group_is_exhausted() {
+        // Only a claude account: the codex group has nothing to select.
+        let snapshot = pool(vec![account("a")], None);
+        assert_eq!(
+            pick(&snapshot, &params(), Some(BackendGroup::Codex), now()),
+            Decision::Exhausted { retry_after: None },
+            "empty group exhausts without picking the other group"
+        );
+        // The claude group still selects fine.
+        assert_eq!(
+            pick(&snapshot, &params(), Some(BackendGroup::Claude), now()),
+            Decision::Switch { to: id("a") }
+        );
+    }
+
     // ---- stickiness ----
 
     #[test]
@@ -636,7 +792,12 @@ mod tests {
         let mut better = account("b");
         better.seven_day = Some(window(0.5, HOUR));
         better.five_hour = Some(window(0.10, HOUR));
-        let decision = pick(&pool(vec![current, better], Some("a")), &params(), now());
+        let decision = pick(
+            &pool(vec![current, better], Some("a")),
+            &params(),
+            None,
+            now(),
+        );
         assert_eq!(decision, Decision::Stay);
     }
 
@@ -645,7 +806,12 @@ mod tests {
         let mut current = account("a");
         current.five_hour = Some(window(0.95, HOUR)); // over 0.90
         let fallback = account("b");
-        let decision = pick(&pool(vec![current, fallback], Some("a")), &params(), now());
+        let decision = pick(
+            &pool(vec![current, fallback], Some("a")),
+            &params(),
+            None,
+            now(),
+        );
         assert_eq!(decision, Decision::Switch { to: id("b") });
     }
 
@@ -654,7 +820,12 @@ mod tests {
         let mut current = account("a");
         current.cooldown_until = Some(at(NOW_SECS + 120));
         let fallback = account("b");
-        let decision = pick(&pool(vec![current, fallback], Some("a")), &params(), now());
+        let decision = pick(
+            &pool(vec![current, fallback], Some("a")),
+            &params(),
+            None,
+            now(),
+        );
         assert_eq!(decision, Decision::Switch { to: id("b") });
     }
 
@@ -663,13 +834,18 @@ mod tests {
         let mut current = account("a");
         current.healthy = false;
         let fallback = account("b");
-        let decision = pick(&pool(vec![current, fallback], Some("a")), &params(), now());
+        let decision = pick(
+            &pool(vec![current, fallback], Some("a")),
+            &params(),
+            None,
+            now(),
+        );
         assert_eq!(decision, Decision::Switch { to: id("b") });
     }
 
     #[test]
     fn initial_selection_with_no_current_switches() {
-        let decision = pick(&pool(vec![account("a")], None), &params(), now());
+        let decision = pick(&pool(vec![account("a")], None), &params(), None, now());
         assert_eq!(decision, Decision::Switch { to: id("a") });
     }
 
@@ -682,10 +858,10 @@ mod tests {
         let mut b = account("b");
         b.five_hour = Some(window_fetched(0.50, HOUR, NOW_SECS - 5000));
         let snapshot = pool(vec![a, b], None);
-        assert!(headers_only_mode(&snapshot, &params(), now()));
+        assert!(headers_only_mode(&snapshot, &params(), None, now()));
         // Staleness gate dropped: scheduling proceeds on the stale data.
         assert_eq!(
-            pick(&snapshot, &params(), now()),
+            pick(&snapshot, &params(), None, now()),
             Decision::Switch { to: id("a") }
         );
     }
@@ -696,9 +872,9 @@ mod tests {
         stale.five_hour = Some(window_fetched(0.10, HOUR, NOW_SECS - 5000));
         let cold = account("b");
         let snapshot = pool(vec![stale, cold], None);
-        assert!(!headers_only_mode(&snapshot, &params(), now()));
+        assert!(!headers_only_mode(&snapshot, &params(), None, now()));
         assert_eq!(
-            pick(&snapshot, &params(), now()),
+            pick(&snapshot, &params(), None, now()),
             Decision::Switch { to: id("b") }
         );
     }
@@ -712,9 +888,9 @@ mod tests {
         let mut stale = account("b");
         stale.five_hour = Some(window_fetched(0.10, HOUR, NOW_SECS - 5000));
         let snapshot = pool(vec![over, stale], None);
-        assert!(headers_only_mode(&snapshot, &params(), now()));
+        assert!(headers_only_mode(&snapshot, &params(), None, now()));
         assert_eq!(
-            pick(&snapshot, &params(), now()),
+            pick(&snapshot, &params(), None, now()),
             Decision::Switch { to: id("b") }
         );
     }
@@ -725,7 +901,7 @@ mod tests {
         a.five_hour = Some(window_fetched(0.10, HOUR, NOW_SECS - 5000));
         let mut b = account("b");
         b.five_hour = Some(window_fetched(0.05, HOUR, NOW_SECS - 5000));
-        let decision = pick(&pool(vec![a, b], Some("a")), &params(), now());
+        let decision = pick(&pool(vec![a, b], Some("a")), &params(), None, now());
         assert_eq!(decision, Decision::Stay);
     }
 
@@ -739,7 +915,7 @@ mod tests {
         let mut b = account("b");
         b.five_hour = Some(window(0.99, 2 * HOUR)); // soonest future reset
         b.seven_day = Some(window(0.5, 24 * HOUR));
-        let decision = pick(&pool(vec![a, b], None), &params(), now());
+        let decision = pick(&pool(vec![a, b], None), &params(), None, now());
         assert_eq!(
             decision,
             Decision::Exhausted {
@@ -755,7 +931,7 @@ mod tests {
         a.cooldown_until = Some(at(NOW_SECS + 2)); // 429 retry-after: 2
         let snapshot = pool(vec![a], None);
         assert_eq!(
-            pick(&snapshot, &params(), now()),
+            pick(&snapshot, &params(), None, now()),
             Decision::Exhausted {
                 retry_after: Some(Duration::from_secs(2)),
             }
@@ -779,7 +955,7 @@ mod tests {
     #[test]
     fn empty_pool_is_exhausted_with_no_retry_hint() {
         assert_eq!(
-            pick(&pool(vec![], None), &params(), now()),
+            pick(&pool(vec![], None), &params(), None, now()),
             Decision::Exhausted { retry_after: None }
         );
     }
@@ -835,7 +1011,7 @@ mod tests {
         let order = selection_order(&snapshot, &params(), now());
         let first = &snapshot.accounts[order[0]].id;
         assert_eq!(
-            pick(&snapshot, &params(), now()),
+            pick(&snapshot, &params(), None, now()),
             Decision::Switch { to: first.clone() },
             "head of the order is exactly what pick would choose"
         );
