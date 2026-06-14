@@ -1017,7 +1017,7 @@ fn draw_activity(
     // the whole history is reachable, not just the rows that happen to fit).
     let total = view.completed.len();
     let completed_rows = capacity.saturating_sub(lines.len());
-    let scroll = chrome.activity_scroll.min(total.saturating_sub(1).max(0));
+    let scroll = chrome.activity_scroll.min(total.saturating_sub(1));
     for entry in view.completed.iter().skip(scroll).take(completed_rows) {
         lines.push(completed_line(entry));
     }
