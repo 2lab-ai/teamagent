@@ -1,7 +1,7 @@
-//! `AnthropicPassthrough` — the v0.1 working provider. Every conversion hook
-//! is identity (zero-copy: the unified types wrap the Anthropic wire shape,
-//! and `bytes::Bytes` clones are refcounted), so the proxy's hot path does no
-//! re-serialization.
+//! `AnthropicPassthrough` — the v0.1 working provider. Conversion hooks are
+//! byte-identity in the common case (the unified types wrap the Anthropic wire
+//! shape, and `bytes::Bytes` clones are refcounted); only Claude-Code-local
+//! model annotations are normalized before the request leaves the proxy.
 //!
 //! Where the hourglass would engage for a NON-passthrough provider:
 //! `request_out` would parse the Anthropic body into real unified fields
@@ -19,6 +19,23 @@ use super::{
     ProviderResponse, UnifiedRequest, UnifiedResponse,
 };
 use crate::config::AccountCredential;
+
+fn strip_client_context_suffix(body: bytes::Bytes) -> bytes::Bytes {
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return body;
+    };
+    let Some(model) = value.get("model").and_then(serde_json::Value::as_str) else {
+        return body;
+    };
+    let Some(base) = model.strip_suffix("[1m]") else {
+        return body;
+    };
+    value["model"] = serde_json::Value::String(base.to_string());
+    match serde_json::to_vec(&value) {
+        Ok(bytes) => bytes::Bytes::from(bytes),
+        Err(_) => body,
+    }
+}
 
 /// Client auth header stripped/replaced on the way upstream.
 pub const X_API_KEY: &str = "x-api-key";
@@ -115,14 +132,15 @@ impl Provider for AnthropicPassthrough {
         })
     }
 
-    /// Identity unwrap (zero-copy: moves the wire request out).
+    /// Normalize the Claude-Code-only context-window suffix, otherwise unwrap
+    /// without reserializing (moves the original wire body out).
     fn request_in(&self, unified: UnifiedRequest) -> Result<ProviderRequest, ProviderError> {
         let wire = unified.wire;
         Ok(ProviderRequest {
             method: wire.method,
             path: wire.path,
             headers: wire.headers,
-            body: wire.body,
+            body: strip_client_context_suffix(wire.body),
         })
     }
 
@@ -193,6 +211,17 @@ mod tests {
         assert_eq!(provider_req.body.as_ref(), body.as_bytes());
         assert_eq!(provider_req.path, "/v1/messages");
         assert_eq!(provider_req.method, Method::POST);
+    }
+
+    #[test]
+    fn request_in_strips_client_context_suffix_from_claude_model() {
+        let body = r#"{"model":"claude-opus-4-8[1m]","messages":[{"role":"user","content":"hi"}]}"#;
+        let p = provider();
+        let unified = p.request_out(request(body)).expect("out");
+        let provider_req = p.request_in(unified).expect("in");
+        let upstream: serde_json::Value =
+            serde_json::from_slice(&provider_req.body).expect("upstream json");
+        assert_eq!(upstream["model"], "claude-opus-4-8");
     }
 
     #[tokio::test]

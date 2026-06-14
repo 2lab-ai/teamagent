@@ -192,6 +192,41 @@ async fn passthrough_returns_identical_body_with_rewritten_auth() {
     );
 }
 
+/// Acceptance #1b: Claude Code annotates a 1M-window model client-side as
+/// `claude-opus-4-8[1m]`. That literal is not a valid Anthropic model id and
+/// 404s upstream (plain `claude-opus-4-8` 200s — its 1M window is the
+/// default). The passthrough provider must strip the `[1m]` annotation before
+/// the request leaves the proxy. This drives the full forward path (so it also
+/// proves the provider's `request_in` hook is wired in, not just the unit).
+#[tokio::test]
+async fn client_context_window_suffix_is_stripped_before_upstream() {
+    const UPSTREAM_BODY: &str =
+        r#"{"id":"msg_1","type":"message","usage":{"input_tokens":7,"output_tokens":3}}"#;
+    const CLIENT_BODY: &str =
+        r#"{"model":"claude-opus-4-8[1m]","messages":[{"role":"user","content":"hi"}]}"#;
+
+    let mock = MockUpstream::spawn().await;
+    mock.push(ScriptedResponse::ok(UPSTREAM_BODY));
+    let proxy = Proxy::spawn(&mock.base_url(), vec![oauth_account("a", "at-a")]).await;
+
+    let client = reqwest::Client::new();
+    let response = post_messages(&client, &proxy, CLIENT_BODY).await;
+    assert_eq!(response.status(), 200);
+
+    let seen = mock.seen();
+    assert_eq!(seen.len(), 1);
+    let upstream: serde_json::Value =
+        serde_json::from_slice(&seen[0].body).expect("upstream body is json");
+    assert_eq!(
+        upstream["model"], "claude-opus-4-8",
+        "the [1m] context-window suffix must be stripped before upstream"
+    );
+    assert_eq!(
+        upstream["messages"][0]["content"], "hi",
+        "request payload preserved aside from the model normalization"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 2. SSE passthrough under forced chunk fragmentation
 // ---------------------------------------------------------------------------
