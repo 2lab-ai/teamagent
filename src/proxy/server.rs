@@ -290,7 +290,7 @@ pub async fn serve(
         state.config.scheduler,
     )
     .with_events(state.events.clone());
-    poller.tick(SystemTime::now()).await;
+    poller.prime(SystemTime::now()).await;
 
     // Initial selection so the first request doesn't pay for it. Evaluate
     // every backend group that has at least one account (with routing
@@ -418,6 +418,13 @@ pub async fn background_refresh_pass(state: &AppState) {
         .duration_since(UNIX_EPOCH)
         .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
         .unwrap_or(0);
+    // Refresh AT MOST ONE account per pass — the soonest-to-expire. Refreshing
+    // every expiring token in one pass was a burst of token-endpoint calls
+    // (worst on startup, when many tokens sit inside the 7h window at once),
+    // which can trip the upstream's request-rate limit. One-per-pass spaces
+    // them across REFRESH_TICK; tokens carry hours of headroom so the sweep has
+    // plenty of time, and request-time forced refresh is the backstop.
+    let mut candidate: Option<(AccountId, AccountCredential, u64)> = None;
     for account in state.pool.snapshot().accounts {
         if !account.healthy {
             continue;
@@ -433,27 +440,36 @@ pub async fn background_refresh_pass(state: &AppState) {
         if expires_at_ms.saturating_sub(now_ms) >= ahead_ms {
             continue;
         }
-        match forward::refresh_credential(state, &account.id, &credential).await {
-            forward::RefreshOutcome::Refreshed(fresh) => {
-                if let AccountCredential::Oauth { expires_at_ms, .. }
-                | AccountCredential::Codex { expires_at_ms, .. } = fresh
-                {
-                    let hours = expires_at_ms.saturating_sub(now_ms) as f64 / 3_600_000.0;
-                    tracing::info!(
-                        account = %account.id,
-                        "background token refresh: expires in {hours:.1}h"
-                    );
-                }
-            }
-            forward::RefreshOutcome::Permanent => {
-                state.pool.record_auth_failure(&account.id);
-                state.emit(ActivityEvent::Error {
-                    context: Some("refresh".into()),
-                    message: format!("{}: refresh token dead; re-login required", account.id),
-                });
-            }
-            forward::RefreshOutcome::Failed => {} // transient — next tick retries
+        if candidate
+            .as_ref()
+            .is_none_or(|(_, _, soonest)| expires_at_ms < *soonest)
+        {
+            candidate = Some((account.id.clone(), credential, expires_at_ms));
         }
+    }
+    let Some((account_id, credential, _)) = candidate else {
+        return;
+    };
+    match forward::refresh_credential(state, &account_id, &credential).await {
+        forward::RefreshOutcome::Refreshed(fresh) => {
+            if let AccountCredential::Oauth { expires_at_ms, .. }
+            | AccountCredential::Codex { expires_at_ms, .. } = fresh
+            {
+                let hours = expires_at_ms.saturating_sub(now_ms) as f64 / 3_600_000.0;
+                tracing::info!(
+                    account = %account_id,
+                    "background token refresh: expires in {hours:.1}h"
+                );
+            }
+        }
+        forward::RefreshOutcome::Permanent => {
+            state.pool.record_auth_failure(&account_id);
+            state.emit(ActivityEvent::Error {
+                context: Some("refresh".into()),
+                message: format!("{account_id}: refresh token dead; re-login required"),
+            });
+        }
+        forward::RefreshOutcome::Failed => {} // transient — next tick retries
     }
 }
 

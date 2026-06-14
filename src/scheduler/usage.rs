@@ -146,6 +146,14 @@ const BACKOFF_LADDER_SECS: [u64; 4] = [120, 300, 600, 900];
 /// Scheduling granularity of the poll loop.
 const POLL_TICK: Duration = Duration::from_secs(5);
 
+/// Minimum wall-clock gap between any two usage polls, across ALL accounts. The
+/// poller fires at most one `/api/oauth/usage` call per gap, one account at a
+/// time, so a tick that finds many accounts due (e.g. the priming tick at
+/// startup, where every account's `next_at` is `now`) never bursts a call per
+/// account. A burst across all accounts can trip the upstream's org/IP
+/// request-rate limit and make teamagent rate-limit its own traffic.
+const MIN_POLL_GAP: Duration = Duration::from_secs(10);
+
 #[derive(Debug, Clone, Copy)]
 struct PollSchedule {
     next_at: SystemTime,
@@ -162,6 +170,8 @@ pub struct UsagePoller<F = ReqwestFetcher> {
     base_url: String,
     config: SchedulerConfig,
     schedule: HashMap<AccountId, PollSchedule>,
+    /// Wall-clock time of the last poll, for the global [`MIN_POLL_GAP`] throttle.
+    last_poll_at: Option<SystemTime>,
     /// Best-effort poller-health feed to the dashboard (`try_send`, dropped
     /// on a full channel — same contract as every activity sender).
     events: Option<tokio::sync::mpsc::Sender<crate::tui::ActivityEvent>>,
@@ -192,6 +202,7 @@ impl<F: UsageFetcher> UsagePoller<F> {
             base_url,
             config,
             schedule: HashMap::new(),
+            last_poll_at: None,
             events: None,
         }
     }
@@ -214,11 +225,9 @@ impl<F: UsageFetcher> UsagePoller<F> {
         }
     }
 
-    /// One scheduling pass: poll every oauth account whose next-allowed-at
-    /// has arrived, then reschedule it (jittered interval on success, ladder
-    /// on failure). Re-reads the roster each pass so account reloads are
-    /// picked up; removed accounts drop their schedule entries.
-    pub async fn tick(&mut self, now: SystemTime) {
+    /// Re-read the oauth roster, drop schedules for removed accounts, and give
+    /// every current account a schedule entry (new accounts due immediately).
+    fn refresh_schedule(&mut self, now: SystemTime) -> Vec<AccountId> {
         let oauth_ids: Vec<AccountId> = self
             .pool
             .snapshot()
@@ -228,39 +237,85 @@ impl<F: UsageFetcher> UsagePoller<F> {
             .map(|a| a.id.clone())
             .collect();
         self.schedule.retain(|id, _| oauth_ids.contains(id));
-
-        for id in oauth_ids {
-            let entry = *self.schedule.entry(id.clone()).or_insert(PollSchedule {
+        for id in &oauth_ids {
+            self.schedule.entry(id.clone()).or_insert(PollSchedule {
                 next_at: now,
                 consecutive_failures: 0,
             });
-            if entry.next_at > now {
-                continue;
-            }
-            let failures = match self.poll_account(&id, now).await {
-                Ok(()) => 0,
-                Err(err) => {
-                    tracing::warn!(account = %id, error = %err, "usage poll failed");
-                    entry.consecutive_failures.saturating_add(1)
-                }
-            };
-            let delay = jittered(self.backoff_delay(failures), &id, now);
-            if let Some(events) = &self.events {
-                let _ = events.try_send(crate::tui::ActivityEvent::UsagePolled {
-                    account: id.0.clone(),
-                    ok: failures == 0,
-                    consecutive_failures: failures,
-                    next_in: delay,
-                });
-            }
-            self.schedule.insert(
-                id,
-                PollSchedule {
-                    next_at: now + delay,
-                    consecutive_failures: failures,
-                },
-            );
         }
+        oauth_ids
+    }
+
+    /// Poll one account and reschedule it (jittered interval on success, backoff
+    /// ladder on failure), emitting a poller-health event.
+    async fn poll_and_reschedule(&mut self, id: AccountId, now: SystemTime) {
+        let prev_failures = self.schedule.get(&id).map_or(0, |e| e.consecutive_failures);
+        let failures = match self.poll_account(&id, now).await {
+            Ok(()) => 0,
+            Err(err) => {
+                tracing::warn!(account = %id, error = %err, "usage poll failed");
+                prev_failures.saturating_add(1)
+            }
+        };
+        let delay = jittered(self.backoff_delay(failures), &id, now);
+        if let Some(events) = &self.events {
+            let _ = events.try_send(crate::tui::ActivityEvent::UsagePolled {
+                account: id.0.clone(),
+                ok: failures == 0,
+                consecutive_failures: failures,
+                next_in: delay,
+            });
+        }
+        self.schedule.insert(
+            id,
+            PollSchedule {
+                next_at: now + delay,
+                consecutive_failures: failures,
+            },
+        );
+    }
+
+    /// Startup priming: poll EVERY due account once so the first selection ranks
+    /// on real window data. This is a one-time burst at boot; the ongoing
+    /// [`Self::tick`] throttles to one poll per [`MIN_POLL_GAP`] so the poller
+    /// never *continuously* bursts a call per account (which can trip the
+    /// upstream's org/IP request-rate limit).
+    pub async fn prime(&mut self, now: SystemTime) {
+        for id in self.refresh_schedule(now) {
+            if self.schedule.get(&id).is_some_and(|e| e.next_at <= now) {
+                self.poll_and_reschedule(id, now).await;
+            }
+        }
+        self.last_poll_at = Some(now);
+    }
+
+    /// One scheduling pass: poll AT MOST ONE due account (the most overdue),
+    /// throttled to one poll per [`MIN_POLL_GAP`] across all accounts. Re-reads
+    /// the roster each pass so account reloads are picked up; removed accounts
+    /// drop their schedule entries.
+    pub async fn tick(&mut self, now: SystemTime) {
+        let oauth_ids = self.refresh_schedule(now);
+
+        // Global throttle: at most one poll per MIN_POLL_GAP, so a pass that
+        // finds many accounts due never bursts a call per account.
+        if self
+            .last_poll_at
+            .is_some_and(|last| now.duration_since(last).is_ok_and(|gap| gap < MIN_POLL_GAP))
+        {
+            return;
+        }
+
+        // Poll the single most-overdue due account this tick.
+        let Some(id) = oauth_ids
+            .iter()
+            .filter(|id| self.schedule.get(*id).is_some_and(|e| e.next_at <= now))
+            .min_by_key(|id| self.schedule.get(*id).map(|e| e.next_at).unwrap_or(now))
+            .cloned()
+        else {
+            return;
+        };
+        self.last_poll_at = Some(now);
+        self.poll_and_reschedule(id, now).await;
     }
 
     /// Compute the next delay after `consecutive_failures` for one account —
@@ -644,7 +699,10 @@ mod tests {
         let fetcher = MockFetcher::new(vec![Err(status_err(403)), Err(status_err(401))]);
         let mut poller =
             UsagePoller::with_fetcher(pool.clone(), &fetcher, "http://x".into(), config());
-        poller.tick(now()).await;
+        // One poll per tick (MIN_POLL_GAP throttle): `a` this tick, `b` after
+        // the gap. Together they cover both accounts without bursting.
+        poller.tick(now()).await; // a → 403
+        poller.tick(at(NOW_SECS + 11)).await; // b → 401
         let snapshot = pool.snapshot();
         let a = snapshot.accounts.iter().find(|x| x.id == id("a")).unwrap();
         let b = snapshot.accounts.iter().find(|x| x.id == id("b")).unwrap();
