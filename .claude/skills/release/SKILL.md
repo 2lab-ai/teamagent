@@ -15,8 +15,9 @@ procedure B = publish+verify brew).
 
 1. **Pre-flight + version.** `just check` green, tree intentional. `Cargo.toml` is currently
    the last released version and **the matching `v*` tag already exists**, so a release
-   **requires a bump**. Ask the user for the new version (propose the next patch, e.g.
-   `0.1.0 → 0.1.1`). *(Decision point — never pick the version yourself.)*
+   **requires a bump**. **Default: bump the patch** (e.g. `0.2.1 → 0.2.2`) and proceed
+   without asking. Only deviate — a minor/major bump or a specific number — when the user
+   gave a **special instruction** for this release (then use exactly what they said).
 2. **Bump.** Set `version = "<new>"` in `Cargo.toml`; run `just check` so `Cargo.lock`
    updates and the gate passes. The release workflow **fails if tag `v<new>` ≠ Cargo.toml
    version** — they must match exactly.
@@ -51,4 +52,5 @@ procedure B = publish+verify brew).
 - Reusing an existing version (e.g. `v0.1.0`) — always go forward.
 - Forgetting to dispatch the tap `bump.yml` — brew stays on the old stable.
 - "Already up-to-date" → `brew update` then re-check `brew info` before trusting it.
-- Picking the version or pushing master/PR without the user's go-ahead.
+- Pushing master/PR without the user's go-ahead (version itself defaults to a patch bump —
+  see step 1).
