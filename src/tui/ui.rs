@@ -1003,6 +1003,15 @@ fn draw_activity(
                 Span::styled(format::clock_hms_utc(request.started_at), dim()),
                 Span::raw(format!("  {} {}", request.method, request.path)),
             ];
+            // [group model] badge while in flight (issue #2, 2a). The data is
+            // filled at routing time (req11); effort is not carried in-flight,
+            // so the badge mirrors completed rows minus the effort suffix.
+            if let Some(meta) =
+                activity_meta(request.group.as_deref(), request.model.as_deref(), None)
+            {
+                spans.push(Span::raw(" "));
+                spans.push(Span::styled(meta, group_color(request.group.as_deref())));
+            }
             if let Some(account) = &request.account {
                 spans.push(Span::raw(format!(" → {account}")));
             }
@@ -1117,9 +1126,20 @@ fn group_color(group: Option<&str>) -> Style {
     }
 }
 
+/// Abbreviate a model id for the activity badge by dropping the redundant
+/// `claude-` prefix on Claude models (`claude-opus-4-8` → `opus-4-8`). Codex
+/// and unknown models pass through unchanged (issue #2, 2b).
+fn abbrev_model<'a>(group: Option<&str>, model: &'a str) -> &'a str {
+    if group == Some("claude") {
+        model.strip_prefix("claude-").unwrap_or(model)
+    } else {
+        model
+    }
+}
+
 /// Compose the `[group model·effort]` badge for an activity line, or `None`
-/// when nothing is known. Examples: `[codex gpt-5.5·high]`, `[claude
-/// claude-sonnet-4-5·16k]`, `[claude]`.
+/// when nothing is known. The model id is abbreviated via [`abbrev_model`].
+/// Examples: `[codex gpt-5.5·high]`, `[claude opus-4-8·16k]`, `[claude]`.
 fn activity_meta(group: Option<&str>, model: Option<&str>, effort: Option<&str>) -> Option<String> {
     if group.is_none() && model.is_none() && effort.is_none() {
         return None;
@@ -1132,7 +1152,7 @@ fn activity_meta(group: Option<&str>, model: Option<&str>, effort: Option<&str>)
         if !label.is_empty() {
             label.push(' ');
         }
-        label.push_str(m);
+        label.push_str(abbrev_model(group, m));
     }
     if let Some(e) = effort {
         label.push('·');
@@ -1772,5 +1792,54 @@ mod tests {
             "lower rows reachable (req13)"
         );
         assert!(text.contains("model detail"), "drill-down panel present");
+    }
+
+    #[test]
+    fn activity_meta_abbreviates_claude_prefix_only(/* issue #2, 2b */) {
+        // Claude models drop the redundant `claude-` prefix.
+        assert_eq!(
+            activity_meta(Some("claude"), Some("claude-opus-4-8"), None).as_deref(),
+            Some("[claude opus-4-8]")
+        );
+        // Codex/gpt models are unchanged.
+        assert_eq!(
+            activity_meta(Some("codex"), Some("gpt-5.5"), Some("high")).as_deref(),
+            Some("[codex gpt-5.5·high]")
+        );
+        // A claude model without the prefix, and unknown groups, pass through.
+        assert_eq!(
+            activity_meta(Some("claude"), Some("opus-4-8"), None).as_deref(),
+            Some("[claude opus-4-8]")
+        );
+        assert_eq!(
+            activity_meta(None, Some("claude-haiku-4-5"), None).as_deref(),
+            Some("[claude-haiku-4-5]"),
+            "no group → no claude- stripping"
+        );
+        // Nothing known → no badge.
+        assert_eq!(activity_meta(None, None, None), None);
+    }
+
+    #[test]
+    fn in_flight_row_shows_abbreviated_model_badge(/* issue #2, 2a */) {
+        let mut view = view_with(Vec::new());
+        view.in_flight = vec![super::super::activity::InFlight {
+            id: 1,
+            method: "POST".into(),
+            path: "/v1/messages".into(),
+            account: Some("claude:me@example.com".into()),
+            group: Some("claude".into()),
+            model: Some("claude-opus-4-8".into()),
+            started_at: std::time::SystemTime::UNIX_EPOCH,
+        }];
+        let text = render(&view, &chrome(false), 160, 30);
+        assert!(
+            text.contains("opus-4-8"),
+            "in-flight row shows the model name (2a)"
+        );
+        assert!(
+            !text.contains("claude-opus-4-8"),
+            "model label is abbreviated, not the raw claude- id (2b)"
+        );
     }
 }
