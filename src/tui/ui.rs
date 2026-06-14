@@ -1569,6 +1569,12 @@ fn draw_model_detail(
             ]));
         }
     }
+    // Quota windows are an account/provider fact, never per-model (req27) — make
+    // that explicit so the per-account list above isn't read as a model limit.
+    lines.push(Line::from(Span::styled(
+        " quota is account-level (see accounts table)",
+        dim(),
+    )));
 
     let block = Block::new().borders(Borders::TOP).title(" model detail ");
     frame.render_widget(Paragraph::new(lines).block(block), area);
