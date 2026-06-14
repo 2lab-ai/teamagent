@@ -31,7 +31,7 @@ pub enum CliError {
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "teamagent",
+    name = "llmux",
     version = crate::build_info::version_with_build(),
     about = "Multi-account LLM proxy for Claude Code with quota-maximizing scheduling"
 )]
@@ -47,7 +47,7 @@ pub enum Command {
     /// Spawn `claude` with ANTHROPIC_BASE_URL pointed at the proxy
     /// (auto-starts the server as a background daemon when needed).
     Run(RunArgs),
-    /// Stop a running server (POST /teamagent/shutdown, wait for the port
+    /// Stop a running server (POST /llmux/shutdown, wait for the port
     /// to free).
     Stop(StopArgs),
     /// Restart the daemon: cooperatively drain a running server (if any),
@@ -61,7 +61,7 @@ pub enum Command {
     /// Print the env exports for pointing Claude Code at the proxy.
     Env(EnvArgs),
     /// Attach to a running daemon and render its dashboard (read-only except
-    /// manual switch). Polls `GET /teamagent/dashboard` over HTTP.
+    /// manual switch). Polls `GET /llmux/dashboard` over HTTP.
     Dashboard(DashboardArgs),
     /// Show scheduler/account state (from a running server when available).
     ///
@@ -150,7 +150,7 @@ pub struct AccountsArgs {
 
 #[derive(Debug, Args)]
 pub struct RemoveArgs {
-    /// Account name as shown by `teamagent accounts`.
+    /// Account name as shown by `llmux accounts`.
     pub name: String,
     /// Skip the confirmation prompt (required when stdin is not a TTY).
     #[arg(long)]
@@ -191,13 +191,13 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
     }
 }
 
-/// `teamagent server` — start the proxy, rendering the in-process TUI on a
+/// `llmux server` — start the proxy, rendering the in-process TUI on a
 /// TTY (unless `--no-tui`).
 ///
 /// herdr semantics (the daemon owns port 3456 and the only local TUI): before
 /// touching the terminal we probe the port.
-/// - A teamagent daemon already runs → print one line and enter the SAME
-///   attach mode `teamagent dashboard` uses (read-only dashboard over HTTP).
+/// - A llmux daemon already runs → print one line and enter the SAME
+///   attach mode `llmux dashboard` uses (read-only dashboard over HTTP).
 /// - A FOREIGN process answers the port → clean one-line error, NO TUI init.
 /// - Nothing is listening → bind FIRST (via `serve`'s readiness signal), and
 ///   only after the bind succeeds initialize the TUI, so a bind error can
@@ -224,7 +224,7 @@ async fn server(args: ServerArgs) -> Result<(), CliError> {
             // (or, with --no-tui, a one-liner so scripts don't hang).
             if !use_tui {
                 eprintln!(
-                    "a teamagent daemon already owns port {port}; run `teamagent dashboard` to attach"
+                    "a llmux daemon already owns port {port}; run `llmux dashboard` to attach"
                 );
                 return Ok(());
             }
@@ -232,7 +232,7 @@ async fn server(args: ServerArgs) -> Result<(), CliError> {
         }
         daemon::ServerProbe::Foreign { detail } => {
             return Err(CliError::Message(format!(
-                "port {port} is in use by something that is not teamagent ({detail})\n\
+                "port {port} is in use by something that is not llmux ({detail})\n\
                  Free the port or change proxy.port in the config."
             )));
         }
@@ -243,9 +243,9 @@ async fn server(args: ServerArgs) -> Result<(), CliError> {
         return Err(CliError::Message(
             "no accounts configured\n\
              Add one first:\n  \
-             teamagent import           Import from Claude Code / teamclaude\n  \
-             teamagent login            OAuth login via browser\n  \
-             teamagent login --api      Add an API key"
+             llmux import           Import from Claude Code / teamclaude\n  \
+             llmux login            OAuth login via browser\n  \
+             llmux login --api      Add an API key"
                 .into(),
         ));
     }
@@ -316,7 +316,7 @@ async fn server(args: ServerArgs) -> Result<(), CliError> {
     Ok(())
 }
 
-/// `teamagent dashboard` — attach to a running daemon and render its
+/// `llmux dashboard` — attach to a running daemon and render its
 /// dashboard. Refuses cleanly when no daemon (or a foreign process) is on the
 /// port — there is nothing local to fall back to here.
 async fn dashboard(_args: DashboardArgs) -> Result<(), CliError> {
@@ -328,16 +328,16 @@ async fn dashboard(_args: DashboardArgs) -> Result<(), CliError> {
             attach(port, api_key, daemon::status_pid(&status)).await
         }
         daemon::ServerProbe::NotRunning => Err(CliError::Message(format!(
-            "no teamagent daemon on port {port} — start one with `teamagent server` or `teamagent run`"
+            "no llmux daemon on port {port} — start one with `llmux server` or `llmux run`"
         ))),
         daemon::ServerProbe::Foreign { detail } => Err(CliError::Message(format!(
-            "port {port} is in use by something that is not teamagent ({detail})"
+            "port {port} is in use by something that is not llmux ({detail})"
         ))),
     }
 }
 
-/// Enter attach mode against a confirmed teamagent daemon: the remote TUI
-/// polls `GET /teamagent/dashboard` and renders the identical layout. No
+/// Enter attach mode against a confirmed llmux daemon: the remote TUI
+/// polls `GET /llmux/dashboard` and renders the identical layout. No
 /// tracing subscriber is installed (ratatui owns the terminal; the client has
 /// no logs of its own to show).
 async fn attach(port: u16, api_key: Option<String>, pid: Option<u32>) -> Result<(), CliError> {

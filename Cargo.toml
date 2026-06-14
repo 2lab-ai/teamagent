@@ -1,13 +1,13 @@
 [package]
-name = "teamagent"
+name = "llmux"
 version = "0.2.1"
 edition = "2021"
 license = "MIT"
 description = "Multi-account, multi-provider LLM proxy for Claude Code with quota-maximizing scheduling"
-repository = "https://github.com/2lab-ai/teamagent"
+repository = "https://github.com/2lab-ai/llmux"
 
 [[bin]]
-name = "teamagent"
+name = "llmux"
 path = "src/main.rs"
 
 [dependencies]

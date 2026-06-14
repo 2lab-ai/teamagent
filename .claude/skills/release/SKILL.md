@@ -1,12 +1,12 @@
 ---
 name: release
-description: Use when the user says "릴리즈", "릴리즈해줘", "release", "cut a release", or "stable release" for teamagent. Bumps the version, tags v*, lets CI publish the stable GitHub release, refreshes the teamagent stable brew formula, verifies brew updated, hot-deploys + restarts locally, and verifies client + server with teamagent status.
+description: Use when the user says "릴리즈", "릴리즈해줘", "release", "cut a release", or "stable release" for llmux. Bumps the version, tags v*, lets CI publish the stable GitHub release, refreshes the llmux stable brew formula, verifies brew updated, hot-deploys + restarts locally, and verifies client + server with llmux status.
 ---
 
 # release (릴리즈) — stable channel
 
 Cut a formal **stable** release: version bump → tag `v*` → CI stable release → brew
-`teamagent` → local deploy → `teamagent status` (client AND server).
+`llmux` → local deploy → `llmux status` (client AND server).
 
 Shared mechanics: `.claude/skills/_shared/cd-reference.md` (procedure A = hot-deploy,
 procedure B = publish+verify brew).
@@ -25,21 +25,21 @@ procedure B = publish+verify brew).
    required.
 4. **Tag + push the tag** (this triggers `release.yml`):
    `git tag v<new> && git push origin v<new>` (token fallback:
-   `git push "https://x-access-token:$(gh auth token)@github.com/2lab-ai/teamagent" v<new>`).
+   `git push "https://x-access-token:$(gh auth token)@github.com/2lab-ai/llmux" v<new>`).
 5. **Watch the release build.**
    ```bash
-   rid=$(gh run list --repo 2lab-ai/teamagent --workflow release.yml -L1 --json databaseId -q '.[0].databaseId')
-   gh run watch --repo 2lab-ai/teamagent "$rid" --exit-status
+   rid=$(gh run list --repo 2lab-ai/llmux --workflow release.yml -L1 --json databaseId -q '.[0].databaseId')
+   gh run watch --repo 2lab-ai/llmux "$rid" --exit-status
    ```
-   Then confirm: `gh release view v<new> --repo 2lab-ai/teamagent` (this is the new "Latest").
-6. **Publish + verify brew (stable)** — procedure B with `formula=teamagent`. Dispatch the
-   tap `bump.yml`, watch it, `brew update && brew upgrade teamagent`, confirm
-   `brew info --json=v2 teamagent | ...installed[0].version` == `<new>`.
-   *(If only `teamagent-preview` is currently installed, `brew install 2lab-ai/tap/teamagent`;
-   both provide `bin/teamagent` via `link_overwrite`.)*
+   Then confirm: `gh release view v<new> --repo 2lab-ai/llmux` (this is the new "Latest").
+6. **Publish + verify brew (stable)** — procedure B with `formula=llmux`. Dispatch the
+   tap `bump.yml`, watch it, `brew update && brew upgrade llmux`, confirm
+   `brew info --json=v2 llmux | ...installed[0].version` == `<new>`.
+   *(If only `llmux-preview` is currently installed, `brew install 2lab-ai/tap/llmux`;
+   both provide `bin/llmux` via `link_overwrite`.)*
 7. **Hot-deploy + restart.** Brew build is in the Cellar after upgrade →
-   `/opt/homebrew/bin/teamagent restart`. Verify `--version` reports `<new> (stable <id>)`.
-8. **Final verify — client AND server.** `/opt/homebrew/bin/teamagent status`: both the local
+   `/opt/homebrew/bin/llmux restart`. Verify `--version` reports `<new> (stable <id>)`.
+8. **Final verify — client AND server.** `/opt/homebrew/bin/llmux status`: both the local
    client view and the running daemon's accounts reflect the new build. This is the owner's
    required end-state.
 9. **Report** new version, release URL, brew version, and the `status` summary.

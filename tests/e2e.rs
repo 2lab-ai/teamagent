@@ -5,7 +5,7 @@
 //! Isolation: every test owns its mock, its proxy (port 0), and a tempdir
 //! config — nothing touches the real `~/.config` or `~/.claude`. Only the
 //! import scenario mutates env vars (`HOME`, `XDG_CONFIG_HOME`,
-//! `TEAMAGENT_CONFIG`) and does so under a process-wide lock.
+//! `LLMUX_CONFIG`) and does so under a process-wide lock.
 
 #[path = "mock_upstream.rs"]
 mod mock_upstream;
@@ -14,11 +14,11 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use llmux::config::{self, AccountConfig, AccountCredential, Config};
+use llmux::proxy::server::{serve, AppState};
+use llmux::scheduler::select::SelectParams;
+use llmux::scheduler::{AccountId, AccountPool};
 use mock_upstream::{MockUpstream, ScriptedResponse};
-use teamagent::config::{self, AccountConfig, AccountCredential, Config};
-use teamagent::proxy::server::{serve, AppState};
-use teamagent::scheduler::select::SelectParams;
-use teamagent::scheduler::{AccountId, AccountPool};
 
 /// Serializes the env-mutating test(s); everything else stays env-free.
 /// Async-aware because the guard spans an `.await` (the import call).
@@ -30,7 +30,7 @@ struct TempDir(PathBuf);
 impl TempDir {
     fn new() -> Self {
         let dir = std::env::temp_dir().join(format!(
-            "teamagent-e2e-{}-{}",
+            "llmux-e2e-{}-{}",
             std::process::id(),
             ulid::Ulid::new()
         ));
@@ -82,7 +82,7 @@ fn oauth_account_expiring(name: &str, token: &str, expires_at_ms: u64) -> Accoun
 }
 
 fn default_params() -> SelectParams {
-    SelectParams::from(&teamagent::config::SchedulerConfig::default())
+    SelectParams::from(&llmux::config::SchedulerConfig::default())
 }
 
 /// One running proxy over a tempdir config, listening on an OS-assigned port.
@@ -107,7 +107,7 @@ impl Proxy {
     /// `config.codex` at the mock).
     async fn spawn_config(mut config: Config) -> Self {
         let tmp = TempDir::new();
-        let config_path = tmp.path().join("teamagent.json");
+        let config_path = tmp.path().join("llmux.json");
         config.proxy.port = 0; // OS-assigned; `serve` reports it via `ready`
         config::save_path(&config_path, &config).expect("seed config");
 
@@ -619,7 +619,7 @@ async fn expired_token_refreshes_once_for_concurrent_requests_and_persists() {
 // 8. Imports yield working accounts end-to-end
 // ---------------------------------------------------------------------------
 
-/// Acceptance #8: `teamagent import` over a teamclaude config AND a
+/// Acceptance #8: `llmux import` over a teamclaude config AND a
 /// `~/.claude/.credentials.json` (tmp HOME) yields accounts that serve real
 /// requests through the proxy.
 #[tokio::test]
@@ -629,7 +629,7 @@ async fn import_teamclaude_and_claude_credentials_yield_working_accounts() {
     let xdg = tmp.path().join("xdg-config");
     std::fs::create_dir_all(home.join(".claude")).expect("home dirs");
     std::fs::create_dir_all(&xdg).expect("xdg dir");
-    let teamagent_config = tmp.path().join("teamagent.json");
+    let llmux_config = tmp.path().join("llmux.json");
 
     let expires_ms = far_future_ms();
     std::fs::write(
@@ -657,9 +657,9 @@ async fn import_teamclaude_and_claude_credentials_yield_working_accounts() {
         let old_cfg = std::env::var_os(config::CONFIG_ENV);
         std::env::set_var("HOME", &home);
         std::env::set_var("XDG_CONFIG_HOME", &xdg);
-        std::env::set_var(config::CONFIG_ENV, &teamagent_config);
+        std::env::set_var(config::CONFIG_ENV, &llmux_config);
 
-        let result = teamagent::cli::import::run(teamagent::cli::ImportArgs {
+        let result = llmux::cli::import::run(llmux::cli::ImportArgs {
             from: None,
             json: None,
         })
@@ -675,7 +675,7 @@ async fn import_teamclaude_and_claude_credentials_yield_working_accounts() {
         result.expect("import succeeds");
     }
 
-    let imported = config::load_path(&teamagent_config).expect("imported config");
+    let imported = config::load_path(&llmux_config).expect("imported config");
     let mut names: Vec<&str> = imported.accounts.iter().map(|a| a.name.as_str()).collect();
     names.sort_unstable();
     assert_eq!(
@@ -798,10 +798,10 @@ async fn background_refresh_renews_expiring_token_without_traffic() {
         "unrefreshed account stays unstamped"
     );
 
-    // …and visible in /teamagent/status alongside the token expiry, so the
+    // …and visible in /llmux/status alongside the token expiry, so the
     // dashboard can show "refreshed N ago" next to the countdown.
     let doc: serde_json::Value = reqwest::Client::new()
-        .get(proxy.url("/teamagent/status"))
+        .get(proxy.url("/llmux/status"))
         .send()
         .await
         .expect("status")
@@ -841,12 +841,12 @@ async fn startup_selects_and_logs_each_group_independently() {
     // Engine state: both groups have an independent initial selection.
     let snap = proxy.pool.snapshot();
     assert_eq!(
-        snap.current_for_group(teamagent::routing::BackendGroup::Claude)
+        snap.current_for_group(llmux::routing::BackendGroup::Claude)
             .cloned(),
         Some(AccountId("claudeacct".into()))
     );
     assert_eq!(
-        snap.current_for_group(teamagent::routing::BackendGroup::Codex)
+        snap.current_for_group(llmux::routing::BackendGroup::Codex)
             .cloned(),
         Some(AccountId("codexacct".into()))
     );
@@ -858,7 +858,7 @@ async fn startup_selects_and_logs_each_group_independently() {
     let mut found_codex_note = false;
     for _ in 0..40 {
         doc = client
-            .get(proxy.url("/teamagent/dashboard"))
+            .get(proxy.url("/llmux/dashboard"))
             .send()
             .await
             .expect("dashboard")
@@ -1058,7 +1058,7 @@ async fn codex_account_serves_anthropic_stream_with_tool_use() {
 
     // Converter usage feeds the proxy totals (dashboard keeps working).
     let account = AccountId("cx".into());
-    let mut totals = teamagent::proxy::server::AccountTotals::default();
+    let mut totals = llmux::proxy::server::AccountTotals::default();
     for _ in 0..50 {
         totals = proxy_totals(&proxy, &account).await;
         if totals.requests > 0 {
@@ -1071,14 +1071,11 @@ async fn codex_account_serves_anthropic_stream_with_tool_use() {
     assert_eq!(totals.output_tokens, 11);
 }
 
-/// Pull one account's totals out of `/teamagent/status`.
-async fn proxy_totals(
-    proxy: &Proxy,
-    account: &AccountId,
-) -> teamagent::proxy::server::AccountTotals {
+/// Pull one account's totals out of `/llmux/status`.
+async fn proxy_totals(proxy: &Proxy, account: &AccountId) -> llmux::proxy::server::AccountTotals {
     let client = reqwest::Client::new();
     let doc: serde_json::Value = client
-        .get(proxy.url("/teamagent/status"))
+        .get(proxy.url("/llmux/status"))
         .send()
         .await
         .expect("status")
@@ -1092,7 +1089,7 @@ async fn proxy_totals(
         .find(|a| a["name"] == account.0.as_str())
         .cloned()
         .unwrap_or_default();
-    teamagent::proxy::server::AccountTotals {
+    llmux::proxy::server::AccountTotals {
         requests: entry["totals"]["requests"].as_u64().unwrap_or(0),
         input_tokens: entry["totals"]["input_tokens"].as_u64().unwrap_or(0),
         output_tokens: entry["totals"]["output_tokens"].as_u64().unwrap_or(0),
@@ -1284,10 +1281,10 @@ fn epoch_secs_in(secs: u64) -> u64 {
         .as_secs()
 }
 
-/// Fetch the codex account entry from `/teamagent/status`.
+/// Fetch the codex account entry from `/llmux/status`.
 async fn status_account(proxy: &Proxy, name: &str) -> serde_json::Value {
     let doc: serde_json::Value = reqwest::Client::new()
-        .get(proxy.url("/teamagent/status"))
+        .get(proxy.url("/llmux/status"))
         .send()
         .await
         .expect("status")
@@ -1307,7 +1304,7 @@ async fn status_account(proxy: &Proxy, name: &str) -> serde_json::Value {
 /// streaming 200 with NO content-type header — the proxy must still treat
 /// the 2xx as SSE (stream:true is always sent upstream) and convert it,
 /// never wrap it into a 502. The x-codex-* quota headers on the same
-/// response must populate the account's 5h/7d windows in /teamagent/status.
+/// response must populate the account's 5h/7d windows in /llmux/status.
 #[tokio::test]
 async fn codex_200_without_content_type_streams_and_populates_quota_windows() {
     let mock = MockUpstream::spawn().await;
@@ -1396,7 +1393,7 @@ async fn codex_200_without_content_type_streams_and_populates_quota_windows() {
 
 /// C6: x-codex quota headers feed the real eligibility gates — a secondary
 /// (7d) window over the 99% ceiling shows up as a concrete blocking reason
-/// for the codex account in /teamagent/status.
+/// for the codex account in /llmux/status.
 #[tokio::test]
 async fn codex_quota_headers_drive_eligibility_gate_and_blocking_reason() {
     let mock = MockUpstream::spawn().await;
@@ -1473,9 +1470,9 @@ async fn codex_json_200_body_terminates_with_clean_error_event() {
 // 9c. Dashboard endpoint: the attach-mode document contract
 // ---------------------------------------------------------------------------
 
-/// Fetch `GET /teamagent/dashboard` as JSON (optionally with the proxy key).
+/// Fetch `GET /llmux/dashboard` as JSON (optionally with the proxy key).
 async fn get_dashboard(proxy: &Proxy, api_key: Option<&str>) -> reqwest::Response {
-    let mut request = reqwest::Client::new().get(proxy.url("/teamagent/dashboard"));
+    let mut request = reqwest::Client::new().get(proxy.url("/llmux/dashboard"));
     if let Some(key) = api_key {
         request = request.header("x-api-key", key);
     }
@@ -1541,7 +1538,7 @@ async fn dashboard_endpoint_serves_the_attach_document() {
     assert!(doc["version"]
         .as_str()
         .expect("version")
-        .starts_with("teamagent "));
+        .starts_with("llmux "));
     assert!(doc["pid"].as_u64().expect("pid") > 0);
     assert!(doc["port"].as_u64().expect("port") > 0);
     assert!(doc["uptime_secs"].is_u64());
@@ -1594,7 +1591,7 @@ async fn dashboard_endpoint_serves_the_attach_document() {
     // client deserializes (and then turns into a `DashboardView` — that
     // conversion is unit-tested in `tui::view`). Selection order and the
     // window reconstruction fields survive the round-trip.
-    let parsed: teamagent::dashboard::DashboardDoc =
+    let parsed: llmux::dashboard::DashboardDoc =
         serde_json::from_value(doc.clone()).expect("doc parses as DashboardDoc");
     assert_eq!(parsed.current.as_deref(), Some("b"));
     let parsed_names: Vec<&str> = parsed.accounts.iter().map(|a| a.name.as_str()).collect();
@@ -1609,9 +1606,9 @@ async fn dashboard_endpoint_serves_the_attach_document() {
 // 9d. Switch endpoint: manual account switch over HTTP
 // ---------------------------------------------------------------------------
 
-/// `POST /teamagent/switch` switches the current account (the server-side of
+/// `POST /llmux/switch` switches the current account (the server-side of
 /// the dashboard's `s`-key), and is gated by the SAME middleware as
-/// `/teamagent/status`: a bogus key from a loopback peer is still accepted
+/// `/llmux/status`: a bogus key from a loopback peer is still accepted
 /// (loopback is exempt), proving the route sits behind `client_auth` rather
 /// than bypassing it.
 #[tokio::test]
@@ -1634,7 +1631,7 @@ async fn switch_endpoint_switches_current_account() {
     // Loopback peer with a deliberately wrong key: still accepted (exempt),
     // and the switch commits.
     let response = client
-        .post(proxy.url("/teamagent/switch"))
+        .post(proxy.url("/llmux/switch"))
         .header("x-api-key", "definitely-not-the-key")
         .json(&serde_json::json!({ "account": "b" }))
         .send()
@@ -1652,7 +1649,7 @@ async fn switch_endpoint_switches_current_account() {
 
     // A switch to an unknown account is refused with a clear error (not 200).
     let response = client
-        .post(proxy.url("/teamagent/switch"))
+        .post(proxy.url("/llmux/switch"))
         .json(&serde_json::json!({ "account": "ghost" }))
         .send()
         .await
@@ -1671,8 +1668,8 @@ async fn switch_endpoint_switches_current_account() {
 // 10. Graceful shutdown endpoint
 // ---------------------------------------------------------------------------
 
-/// A1: `POST /teamagent/shutdown` answers 200 and the server exits — the
-/// port stops accepting connections (this is exactly what `teamagent stop`
+/// A1: `POST /llmux/shutdown` answers 200 and the server exits — the
+/// port stops accepting connections (this is exactly what `llmux stop`
 /// polls for).
 #[tokio::test]
 async fn shutdown_endpoint_stops_the_server() {
@@ -1681,7 +1678,7 @@ async fn shutdown_endpoint_stops_the_server() {
 
     let client = reqwest::Client::new();
     let response = client
-        .post(proxy.url("/teamagent/shutdown"))
+        .post(proxy.url("/llmux/shutdown"))
         .send()
         .await
         .expect("shutdown endpoint reachable");
@@ -1692,7 +1689,7 @@ async fn shutdown_endpoint_stops_the_server() {
     let mut stopped = false;
     for _ in 0..100 {
         let probe = reqwest::Client::new();
-        match probe.get(proxy.url("/teamagent/status")).send().await {
+        match probe.get(proxy.url("/llmux/status")).send().await {
             Err(err) if err.is_connect() => {
                 stopped = true;
                 break;
@@ -1703,7 +1700,7 @@ async fn shutdown_endpoint_stops_the_server() {
     assert!(stopped, "port must stop accepting after shutdown");
 }
 
-/// req8 + req8.1: `POST /teamagent/codex` changes the LIVE request shape — the
+/// req8 + req8.1: `POST /llmux/codex` changes the LIVE request shape — the
 /// next codex upstream request carries the new model, `service_tier:"priority"`
 /// (the wire value for fast mode), and `reasoning.effort`.
 #[tokio::test]
@@ -1716,7 +1713,7 @@ async fn codex_settings_endpoint_changes_the_upstream_request() {
 
     // Change codex settings via the control endpoint (loopback-exempt).
     let resp = client
-        .post(proxy.url("/teamagent/codex"))
+        .post(proxy.url("/llmux/codex"))
         .json(&serde_json::json!({
             "fast": true,
             "default_model": "gpt-5.5-codex",
@@ -1831,7 +1828,7 @@ async fn gpt_5_5_request_leases_codex_account() {
     let snapshot = proxy.pool.snapshot();
     assert_eq!(
         snapshot
-            .current_for_group(teamagent::routing::BackendGroup::Codex)
+            .current_for_group(llmux::routing::BackendGroup::Codex)
             .map(|c| c.0.as_str()),
         Some("codex-acct")
     );
@@ -1878,7 +1875,7 @@ async fn opus_request_leases_claude_account() {
     let snapshot = proxy.pool.snapshot();
     assert_eq!(
         snapshot
-            .current_for_group(teamagent::routing::BackendGroup::Claude)
+            .current_for_group(llmux::routing::BackendGroup::Claude)
             .map(|c| c.0.as_str()),
         Some("claude-acct")
     );
@@ -1960,12 +1957,12 @@ async fn empty_codex_group_errors() {
 // 12. Brew install (manual)
 // ---------------------------------------------------------------------------
 
-/// Acceptance #9: `brew install 2lab-ai/tap/teamagent-preview` installs a
+/// Acceptance #9: `brew install 2lab-ai/tap/llmux-preview` installs a
 /// release-workflow binary that runs. This requires the published tap +
 /// GitHub release artifacts — it is the dispatcher's manual verification
 /// step, not an in-repo test (kept `#[ignore]`d so the suite documents it).
 #[tokio::test]
 #[ignore = "manual: requires the published homebrew tap + release artifacts"]
 async fn brew_installed_binary_runs() {
-    unreachable!("run manually: brew install 2lab-ai/tap/teamagent-preview && teamagent --version")
+    unreachable!("run manually: brew install 2lab-ai/tap/llmux-preview && llmux --version")
 }

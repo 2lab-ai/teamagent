@@ -1,11 +1,11 @@
 ---
 name: deploy
-description: Use when the user says "배포", "배포해줘", "deploy", or "ship a preview" for teamagent. Pushes to master, lets CI publish a preview prerelease, refreshes the teamagent-preview brew formula, verifies brew actually updated, then hot-deploys that build locally and restarts.
+description: Use when the user says "배포", "배포해줘", "deploy", or "ship a preview" for llmux. Pushes to master, lets CI publish a preview prerelease, refreshes the llmux-preview brew formula, verifies brew actually updated, then hot-deploys that build locally and restarts.
 ---
 
 # deploy (배포) — preview channel
 
-Ship the current work as a **preview**: master → CI preview build → brew `teamagent-preview`
+Ship the current work as a **preview**: master → CI preview build → brew `llmux-preview`
 → local. For a local-only dev loop use `build`; for a stable release use `release`.
 
 Shared mechanics: `.claude/skills/_shared/cd-reference.md` (procedure A = hot-deploy,
@@ -20,19 +20,19 @@ procedure B = publish+verify brew).
    `git push origin master` (token fallback if needed).
 3. **Watch the preview build.**
    ```bash
-   rid=$(gh run list --repo 2lab-ai/teamagent --workflow preview.yml -L1 --json databaseId -q '.[0].databaseId')
-   gh run watch --repo 2lab-ai/teamagent "$rid" --exit-status
+   rid=$(gh run list --repo 2lab-ai/llmux --workflow preview.yml -L1 --json databaseId -q '.[0].databaseId')
+   gh run watch --repo 2lab-ai/llmux "$rid" --exit-status
    ```
    Success publishes prerelease `preview-<YYYY-MM-DD-HHMM>-<sha12>`.
-4. **Confirm the prerelease.** `gh release list --repo 2lab-ai/teamagent -L5` (preview is a
+4. **Confirm the prerelease.** `gh release list --repo 2lab-ai/llmux -L5` (preview is a
    *prerelease* — `gh release view` without a tag shows the stable one, not this). Note the
    new `preview-*` tag.
-5. **Publish + verify brew** — procedure B with `formula=teamagent-preview`. Dispatch the tap
-   `bump.yml`, watch it, `brew update && brew upgrade teamagent-preview`, confirm the brew
+5. **Publish + verify brew** — procedure B with `formula=llmux-preview`. Dispatch the tap
+   `bump.yml`, watch it, `brew update && brew upgrade llmux-preview`, confirm the brew
    version (`YYYY.MM.DD.HHMM`) matches the new preview tag's timestamp.
 6. **Hot-deploy + restart.** The brew build is already in the Cellar after upgrade, so:
-   `/opt/homebrew/bin/teamagent restart`. Verify `--version` reports `(preview <id>)`.
-7. **Verify.** `/opt/homebrew/bin/teamagent status` — daemon on the new preview build.
+   `/opt/homebrew/bin/llmux restart`. Verify `--version` reports `(preview <id>)`.
+7. **Verify.** `/opt/homebrew/bin/llmux status` — daemon on the new preview build.
 8. **Report** preview tag, brew version, running daemon version.
 
 ## Common mistakes

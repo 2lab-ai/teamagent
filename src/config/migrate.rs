@@ -43,7 +43,7 @@ pub fn default_claude_credentials_path() -> Result<PathBuf, ConfigError> {
 }
 
 /// Parse a teamclaude config file and return its accounts converted to the
-/// teamagent schema (camelCase → snake_case, `expiresAt` normalized to ms).
+/// llmux schema (camelCase → snake_case, `expiresAt` normalized to ms).
 /// Dedup against existing accounts is the caller's job (by `account_uuid`).
 pub fn import_teamclaude(path: &Path) -> Result<Vec<AccountConfig>, ConfigError> {
     Ok(import_teamclaude_config(path)?.accounts)
@@ -124,9 +124,9 @@ pub fn import_file(path: &Path) -> Result<Vec<AccountConfig>, ConfigError> {
     accounts_from_value(&value).map_err(ConfigError::Invalid)
 }
 
-/// Parse an inline JSON credential blob (`teamagent import --json`).
+/// Parse an inline JSON credential blob (`llmux import --json`).
 /// Accepts a single account object or an array of them, in either the
-/// teamagent or teamclaude field naming, or a `claudeAiOauth` envelope.
+/// llmux or teamclaude field naming, or a `claudeAiOauth` envelope.
 pub fn import_inline_json(json: &str) -> Result<Vec<AccountConfig>, ConfigError> {
     let value: Value = serde_json::from_str(json)?;
     accounts_from_value(&value).map_err(ConfigError::Invalid)
@@ -151,7 +151,7 @@ fn accounts_from_value(value: &Value) -> Result<Vec<AccountConfig>, String> {
 /// Lenient single-account conversion. Accepts:
 /// - `{"claudeAiOauth": {...}}` envelopes (tokens nested),
 /// - teamclaude camelCase (`accessToken`, `refreshToken`, `expiresAt`,
-///   `accountUuid`, `apiKey`) and teamagent snake_case fields,
+///   `accountUuid`, `apiKey`) and llmux snake_case fields,
 /// - `{"importFrom": "~/.claude/.credentials.json"}` indirection
 ///   (teamclaude config entries that defer to a credentials file),
 /// - explicit `"type"` or inference from which credential fields exist.

@@ -27,11 +27,11 @@ field is `service_tier: "priority"` (flex → `"flex"`; default → field omitte
 gated by the `FastMode` entitlement. Fast does **not** change the model slug or
 reasoning effort — only `service_tier`.
 
-teamagent now mirrors this: `config.codex.fast = true` ⇒ the Responses body
+llmux now mirrors this: `config.codex.fast = true` ⇒ the Responses body
 carries `service_tier: "priority"`. Reasoning effort
 (`none|minimal|low|medium|high|xhigh`) and the model slug are independently
 configurable. All three are settable live from the dashboard (`f`/`m`/`e`) via
-`POST /teamagent/codex`, and persisted.
+`POST /llmux/codex`, and persisted.
 
 ## 3. The 7d-usage bug was a percentage/fraction scale error (VERIFIED)
 
@@ -53,7 +53,7 @@ confirmed from the live header `7d-reset`).
 
 **Finding:** Claude Code derives the context-window size it displays from the
 **model-name string, client-side** — it is not read from any `/v1/messages`
-response field and teamagent serves no `/v1/models`. Sources:
+response field and llmux serves no `/v1/models`. Sources:
 - code.claude.com/docs/en/model-config — features (incl. the 1M window via the
   `[1m]` suffix) are enabled by matching the model ID against known patterns;
   the suffix is stripped before the request is sent.
@@ -63,11 +63,11 @@ response field and teamagent serves no `/v1/models`. Sources:
 
 gpt-5.5 on the Codex backend has a **400K** context window
 (openai.com/index/introducing-gpt-5-5). Because the value lives in Claude
-Code's client-side name→window table, **no teamagent response or endpoint can
+Code's client-side name→window table, **no llmux response or endpoint can
 set it.**
 
 **Workaround (works today):** type `/model gpt-5.5[1m]` in Claude Code. The
-`[1m]` suffix makes the client display a 1M window; teamagent's classifier
+`[1m]` suffix makes the client display a 1M window; llmux's classifier
 still routes it to codex (`gpt-` prefix), and the codex translator rewrites the
 model to the configured slug anyway. Caveat: this **over-reports** as 1M (true
 codex window is 400K); there is no documented way to display exactly "400K".

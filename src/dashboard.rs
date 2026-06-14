@@ -1,12 +1,12 @@
 //! Dashboard state + document: the single source of truth behind both the
-//! in-process TUI and the remote attach mode (`teamagent dashboard`).
+//! in-process TUI and the remote attach mode (`llmux dashboard`).
 //!
 //! - [`DashboardHub`] — server-owned fold of the activity-event stream and
 //!   the tracing bridge: activity ring, per-account totals, last switch,
 //!   poller health, log console. Lives in `proxy::server::AppState`; one
 //!   fold task ([`fold`]) consumes the event/log channels into it.
-//! - [`DashboardDoc`] — the serializable superset of `/teamagent/status`
-//!   served at `GET /teamagent/dashboard`. The local TUI builds the SAME
+//! - [`DashboardDoc`] — the serializable superset of `/llmux/status`
+//!   served at `GET /llmux/dashboard`. The local TUI builds the SAME
 //!   document in-process every frame and the remote client parses it from JSON,
 //!   so both render paths share one contract (`tui::view` converts it into
 //!   the view-model the draw code consumes).
@@ -261,11 +261,11 @@ fn trace_event(event: &ActivityEvent) {
 }
 
 // ---------------------------------------------------------------------------
-// Document: the GET /teamagent/dashboard contract
+// Document: the GET /llmux/dashboard contract
 // ---------------------------------------------------------------------------
 
-/// The `/teamagent/dashboard` document — a strict superset of
-/// `/teamagent/status` (same account fields and ordering) plus scheduler /
+/// The `/llmux/dashboard` document — a strict superset of
+/// `/llmux/status` (same account fields and ordering) plus scheduler /
 /// poller / totals / activity / log state. Serialized by the server, parsed
 /// by the attach-mode client, and built in-process by the local TUI — one
 /// contract, one renderer. Fields are additive only.
@@ -290,7 +290,7 @@ pub struct DashboardDoc {
     pub refresh_ahead_secs: u64,
     pub evaluate_tick_secs: u64,
     /// Selection order (current → eligible by rank → ineligible), same as
-    /// `/teamagent/status`.
+    /// `/llmux/status`.
     pub accounts: Vec<AccountDoc>,
     pub scheduler: SchedulerDoc,
     pub poller: Vec<PollerDoc>,
@@ -520,7 +520,7 @@ fn epoch_secs(at: SystemTime) -> u64 {
 }
 
 /// Derive the status word + blocking reason for one account — shared by
-/// `/teamagent/status` and `/teamagent/dashboard` so the wording never
+/// `/llmux/status` and `/llmux/dashboard` so the wording never
 /// drifts between the two documents.
 pub(crate) fn account_status_blocked(
     account: &AccountSnapshot,
@@ -747,7 +747,7 @@ pub(crate) fn dashboard_doc(
     }
 }
 
-/// Build the document from live server state — what `GET /teamagent/dashboard`
+/// Build the document from live server state — what `GET /llmux/dashboard`
 /// serves and what the local TUI renders each frame.
 pub(crate) fn build_doc(state: &AppState, now: SystemTime) -> DashboardDoc {
     let snapshot = state.pool.snapshot();
@@ -802,7 +802,7 @@ mod tests {
             uptime_secs: 130,
             port: 3456,
             upstream: "https://api.anthropic.com".into(),
-            config_path: Some("/tmp/teamagent.json".into()),
+            config_path: Some("/tmp/llmux.json".into()),
             refresh_ahead_secs: 7 * 3600,
             evaluate_tick_secs: 60,
             codex: CodexSettingsDoc {
@@ -942,13 +942,13 @@ mod tests {
     #[test]
     fn doc_is_a_status_superset_with_accounts_in_selection_order() {
         let doc = seeded_doc();
-        assert!(doc.version.starts_with("teamagent "));
+        assert!(doc.version.starts_with("llmux "));
         assert_eq!(doc.pid, 4321);
         assert_eq!(doc.port, 3456);
         assert_eq!(doc.uptime_secs, 130);
         assert_eq!(doc.current.as_deref(), Some("a"));
         assert_eq!(doc.upstream, "https://api.anthropic.com");
-        assert_eq!(doc.config_path.as_deref(), Some("/tmp/teamagent.json"));
+        assert_eq!(doc.config_path.as_deref(), Some("/tmp/llmux.json"));
 
         // Selection order: current first, parked account last.
         let names: Vec<&str> = doc.accounts.iter().map(|a| a.name.as_str()).collect();

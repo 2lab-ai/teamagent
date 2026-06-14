@@ -1,4 +1,4 @@
-//! teamagent binary entry: parse the CLI, dispatch.
+//! llmux binary entry: parse the CLI, dispatch.
 //!
 //! Tracing is initialized inside `cli::dispatch`, not here: the `server`
 //! command must pick its own subscriber (TUI bridge on a TTY, plain stderr
@@ -11,8 +11,8 @@ use clap::Parser;
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let cli = teamagent::cli::Cli::parse();
-    match teamagent::cli::dispatch(cli).await {
+    let cli = llmux::cli::Cli::parse();
+    match llmux::cli::dispatch(cli).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("error: {err}");

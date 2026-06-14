@@ -1998,12 +1998,12 @@ mod tests {
         ));
         // Seed a config file so persistence is exercised end-to-end.
         let dir = std::env::temp_dir().join(format!(
-            "teamagent-fwd-test-{}-{}",
+            "llmux-fwd-test-{}-{}",
             std::process::id(),
             ulid::Ulid::new()
         ));
         std::fs::create_dir_all(&dir).expect("tmp dir");
-        let config_path = dir.join("teamagent.json");
+        let config_path = dir.join("llmux.json");
         crate::config::save_path(&config_path, &state.config).expect("seed config");
         state.config_path = Some(config_path.clone());
 

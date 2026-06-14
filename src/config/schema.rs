@@ -1,4 +1,4 @@
-//! Config schema v1 for `~/.config/teamagent.json` (see `.prd/02-architecture.md`).
+//! Config schema v1 for `~/.config/llmux.json` (see `.prd/02-architecture.md`).
 //! These structs are the on-disk contract; they are complete and purely declarative.
 
 use serde::{Deserialize, Serialize};
@@ -16,7 +16,7 @@ pub const DEFAULT_CODEX_UPSTREAM: &str = "https://chatgpt.com/backend-api/codex"
 /// Default OpenAI OAuth token endpoint used to refresh Codex access tokens.
 pub const DEFAULT_CODEX_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 
-/// Root of `~/.config/teamagent.json`.
+/// Root of `~/.config/llmux.json`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Config {
     /// Schema version. Always `1` for now; bump on breaking layout changes.

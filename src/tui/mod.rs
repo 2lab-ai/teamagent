@@ -4,13 +4,13 @@
 //! (pointers to the CLI), `l` log-panel size, `d` detail toggle.
 //!
 //! Two entry points, ONE renderer:
-//! - [`run_local`] — in-process mode (`teamagent server` on a TTY): renders
+//! - [`run_local`] — in-process mode (`llmux server` on a TTY): renders
 //!   live `AppState` (pool + dashboard hub) directly.
-//! - [`run_remote`] — attach mode (`teamagent dashboard`, or `teamagent
+//! - [`run_remote`] — attach mode (`llmux dashboard`, or `llmux
 //!   server` when a daemon already owns the port): polls
-//!   `GET /teamagent/dashboard` every second and renders the fetched
+//!   `GET /llmux/dashboard` every second and renders the fetched
 //!   document. Mostly read-only: manual switch goes through
-//!   `POST /teamagent/switch`; config mutation keys (`a`/`r`/`R`) are
+//!   `POST /llmux/switch`; config mutation keys (`a`/`r`/`R`) are
 //!   local-mode-only.
 //!
 //! Both paths build the same [`view::DashboardView`] (local: from an
@@ -21,7 +21,7 @@ pub(crate) mod activity;
 mod anim;
 mod event;
 // pub(crate): `cli::status` reuses the token/age formatters so the plain
-// `teamagent status` output and the dashboard agree on the display.
+// `llmux status` output and the dashboard agree on the display.
 pub(crate) mod format;
 pub(crate) mod logs;
 mod ui;
@@ -67,7 +67,7 @@ fn codex_status_line(c: &CodexSettingsDoc) -> String {
 const RENDER_TICK: Duration = Duration::from_millis(120);
 /// Input drain cadence — faster than the render tick so keys feel immediate.
 const INPUT_TICK: Duration = Duration::from_millis(33);
-/// Remote poll cadence for `GET /teamagent/dashboard`.
+/// Remote poll cadence for `GET /llmux/dashboard`.
 const FETCH_TICK: Duration = Duration::from_secs(1);
 /// How long a transient status-line message stays on screen.
 const STATUS_TTL: Duration = Duration::from_secs(5);
@@ -163,7 +163,7 @@ struct Remote {
     /// (key handling is sync; the POST is not).
     pending_switch: Option<String>,
     /// Codex settings change (fast/model/effort) queued by a key, performed by
-    /// the event loop via `POST /teamagent/codex` (req8.1).
+    /// the event loop via `POST /llmux/codex` (req8.1).
     pending_codex: Option<crate::dashboard::CodexSettingsDoc>,
 }
 
@@ -300,17 +300,16 @@ impl App {
             // local-mode-only (config mutation stays on the server host).
             KeyCode::Char('a') => {
                 self.set_status(if self.is_remote() {
-                    "add: local mode only — run `teamagent login` on the server host".into()
+                    "add: local mode only — run `llmux login` on the server host".into()
                 } else {
-                    "add: run `teamagent login` (or `teamagent login --api`)".into()
+                    "add: run `llmux login` (or `llmux login --api`)".into()
                 });
             }
             KeyCode::Char('r') => {
                 self.set_status(if self.is_remote() {
-                    "remove: local mode only — run `teamagent remove <name>` on the server host"
-                        .into()
+                    "remove: local mode only — run `llmux remove <name>` on the server host".into()
                 } else {
-                    "remove: run `teamagent remove <name>`".into()
+                    "remove: run `llmux remove <name>`".into()
                 });
             }
             KeyCode::Char('l') => self.log_panel = self.log_panel.cycle(),
@@ -344,9 +343,7 @@ impl App {
                 c.fast = !c.fast;
                 self.set_codex(c);
             }
-            None => {
-                self.set_status("codex: no codex account (run `teamagent login --codex`)".into())
-            }
+            None => self.set_status("codex: no codex account (run `llmux login --codex`)".into()),
         }
     }
 
@@ -413,12 +410,12 @@ impl App {
         }
     }
 
-    /// Perform the queued remote codex change (`POST /teamagent/codex`).
+    /// Perform the queued remote codex change (`POST /llmux/codex`).
     async fn perform_remote_codex(&mut self, new: CodexSettingsDoc) {
         let Backend::Remote(remote) = &mut self.backend else {
             return;
         };
-        let url = format!("{}/teamagent/codex", remote.base_url);
+        let url = format!("{}/llmux/codex", remote.base_url);
         let mut request = remote.client.post(&url).json(&serde_json::json!({
             "fast": new.fast,
             "default_model": new.model,
@@ -544,12 +541,12 @@ impl App {
         }
     }
 
-    /// Perform the queued remote switch (`POST /teamagent/switch`).
+    /// Perform the queued remote switch (`POST /llmux/switch`).
     async fn perform_remote_switch(&mut self, target: String) {
         let Backend::Remote(remote) = &mut self.backend else {
             return;
         };
-        let url = format!("{}/teamagent/switch", remote.base_url);
+        let url = format!("{}/llmux/switch", remote.base_url);
         let mut request = remote
             .client
             .post(&url)
@@ -589,7 +586,7 @@ pub async fn run_local(state: crate::proxy::server::AppState) -> std::io::Result
     result
 }
 
-/// Attach to a running daemon: poll `GET /teamagent/dashboard` every second
+/// Attach to a running daemon: poll `GET /llmux/dashboard` every second
 /// and render the fetched document with the same draw code as local mode. A
 /// lost connection shows a reconnect banner and keeps retrying — never
 /// crashes the client.
@@ -631,7 +628,7 @@ async fn fetch_loop(
     api_key: Option<String>,
     tx: mpsc::Sender<FetchMsg>,
 ) {
-    let url = format!("{base_url}/teamagent/dashboard");
+    let url = format!("{base_url}/llmux/dashboard");
     let mut interval = tokio::time::interval(FETCH_TICK);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {

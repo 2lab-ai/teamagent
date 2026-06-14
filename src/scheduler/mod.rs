@@ -343,7 +343,7 @@ impl PoolState {
         Ok(())
     }
 
-    /// Immutable snapshot for the pure selector and for `/teamagent/status`.
+    /// Immutable snapshot for the pure selector and for `/llmux/status`.
     pub fn snapshot(&self) -> PoolSnapshot {
         PoolSnapshot {
             accounts: self

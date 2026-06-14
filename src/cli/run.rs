@@ -1,4 +1,4 @@
-//! `teamagent run [-- args]` — ensure the proxy is running (auto-starting a
+//! `llmux run [-- args]` — ensure the proxy is running (auto-starting a
 //! background daemon when needed), then spawn `claude` with the proxy env
 //! injected.
 
@@ -19,13 +19,13 @@ pub async fn run(args: RunArgs) -> Result<(), CliError> {
     match ensure_server_running(&config, args.force).await? {
         EnsureOutcome::Started { pid } => {
             eprintln!(
-                "started teamagent server (pid {pid}) on port {}",
+                "started llmux server (pid {pid}) on port {}",
                 config.proxy.port
             );
         }
         EnsureOutcome::Restarted { pid } => {
             eprintln!(
-                "restarted teamagent server (pid {pid}) on port {} → {}",
+                "restarted llmux server (pid {pid}) on port {} → {}",
                 config.proxy.port,
                 crate::build_info::version_string()
             );

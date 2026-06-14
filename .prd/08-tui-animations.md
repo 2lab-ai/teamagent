@@ -5,7 +5,7 @@
 Source: https://github.com/czl9707/agents-are-thinking (Rust crate, no runtime deps,
 also WASM/PyO3 bindings). It's a library of **48 terminal "thinking" effects across 6
 glyph families**, each an `Effect` with a `cycle_length` and a `step() -> frame` state
-machine. Only the *ideas* were taken; teamagent does not depend on the crate.
+machine. Only the *ideas* were taken; llmux does not depend on the crate.
 
 - **Glyph families**: `braille` (U+2800–28FF dot patterns), `shade` (`░▒▓█`),
   `bar` (`▁▂▃▄▅▆▇█`), `vblock` (vertical blocks), `square`, `dot`.
@@ -15,7 +15,7 @@ machine. Only the *ideas* were taken; teamagent does not depend on the crate.
 - **Model**: one shared frame counter advances every tick; each effect is a pure
   `frame → glyph(s)` function. Cheap, deterministic, testable.
 
-### Adaptation constraints for teamagent
+### Adaptation constraints for llmux
 
 - The reference renders multi-line *grids* (for a web preview). Our dashboard needs
   **one glyph per table row** → we use single-char frame cycles, not grids.
@@ -53,5 +53,5 @@ cadence raised 250ms → 120ms (~8fps) so motion is smooth, not choppy.
   (auth failed) / dim drift (stale). The status column widened 18 → 20 to fit the
   leading glyph alongside the longest reason ("usage stale 14m03s").
 
-Animation works identically in the local TUI and the `teamagent dashboard` attach client
+Animation works identically in the local TUI and the `llmux dashboard` attach client
 (both render from `chrome.frame`).

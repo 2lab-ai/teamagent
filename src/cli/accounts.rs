@@ -1,4 +1,4 @@
-//! `teamagent accounts [-v]` and `teamagent remove <name>` — account
+//! `llmux accounts [-v]` and `llmux remove <name>` — account
 //! roster management. Both work purely from the config file (no network,
 //! no running server required).
 
@@ -13,7 +13,7 @@ pub async fn list(args: AccountsArgs) -> Result<(), CliError> {
 
     if config.accounts.is_empty() {
         println!("No accounts configured.");
-        println!("Add one with: teamagent import, teamagent login, or teamagent login --api");
+        println!("Add one with: llmux import, llmux login, or llmux login --api");
         return Ok(());
     }
 
@@ -74,7 +74,7 @@ pub async fn remove(args: RemoveArgs) -> Result<(), CliError> {
     let config = crate::config::load()?;
     if !config.accounts.iter().any(|a| a.name == args.name) {
         return Err(CliError::Message(format!(
-            "account {:?} not found (see `teamagent accounts`)",
+            "account {:?} not found (see `llmux accounts`)",
             args.name
         )));
     }

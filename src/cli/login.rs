@@ -1,4 +1,4 @@
-//! `teamagent login [--api | --codex]` — add an account.
+//! `llmux login [--api | --codex]` — add an account.
 
 use crate::auth::{codex, oauth, profile};
 use crate::config::{AccountConfig, AccountCredential, Config, Upsert};

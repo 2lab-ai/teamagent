@@ -1,7 +1,7 @@
 //! Tracing output routing. Two modes, chosen by the command path:
 //!
 //! - [`init_plain`] — fmt logs to stderr (every non-server command, and
-//!   `teamagent server` without a TTY). The pre-existing behavior.
+//!   `llmux server` without a TTY). The pre-existing behavior.
 //! - [`init_tui_bridge`] — installs ONLY a channel bridge layer: each event
 //!   is formatted to one compact line and `try_send`-ed into a bounded
 //!   channel the TUI drains into its log console. Nothing writes to

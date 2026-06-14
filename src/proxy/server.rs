@@ -1,4 +1,4 @@
-//! axum listener + routing: `/teamagent/status`, raw `/v1/oauth/token`
+//! axum listener + routing: `/llmux/status`, raw `/v1/oauth/token`
 //! relay, and a catch-all that forwards everything else upstream (FR1).
 
 use std::collections::HashMap;
@@ -105,7 +105,7 @@ pub struct AppState {
     pub classifier: Arc<crate::routing::Classifier>,
     /// Coalesces concurrent OAuth refreshes per account.
     pub refresher: Arc<RefreshCoalescer>,
-    /// Per-account relayed-traffic totals for `/teamagent/status`.
+    /// Per-account relayed-traffic totals for `/llmux/status`.
     pub totals: Arc<UsageTotals>,
     /// Where refreshed tokens are persisted (read-merge-write). `None`
     /// disables persistence (tests).
@@ -117,7 +117,7 @@ pub struct AppState {
     pub events: Option<tokio::sync::mpsc::Sender<ActivityEvent>>,
     /// Server-owned dashboard fold (activity ring, totals, last switch,
     /// poller health, log console). The local TUI renders it directly; the
-    /// `GET /teamagent/dashboard` endpoint serializes it.
+    /// `GET /llmux/dashboard` endpoint serializes it.
     pub hub: Arc<DashboardHub>,
     /// Activity-event receiver, taken by `serve` to spawn the fold task.
     /// `Mutex<Option<_>>` so `AppState` stays `Clone` (the receiver is a
@@ -129,12 +129,12 @@ pub struct AppState {
     pending_logs: Arc<Mutex<Option<tokio::sync::mpsc::Receiver<LogLine>>>>,
     /// Per-process request id source for activity-event correlation.
     pub request_counter: Arc<AtomicU64>,
-    /// Server start, for `/teamagent/status` uptime.
+    /// Server start, for `/llmux/status` uptime.
     pub started: Instant,
     /// Actually bound port (config port until `serve` binds; the OS-assigned
     /// port afterwards — matters for `proxy.port = 0` test servers).
     pub bound_port: Arc<AtomicU16>,
-    /// Graceful-shutdown trigger fired by `POST /teamagent/shutdown`.
+    /// Graceful-shutdown trigger fired by `POST /llmux/shutdown`.
     pub shutdown: Arc<tokio::sync::Notify>,
 }
 
@@ -473,16 +473,16 @@ pub async fn background_refresh_pass(state: &AppState) {
     }
 }
 
-/// Build the router: `GET /teamagent/status`, `POST /teamagent/shutdown`,
+/// Build the router: `GET /llmux/status`, `POST /llmux/shutdown`,
 /// `POST /v1/oauth/token` (raw relay), fallback → [`forward_any`]. Every
 /// route sits behind the proxy api-key check (loopback peers exempt).
 pub fn router(state: AppState) -> Router {
     Router::new()
-        .route("/teamagent/status", get(status))
-        .route("/teamagent/dashboard", get(dashboard_endpoint))
-        .route("/teamagent/switch", post(switch_endpoint))
-        .route("/teamagent/codex", post(codex_config_endpoint))
-        .route("/teamagent/shutdown", post(shutdown))
+        .route("/llmux/status", get(status))
+        .route("/llmux/dashboard", get(dashboard_endpoint))
+        .route("/llmux/switch", post(switch_endpoint))
+        .route("/llmux/codex", post(codex_config_endpoint))
+        .route("/llmux/shutdown", post(shutdown))
         .route("/v1/oauth/token", post(oauth_token_relay))
         .fallback(forward_any)
         .layer(axum::middleware::from_fn_with_state(
@@ -538,7 +538,7 @@ fn epoch_secs(at: SystemTime) -> u64 {
         .unwrap_or(0)
 }
 
-/// Server-process facts for `/teamagent/status` that are not pool state.
+/// Server-process facts for `/llmux/status` that are not pool state.
 #[derive(Debug, Clone, Copy)]
 pub struct ServerMeta {
     pub pid: u32,
@@ -546,7 +546,7 @@ pub struct ServerMeta {
     pub port: u16,
 }
 
-/// Serializable `/teamagent/status` document — pure function of a pool
+/// Serializable `/llmux/status` document — pure function of a pool
 /// snapshot + totals + select params + server meta so the shape is
 /// unit-testable without a socket. Fields are additive only (the CLI parses
 /// this across versions). The `accounts` array is emitted in the
@@ -637,7 +637,7 @@ pub fn status_json(
     })
 }
 
-/// `GET /teamagent/status` — JSON scheduler/account state (pool snapshot,
+/// `GET /llmux/status` — JSON scheduler/account state (pool snapshot,
 /// current account, cooldowns, build info, pid/uptime/port).
 async fn status(State(state): State<AppState>) -> Response {
     let meta = ServerMeta {
@@ -660,11 +660,11 @@ async fn status(State(state): State<AppState>) -> Response {
         .into_response()
 }
 
-/// `GET /teamagent/dashboard` — the [`crate::dashboard::DashboardDoc`]: a
-/// strict superset of `/teamagent/status` (same account fields and ordering)
+/// `GET /llmux/dashboard` — the [`crate::dashboard::DashboardDoc`]: a
+/// strict superset of `/llmux/status` (same account fields and ordering)
 /// plus scheduler / poller / totals / activity / log state. Behind the same
 /// loopback + proxy-api-key gate as every route. The attach-mode client
-/// (`teamagent dashboard`) polls this; the local TUI builds the same document
+/// (`llmux dashboard`) polls this; the local TUI builds the same document
 /// in-process — one contract, one renderer.
 async fn dashboard_endpoint(State(state): State<AppState>) -> Response {
     let doc = dashboard::build_doc(&state, SystemTime::now());
@@ -682,13 +682,13 @@ async fn dashboard_endpoint(State(state): State<AppState>) -> Response {
     }
 }
 
-/// Request body for `POST /teamagent/switch`.
+/// Request body for `POST /llmux/switch`.
 #[derive(serde::Deserialize)]
 struct SwitchRequest {
     account: String,
 }
 
-/// `POST /teamagent/switch` `{"account":"<name>"}` — manual account switch,
+/// `POST /llmux/switch` `{"account":"<name>"}` — manual account switch,
 /// the server-side of the dashboard's `s`-key path. Same gate as every route
 /// (loopback exempt, otherwise the proxy api key). Runs the identical
 /// `AccountPool::switch_to` the in-process TUI calls, emits the
@@ -724,7 +724,7 @@ async fn switch_endpoint(
     }
 }
 
-/// Partial update for `POST /teamagent/codex` (req8.1 — dashboard codex
+/// Partial update for `POST /llmux/codex` (req8.1 — dashboard codex
 /// settings). Every field is optional; an omitted field keeps its current
 /// value. For `reasoning_effort`, an empty string or `"unset"` clears it
 /// (back to the backend default). Applies to the LIVE provider immediately and
@@ -781,12 +781,12 @@ async fn codex_config_endpoint(
         .into_response()
 }
 
-/// `POST /teamagent/shutdown` — graceful server exit (same loopback /
+/// `POST /llmux/shutdown` — graceful server exit (same loopback /
 /// proxy-api-key rules as every route, via the shared middleware). The 200
 /// is delivered before the process exits: hyper's graceful shutdown stops
 /// accepting new connections and completes in-flight responses first.
 async fn shutdown(State(state): State<AppState>) -> Response {
-    tracing::info!("shutdown requested via /teamagent/shutdown");
+    tracing::info!("shutdown requested via /llmux/shutdown");
     state.shutdown.notify_one();
     (
         StatusCode::OK,
@@ -917,26 +917,26 @@ mod tests {
     fn client_auth_loopback_is_exempt() {
         let v4 = IpAddr::V4(Ipv4Addr::LOCALHOST);
         let v6 = IpAddr::V6(Ipv6Addr::LOCALHOST);
-        assert!(client_auth_ok(Some("ta-secret"), Some(v4), None));
-        assert!(client_auth_ok(Some("ta-secret"), Some(v6), None));
+        assert!(client_auth_ok(Some("lm-secret"), Some(v4), None));
+        assert!(client_auth_ok(Some("lm-secret"), Some(v6), None));
     }
 
     #[test]
     fn client_auth_remote_requires_matching_key() {
         let remote = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5));
         assert!(client_auth_ok(
-            Some("ta-secret"),
+            Some("lm-secret"),
             Some(remote),
-            Some("ta-secret")
+            Some("lm-secret")
         ));
-        assert!(!client_auth_ok(Some("ta-secret"), Some(remote), None));
+        assert!(!client_auth_ok(Some("lm-secret"), Some(remote), None));
         assert!(!client_auth_ok(
-            Some("ta-secret"),
+            Some("lm-secret"),
             Some(remote),
             Some("wrong")
         ));
         assert!(
-            !client_auth_ok(Some("ta-secret"), None, None),
+            !client_auth_ok(Some("lm-secret"), None, None),
             "unknown peer is not exempt"
         );
     }
@@ -984,7 +984,7 @@ mod tests {
         assert!(doc["version"]
             .as_str()
             .expect("version string")
-            .starts_with("teamagent "));
+            .starts_with("llmux "));
         assert_eq!(doc["pid"], 4321);
         assert_eq!(doc["uptime_secs"], 7980);
         assert_eq!(doc["port"], 3456);

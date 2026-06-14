@@ -38,7 +38,7 @@ pub enum AuthError {
         status: http::StatusCode,
         body: String,
     },
-    /// Profile response was 200 but lacked a field teamagent cannot work
+    /// Profile response was 200 but lacked a field llmux cannot work
     /// without (`account.uuid` is the dedup key; `account.email` the name).
     #[error("profile response missing {0}")]
     ProfileIncomplete(&'static str),

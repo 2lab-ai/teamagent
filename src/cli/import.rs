@@ -1,4 +1,4 @@
-//! `teamagent import [--from PATH | --json J]` — bring accounts in from
+//! `llmux import [--from PATH | --json J]` — bring accounts in from
 //! teamclaude config, `~/.claude/.credentials.json`, or inline JSON.
 //! Works fully offline: profile enrichment is a TODO until `auth` lands.
 

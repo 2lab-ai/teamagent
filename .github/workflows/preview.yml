@@ -2,7 +2,7 @@ name: Preview
 
 # Publishes a prerelease `preview-<YYYY-MM-DD-HHMM>-<sha12>` with 4 binaries
 # + SHA256SUMS on every push to main/master (and on demand). The tap's
-# bump-teamagent-preview job derives the brew version (YYYY.MM.DD.HHMM)
+# bump-llmux-preview job derives the brew version (YYYY.MM.DD.HHMM)
 # from this tag, so the tag format is load-bearing.
 
 on:
@@ -56,22 +56,22 @@ jobs:
         include:
           - target: aarch64-apple-darwin
             os: macos-latest
-            name: teamagent-macos-aarch64
+            name: llmux-macos-aarch64
           - target: x86_64-apple-darwin
             os: macos-latest
-            name: teamagent-macos-x86_64
+            name: llmux-macos-x86_64
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-            name: teamagent-linux-x86_64
+            name: llmux-linux-x86_64
           # Native arm64 runner (free for public repos) — no cross/zigbuild needed.
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
-            name: teamagent-linux-aarch64
+            name: llmux-linux-aarch64
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     env:
-      TEAMAGENT_BUILD_CHANNEL: preview
-      TEAMAGENT_BUILD_ID: ${{ needs.preflight.outputs.build_id }}
+      LLMUX_BUILD_CHANNEL: preview
+      LLMUX_BUILD_ID: ${{ needs.preflight.outputs.build_id }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -95,7 +95,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cp "target/${{ matrix.target }}/release/teamagent" "${{ matrix.name }}"
+          cp "target/${{ matrix.target }}/release/llmux" "${{ matrix.name }}"
           if [ "${{ runner.os }}" = "Linux" ]; then
             sha256sum "${{ matrix.name }}" > "${{ matrix.name }}.sha256"
           else
@@ -130,15 +130,15 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p release
-          for asset in teamagent-macos-aarch64 teamagent-macos-x86_64 teamagent-linux-x86_64 teamagent-linux-aarch64; do
+          for asset in llmux-macos-aarch64 llmux-macos-x86_64 llmux-linux-x86_64 llmux-linux-aarch64; do
             cp "artifacts/$asset/$asset" "release/$asset"
           done
-          (cd release && sha256sum teamagent-* > SHA256SUMS)
+          (cd release && sha256sum llmux-* > SHA256SUMS)
           cat release/SHA256SUMS
           {
             echo "Preview build \`${{ needs.preflight.outputs.build_id }}\` from ${{ needs.preflight.outputs.commit }}."
             echo
-            echo "Install: \`brew install 2lab-ai/tap/teamagent-preview\`"
+            echo "Install: \`brew install 2lab-ai/tap/llmux-preview\`"
             echo
             echo '```'
             cat release/SHA256SUMS
@@ -155,10 +155,10 @@ jobs:
           make_latest: false
           target_commitish: ${{ needs.preflight.outputs.commit }}
           files: |
-            release/teamagent-macos-aarch64
-            release/teamagent-macos-x86_64
-            release/teamagent-linux-x86_64
-            release/teamagent-linux-aarch64
+            release/llmux-macos-aarch64
+            release/llmux-macos-x86_64
+            release/llmux-linux-x86_64
+            release/llmux-linux-aarch64
             release/SHA256SUMS
 
       - name: Prune old preview prereleases (keep 15)

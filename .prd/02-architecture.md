@@ -1,4 +1,4 @@
-# teamagent — Architecture
+# llmux — Architecture
 
 Rust, edition 2021. Single binary, tokio multi-thread runtime. Module layout follows herdr's
 state/runtime separation: scheduler decisions are pure functions over snapshots, runtime state is
@@ -14,7 +14,7 @@ src/
     mod.rs             # server/dashboard/run/stop dispatch, daemon attach decision
     daemon.rs          # probe/spawn/wait/stop helpers (herdr-style client/server)
     login.rs import.rs run.rs status.rs accounts.rs api.rs env.rs
-  config/              # ~/.config/teamagent.json load/save, atomic read-merge-write
+  config/              # ~/.config/llmux.json load/save, atomic read-merge-write
     mod.rs schema.rs migrate.rs
   auth/
     oauth.rs           # Claude PKCE flow, token exchange, refresh (coalesced)
@@ -28,7 +28,7 @@ src/
     headers.rs         # Anthropic unified + Codex x-codex-* header parsing
     usage.rs           # /api/oauth/usage poller (Claude OAuth only, backoff ladder)
   proxy/
-    server.rs          # axum listener, /teamagent/* control endpoints, background tasks
+    server.rs          # axum listener, /llmux/* control endpoints, background tasks
     forward.rs         # request rewrite, provider dispatch, retry taxonomy, refresh choke point
     sse.rs             # passthrough + transform relay; SseTransform trait
     logging.rs         # optional request logs, credential masking
@@ -37,7 +37,7 @@ src/
     anthropic.rs       # passthrough impl (identity hooks, zero-copy fast path)
     codex.rs           # Anthropic Messages <-> OpenAI Responses translation + SSE converter
     stubs.rs           # gemini/local compile-checked drafts
-  dashboard.rs         # DashboardHub + DashboardDoc (/teamagent/dashboard contract)
+  dashboard.rs         # DashboardHub + DashboardDoc (/llmux/dashboard contract)
   tui/
     mod.rs             # local + remote dashboard loops, attach client
     view.rs            # DashboardView: single render input from live state or DashboardDoc
@@ -55,7 +55,7 @@ tests/
 Claude Code
   │ ANTHROPIC_BASE_URL=http://localhost:3456
   ▼
-teamagent daemon (axum)
+llmux daemon (axum)
   ├─ AccountPool (scheduler state, windows, leases)
   ├─ Provider dispatch
   │   ├─ AnthropicPassthrough → https://api.anthropic.com
@@ -66,15 +66,15 @@ teamagent daemon (axum)
   │   ├─ scheduler re-evaluation tick
   │   └─ DashboardHub fold (activity/log/poller/switch state)
   └─ Control API
-      ├─ GET  /teamagent/status
-      ├─ GET  /teamagent/dashboard
-      ├─ POST /teamagent/switch
-      └─ POST /teamagent/shutdown
+      ├─ GET  /llmux/status
+      ├─ GET  /llmux/dashboard
+      ├─ POST /llmux/switch
+      └─ POST /llmux/shutdown
 ```
 
-`teamagent run` is a client command: it probes `/teamagent/status`, spawns a detached daemon with
+`llmux run` is a client command: it probes `/llmux/status`, spawns a detached daemon with
 `server --no-tui` if none is running, waits until ready, then launches `claude` with
-`ANTHROPIC_BASE_URL`. `teamagent dashboard` is an attach client: it polls `/teamagent/dashboard`
+`ANTHROPIC_BASE_URL`. `llmux dashboard` is an attach client: it polls `/llmux/dashboard`
 and renders the same ratatui layout without binding the proxy port.
 
 ## Concurrency model
@@ -104,8 +104,8 @@ Codex x-codex-* headers ─────┼──> headers.rs ─────┐
                                                                ▼
                          select.rs::pick(snapshot, now) — pure, deterministic
                          1 gates: health, cooldown, thresholds, staleness
-                         2 current stickiness
-                         3 rank: min(7d reset) → min(5h util) → id → provider tier
+                         2 stickiness + perishability override (SWITCH_MARGIN)
+                         3 rank: max score (servable×urgency) → min 5h → min 7d reset → id
                                                                │
                          switch_to(expected_current, target)  # CAS-ish, lease guard
 ```
@@ -127,8 +127,9 @@ has no usage poller, so staleness does not gate it; quota thresholds still gate 
    - `oauth` / `apikey` → `AnthropicPassthrough`.
    - `codex` → `CodexProvider`.
 
-   With routing disabled (default) no group filter is applied: a single legacy current slot is
-   used and codex stays the cross-group overflow pool — exactly the prior behavior.
+   Routing is **on by default**, so the `model` normally selects the group. With routing disabled
+   no group filter is applied: a single legacy current slot is used and codex becomes the
+   cross-group overflow pool — the older behavior.
 3. Refresh credential if near expiry; on one 401, force refresh and retry once.
 4. Build provider request:
    - Anthropic: identity body, inject Bearer or x-api-key.
@@ -160,7 +161,9 @@ has no usage poller, so staleness does not gate it; quota thresholds still gate 
   "upstream": "https://api.anthropic.com",
   "codex": {
     "upstream": "https://chatgpt.com/backend-api/codex",
-    "token_url": "https://auth.openai.com/oauth/token"
+    "token_url": "https://auth.openai.com/oauth/token",
+    "default_model": "gpt-5.5",
+    "fast": false
   },
   "scheduler": {
     "five_hour_max": 0.90,
@@ -170,7 +173,7 @@ has no usage poller, so staleness does not gate it; quota thresholds still gate 
     "refresh_ahead_secs": 25200
   },
   "routing": {            // model→backend-group routing; all keys default-able
-    "enabled": false,    // false = today's overflow behavior (no group filter)
+    "enabled": true,     // default; false = Codex-as-overflow (no group filter)
     "claude_models": [],  // empty = builtin rules; non-empty replaces them
     "codex_models": [],
     "default_group": "claude",   // unmatched / model-less request lands here
@@ -200,7 +203,8 @@ translator therefore:
 - maps Anthropic text blocks to `input_text`/`output_text`;
 - maps `tool_use` to `function_call` and `tool_result` to `function_call_output`;
 - drops request-side images/thinking in v0.1 with warnings;
-- pins `model` to `gpt-5.5`, sets `stream: true`, `store: false`, and a stable `prompt_cache_key`.
+- sends `codex.default_model` (default `gpt-5.5`), optional `service_tier`/`reasoning.effort`,
+  `stream: true`, `store: false`, and a stable `prompt_cache_key`.
 
 The response converter is a state machine over Responses SSE events:
 - `response.created` → Anthropic `message_start`;

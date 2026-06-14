@@ -1,4 +1,4 @@
-//! `teamagent api <path>` — debug GET against the upstream API using the
+//! `llmux api <path>` — debug GET against the upstream API using the
 //! current account's credential (e.g. `/api/oauth/usage`).
 
 use crate::config::AccountCredential;
@@ -17,9 +17,7 @@ pub async fn run(args: ApiArgs) -> Result<(), CliError> {
         .iter()
         .find(|a| matches!(a.credential, AccountCredential::Oauth { .. }))
         .or_else(|| config.accounts.first())
-        .ok_or_else(|| {
-            CliError::Message("no accounts configured (see `teamagent login`)".into())
-        })?;
+        .ok_or_else(|| CliError::Message("no accounts configured (see `llmux login`)".into()))?;
 
     let url = if args.path.starts_with("http://") || args.path.starts_with("https://") {
         args.path.clone()

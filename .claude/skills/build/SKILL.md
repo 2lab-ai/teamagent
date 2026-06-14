@@ -1,6 +1,6 @@
 ---
 name: build
-description: Use for normal teamagent dev iteration when the user says "빌드", "빌드해줘", "build", "build and deploy locally", or wants to compile + run a change locally and save it. Builds release, hot-deploys the binary to the local daemon, commits, and pushes to a feature branch (never master).
+description: Use for normal llmux dev iteration when the user says "빌드", "빌드해줘", "build", "build and deploy locally", or wants to compile + run a change locally and save it. Builds release, hot-deploys the binary to the local daemon, commits, and pushes to a feature branch (never master).
 ---
 
 # build (빌드) — local build + branch push
@@ -20,8 +20,8 @@ Shared mechanics: `.claude/skills/_shared/cd-reference.md` (procedure A = hot-de
    Fix failures; do not commit red.
 3. **Build + hot-deploy locally** — procedure A in the shared reference (`cargo build
    --release --locked`; `rm` the read-only Cellar file; `cp`; `chmod 755`;
-   `teamagent restart`). Autonomous — this is the whole point of `build`.
-4. **Smoke check.** `/opt/homebrew/bin/teamagent status` — daemon back up on the new binary,
+   `llmux restart`). Autonomous — this is the whole point of `build`.
+4. **Smoke check.** `/opt/homebrew/bin/llmux status` — daemon back up on the new binary,
    `in_flight` was 0 before restart.
 5. **Commit.** Conventional, lowercase, no emoji, no AI co-author line (AGENTS.md):
    `git add -A && git commit -m "<type>: <summary>"`.
@@ -32,7 +32,7 @@ Shared mechanics: `.claude/skills/_shared/cd-reference.md` (procedure A = hot-de
 ## Common mistakes
 
 - `cp` over the read-only Cellar binary → EACCES. `rm -f "$(readlink -f
-  /opt/homebrew/bin/teamagent)"` first (procedure A).
+  /opt/homebrew/bin/llmux)"` first (procedure A).
 - Pushing to master from `build` — that fires the preview pipeline. Branch only.
 - Committing with `just check` red, or with an emoji / AI co-author line.
 - A later `brew upgrade` will overwrite this hot-deployed `dev dev` binary — expected;

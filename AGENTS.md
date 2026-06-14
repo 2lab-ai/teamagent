@@ -1,4 +1,4 @@
-# teamagent — agent guide
+# llmux — agent guide
 
 Contract: `.prd/01-spec.md` (what) + `.prd/02-architecture.md` (how). Read both before
 non-trivial changes.

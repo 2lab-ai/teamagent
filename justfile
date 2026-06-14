@@ -1,4 +1,4 @@
-# teamagent task runner (herdr conventions)
+# llmux task runner (herdr conventions)
 
 # Format + lint + test — the gate before every commit
 check:

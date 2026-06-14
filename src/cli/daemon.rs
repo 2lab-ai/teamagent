@@ -1,10 +1,10 @@
 //! Server lifecycle from the CLI: detect a running server on the configured
-//! port, auto-start one as a detached background daemon (`teamagent run`),
-//! and stop it (`teamagent stop` → `POST /teamagent/shutdown`).
+//! port, auto-start one as a detached background daemon (`llmux run`),
+//! and stop it (`llmux stop` → `POST /llmux/shutdown`).
 //!
-//! Detection is herdr-style: probe `GET /teamagent/status` with a short
+//! Detection is herdr-style: probe `GET /llmux/status` with a short
 //! timeout. Connection refused/timeout = not running; a 200 with a
-//! teamagent-shaped document = running; anything else answering on the port
+//! llmux-shaped document = running; anything else answering on the port
 //! is FOREIGN and we refuse to spawn over it.
 
 use std::path::{Path, PathBuf};
@@ -14,7 +14,7 @@ use super::{proxy_base_url, CliError, StopArgs};
 use crate::config::Config;
 
 /// Probe timeout: long enough for a loaded localhost server, short enough
-/// that `teamagent run` stays snappy when nothing is listening.
+/// that `llmux run` stays snappy when nothing is listening.
 const PROBE_TIMEOUT: Duration = Duration::from_millis(800);
 
 /// Max wait for a spawned daemon to answer the status endpoint (and for a
@@ -33,11 +33,11 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// What is (or is not) listening on the proxy port.
 #[derive(Debug)]
 pub enum ServerProbe {
-    /// `/teamagent/status` answered with a teamagent-shaped document.
+    /// `/llmux/status` answered with a llmux-shaped document.
     Running { status: serde_json::Value },
     /// Connection refused / timed out — nothing is listening.
     NotRunning,
-    /// Something answered, but it is not teamagent — never spawn over it.
+    /// Something answered, but it is not llmux — never spawn over it.
     Foreign { detail: String },
 }
 
@@ -53,14 +53,14 @@ pub enum EnsureOutcome {
     Restarted { pid: u32 },
 }
 
-/// Probe the configured port for a running teamagent server.
+/// Probe the configured port for a running llmux server.
 pub async fn probe_server(port: u16, api_key: Option<&str>) -> Result<ServerProbe, CliError> {
     let client = reqwest::Client::builder()
         .connect_timeout(PROBE_TIMEOUT)
         .timeout(PROBE_TIMEOUT)
         .build()
         .map_err(|err| CliError::Message(format!("http client init failed: {err}")))?;
-    let url = format!("{}/teamagent/status", proxy_base_url(port));
+    let url = format!("{}/llmux/status", proxy_base_url(port));
     let mut request = client.get(&url);
     if let Some(api_key) = api_key {
         // Localhost is exempt, but sending it is harmless and keeps this
@@ -82,7 +82,7 @@ pub async fn probe_server(port: u16, api_key: Option<&str>) -> Result<ServerProb
     Ok(classify_probe(status, &body))
 }
 
-/// The daemon's pid from a `/teamagent/status` (or `/teamagent/dashboard`)
+/// The daemon's pid from a `/llmux/status` (or `/llmux/dashboard`)
 /// document, for the attach-mode header marker before the first dashboard
 /// poll lands. `None` if the field is missing (older server).
 pub fn status_pid(status: &serde_json::Value) -> Option<u32> {
@@ -93,7 +93,7 @@ pub fn status_pid(status: &serde_json::Value) -> Option<u32> {
 }
 
 /// Classify a status-endpoint response: only a 2xx carrying a
-/// teamagent-shaped document counts as a running server.
+/// llmux-shaped document counts as a running server.
 fn classify_probe(status: http::StatusCode, body: &str) -> ServerProbe {
     if !status.is_success() {
         return ServerProbe::Foreign {
@@ -101,19 +101,19 @@ fn classify_probe(status: http::StatusCode, body: &str) -> ServerProbe {
         };
     }
     match serde_json::from_str::<serde_json::Value>(body) {
-        Ok(doc) if is_teamagent_status(&doc) => ServerProbe::Running { status: doc },
+        Ok(doc) if is_llmux_status(&doc) => ServerProbe::Running { status: doc },
         _ => ServerProbe::Foreign {
-            detail: "status response is not a teamagent document".into(),
+            detail: "status response is not a llmux document".into(),
         },
     }
 }
 
-/// The minimal shape every teamagent server has served since v0.1:
-/// `version` ("teamagent ...") and an `accounts` array.
-fn is_teamagent_status(doc: &serde_json::Value) -> bool {
+/// The minimal shape every llmux server has served since v0.1:
+/// `version` ("llmux ...") and an `accounts` array.
+fn is_llmux_status(doc: &serde_json::Value) -> bool {
     doc.get("version")
         .and_then(serde_json::Value::as_str)
-        .is_some_and(|v| v.starts_with("teamagent"))
+        .is_some_and(|v| v.starts_with("llmux"))
         && doc.get("accounts").is_some_and(serde_json::Value::is_array)
 }
 
@@ -130,7 +130,7 @@ fn should_restart(running_version: Option<&str>, current_version: &str, force: b
 }
 
 /// Make sure a server is listening on `config.proxy.port`: probe, and when
-/// nothing is running spawn `teamagent server --no-tui` as a detached daemon
+/// nothing is running spawn `llmux server --no-tui` as a detached daemon
 /// (stderr → [`server_log_path`]) and wait until the status endpoint answers.
 ///
 /// When a daemon is already running, its version is compared to this binary's
@@ -159,7 +159,7 @@ pub async fn ensure_server_running(
         }
         ServerProbe::Foreign { detail } => {
             return Err(CliError::Message(format!(
-                "port {port} is in use by something that is not teamagent ({detail})\n\
+                "port {port} is in use by something that is not llmux ({detail})\n\
                  Free the port or change proxy.port in the config."
             )));
         }
@@ -171,9 +171,9 @@ pub async fn ensure_server_running(
         return Err(CliError::Message(
             "no accounts configured\n\
              Add one first:\n  \
-             teamagent import           Import from Claude Code / teamclaude\n  \
-             teamagent login            OAuth login via browser\n  \
-             teamagent login --api      Add an API key"
+             llmux import           Import from Claude Code / teamclaude\n  \
+             llmux login            OAuth login via browser\n  \
+             llmux login --api      Add an API key"
                 .into(),
         ));
     }
@@ -189,7 +189,7 @@ pub async fn ensure_server_running(
     }
 }
 
-/// `teamagent restart` — explicitly drain-if-running and (re)spawn the daemon,
+/// `llmux restart` — explicitly drain-if-running and (re)spawn the daemon,
 /// then print status. Unlike `run`, this never execs `claude`: it is just the
 /// server-lifecycle half, with `force` so a same-version daemon is replaced too.
 pub async fn restart() -> Result<(), CliError> {
@@ -198,14 +198,14 @@ pub async fn restart() -> Result<(), CliError> {
     let version = crate::build_info::version_string();
     match ensure_server_running(&config, true).await? {
         EnsureOutcome::Started { pid } => {
-            println!("started teamagent server (pid {pid}) on port {port} → {version}");
+            println!("started llmux server (pid {pid}) on port {port} → {version}");
         }
         EnsureOutcome::Restarted { pid } => {
-            println!("restarted teamagent server (pid {pid}) on port {port} → {version}");
+            println!("restarted llmux server (pid {pid}) on port {port} → {version}");
         }
         // With force=true this is unreachable, but stay total rather than panic.
         EnsureOutcome::AlreadyRunning => {
-            println!("teamagent server already running on port {port} → {version}");
+            println!("llmux server already running on port {port} → {version}");
         }
     }
     Ok(())
@@ -236,8 +236,8 @@ fn spawn_server_daemon(log_path: &Path) -> Result<u32, CliError> {
     Ok(child.id())
 }
 
-/// Daemon stderr log: `$XDG_STATE_HOME/teamagent/server.log`, defaulting to
-/// `~/.local/state/teamagent/server.log` (state, not config — same
+/// Daemon stderr log: `$XDG_STATE_HOME/llmux/server.log`, defaulting to
+/// `~/.local/state/llmux/server.log` (state, not config — same
 /// deliberate Unix-everywhere choice as `config::config_path`).
 pub fn server_log_path() -> Result<PathBuf, CliError> {
     let dir = state_dir().ok_or_else(|| {
@@ -247,18 +247,18 @@ pub fn server_log_path() -> Result<PathBuf, CliError> {
     Ok(dir.join("server.log"))
 }
 
-/// `$XDG_STATE_HOME/teamagent` when set and non-empty, else
-/// `~/.local/state/teamagent`.
+/// `$XDG_STATE_HOME/llmux` when set and non-empty, else
+/// `~/.local/state/llmux`.
 fn state_dir() -> Option<PathBuf> {
     if let Some(xdg) = std::env::var_os("XDG_STATE_HOME") {
         if !xdg.is_empty() {
-            return Some(PathBuf::from(xdg).join("teamagent"));
+            return Some(PathBuf::from(xdg).join("llmux"));
         }
     }
-    dirs::home_dir().map(|home| home.join(".local/state/teamagent"))
+    dirs::home_dir().map(|home| home.join(".local/state/llmux"))
 }
 
-/// Poll the status endpoint until the server answers as teamagent, or fail
+/// Poll the status endpoint until the server answers as llmux, or fail
 /// after `timeout`.
 async fn wait_until_ready(
     port: u16,
@@ -280,12 +280,12 @@ async fn wait_until_ready(
     }
 }
 
-/// Cooperatively shut down the teamagent daemon on `port` and wait up to
-/// `timeout` for the port to free: POST `/teamagent/shutdown` (hyper graceful
+/// Cooperatively shut down the llmux daemon on `port` and wait up to
+/// `timeout` for the port to free: POST `/llmux/shutdown` (hyper graceful
 /// shutdown — in-flight requests finish) then poll [`probe_server`] until
 /// `NotRunning`. Never SIGKILLs; if the port is still held at the deadline it
 /// returns an error. The caller is responsible for having confirmed a
-/// teamagent (not foreign) daemon is on the port first.
+/// llmux (not foreign) daemon is on the port first.
 async fn shutdown_and_wait(
     port: u16,
     api_key: Option<&str>,
@@ -296,7 +296,7 @@ async fn shutdown_and_wait(
         .timeout(Duration::from_secs(5))
         .build()
         .map_err(|err| CliError::Message(format!("http client init failed: {err}")))?;
-    let url = format!("{}/teamagent/shutdown", proxy_base_url(port));
+    let url = format!("{}/llmux/shutdown", proxy_base_url(port));
     let mut request = client.post(&url);
     if let Some(api_key) = api_key {
         request = request.header("x-api-key", api_key);
@@ -327,7 +327,7 @@ async fn shutdown_and_wait(
     }
 }
 
-/// `teamagent stop` — cooperatively shut down the running server and wait for
+/// `llmux stop` — cooperatively shut down the running server and wait for
 /// the port to release (5s budget). A missing server is not an error
 /// (idempotent stop); a foreign listener is refused.
 pub async fn stop(_args: StopArgs) -> Result<(), CliError> {
@@ -342,14 +342,14 @@ pub async fn stop(_args: StopArgs) -> Result<(), CliError> {
         }
         ServerProbe::Foreign { detail } => {
             return Err(CliError::Message(format!(
-                "port {port} is in use by something that is not teamagent ({detail}) — refusing to stop it"
+                "port {port} is in use by something that is not llmux ({detail}) — refusing to stop it"
             )));
         }
         ServerProbe::Running { .. } => {}
     }
 
     shutdown_and_wait(port, api_key, READY_TIMEOUT).await?;
-    println!("stopped teamagent server on port {port}");
+    println!("stopped llmux server on port {port}");
     Ok(())
 }
 
@@ -360,7 +360,7 @@ mod tests {
     use axum::Router;
     use http::StatusCode;
 
-    fn teamagent_status_body() -> String {
+    fn llmux_status_body() -> String {
         serde_json::json!({
             "version": crate::build_info::version_string(),
             "current": null,
@@ -370,18 +370,18 @@ mod tests {
     }
 
     #[test]
-    fn classify_probe_accepts_teamagent_shape() {
-        let probe = classify_probe(StatusCode::OK, &teamagent_status_body());
+    fn classify_probe_accepts_llmux_shape() {
+        let probe = classify_probe(StatusCode::OK, &llmux_status_body());
         assert!(matches!(probe, ServerProbe::Running { .. }), "{probe:?}");
     }
 
     #[test]
-    fn classify_probe_rejects_non_teamagent_bodies() {
+    fn classify_probe_rejects_non_llmux_bodies() {
         for body in [
             "<html>hello</html>",
             "{}",
             r#"{"version":"nginx/1.25","accounts":[]}"#,
-            r#"{"version":"teamagent 0.1.0 (dev dev)"}"#, // no accounts array
+            r#"{"version":"llmux 0.1.0 (dev dev)"}"#, // no accounts array
         ] {
             let probe = classify_probe(StatusCode::OK, body);
             assert!(
@@ -393,7 +393,7 @@ mod tests {
 
     #[test]
     fn classify_probe_rejects_non_2xx() {
-        let probe = classify_probe(StatusCode::NOT_FOUND, &teamagent_status_body());
+        let probe = classify_probe(StatusCode::NOT_FOUND, &llmux_status_body());
         assert!(matches!(probe, ServerProbe::Foreign { .. }), "{probe:?}");
     }
 
@@ -419,16 +419,16 @@ mod tests {
     fn status_pid_is_none_without_the_field() {
         // Older server (status without a pid) → attach still works, header
         // just shows "pid ?".
-        let doc = serde_json::json!({ "version": "teamagent 0.1.0", "accounts": [] });
+        let doc = serde_json::json!({ "version": "llmux 0.1.0", "accounts": [] });
         assert_eq!(status_pid(&doc), None);
     }
 
     /// The version-gated restart decision matrix (`should_restart`).
     #[test]
     fn should_restart_matrix() {
-        let cur = "teamagent 0.1.0 (dev dev)";
-        let same = "teamagent 0.1.0 (dev dev)";
-        let other = "teamagent 0.1.0 (preview preview-20260612-abc1234)";
+        let cur = "llmux 0.1.0 (dev dev)";
+        let same = "llmux 0.1.0 (dev dev)";
+        let other = "llmux 0.1.0 (preview preview-20260612-abc1234)";
 
         // force always wins, regardless of version (or its absence).
         assert!(should_restart(Some(same), cur, true), "force + same");
@@ -450,9 +450,9 @@ mod tests {
         );
     }
 
-    /// Serve `body` (200) at `/teamagent/status` on 127.0.0.1:0.
+    /// Serve `body` (200) at `/llmux/status` on 127.0.0.1:0.
     async fn spawn_status_mock(body: String) -> u16 {
-        let app = Router::new().route("/teamagent/status", get(move || async move { body }));
+        let app = Router::new().route("/llmux/status", get(move || async move { body }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
@@ -462,9 +462,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn probe_detects_running_teamagent() {
-        let port = spawn_status_mock(teamagent_status_body()).await;
-        let probe = probe_server(port, Some("ta-key")).await.unwrap();
+    async fn probe_detects_running_llmux() {
+        let port = spawn_status_mock(llmux_status_body()).await;
+        let probe = probe_server(port, Some("lm-key")).await.unwrap();
         assert!(matches!(probe, ServerProbe::Running { .. }), "{probe:?}");
     }
 
@@ -487,7 +487,7 @@ mod tests {
 
     #[tokio::test]
     async fn wait_until_ready_succeeds_against_live_server_and_times_out_otherwise() {
-        let port = spawn_status_mock(teamagent_status_body()).await;
+        let port = spawn_status_mock(llmux_status_body()).await;
         wait_until_ready(port, None, Duration::from_secs(1))
             .await
             .expect("live server is ready");

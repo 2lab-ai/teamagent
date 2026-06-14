@@ -1,7 +1,7 @@
 //! `DashboardView` — the one struct the draw code renders from, built from a
 //! [`DashboardDoc`] regardless of where that document came from: the local
 //! TUI builds it in-process from live `AppState` and the attach-mode client
-//! parses it from `GET /teamagent/dashboard` JSON. One contract, one
+//! parses it from `GET /llmux/dashboard` JSON. One contract, one
 //! renderer — the rendering is never forked.
 
 use std::collections::HashMap;
@@ -271,9 +271,7 @@ impl DashboardView {
     /// "0.1.0 (channel id)" — the version string with the binary name
     /// stripped (the header already says whose version it is).
     pub(crate) fn display_version(&self) -> &str {
-        self.version
-            .strip_prefix("teamagent ")
-            .unwrap_or(&self.version)
+        self.version.strip_prefix("llmux ").unwrap_or(&self.version)
     }
 }
 
@@ -283,13 +281,13 @@ mod tests {
 
     fn doc_json() -> serde_json::Value {
         serde_json::json!({
-            "version": "teamagent 0.1.0 (dev dev)",
+            "version": "llmux 0.1.0 (dev dev)",
             "pid": 61282,
             "uptime_secs": 7980,
             "port": 3456,
             "current": "a",
             "upstream": "https://api.anthropic.com",
-            "config_path": "/home/u/.config/teamagent/teamagent.json",
+            "config_path": "/home/u/.config/llmux/llmux.json",
             "select_params": { "five_hour_max": 0.90, "seven_day_max": 0.99, "usage_max_age_secs": 600 },
             "refresh_ahead_secs": 25200,
             "evaluate_tick_secs": 60,

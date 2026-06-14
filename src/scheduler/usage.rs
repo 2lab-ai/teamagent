@@ -151,7 +151,7 @@ const POLL_TICK: Duration = Duration::from_secs(5);
 /// time, so a tick that finds many accounts due (e.g. the priming tick at
 /// startup, where every account's `next_at` is `now`) never bursts a call per
 /// account. A burst across all accounts can trip the upstream's org/IP
-/// request-rate limit and make teamagent rate-limit its own traffic.
+/// request-rate limit and make llmux rate-limit its own traffic.
 const MIN_POLL_GAP: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy)]

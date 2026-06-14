@@ -1,4 +1,4 @@
-//! `teamagent status` — herdr-style client/server/update sections from a
+//! `llmux status` — herdr-style client/server/update sections from a
 //! running server; `--json` emits the raw status document.
 //!
 //! Exit codes: 0 = server running, 1 = server not running (or any error).
@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime};
 use super::daemon::{self, ServerProbe};
 use super::{CliError, StatusArgs};
 
-/// Probe the configured port (shared with `teamagent run`'s auto-start —
+/// Probe the configured port (shared with `llmux run`'s auto-start —
 /// see `cli::daemon`) and render the herdr-style sections. A server that is
 /// not running prints the client section + `status: not running` and exits 1.
 pub async fn run(args: StatusArgs) -> Result<(), CliError> {
@@ -41,7 +41,7 @@ pub async fn run(args: StatusArgs) -> Result<(), CliError> {
             std::process::exit(1);
         }
         ServerProbe::Foreign { detail } => Err(CliError::Message(format!(
-            "port {port} answers but is not teamagent: {detail}"
+            "port {port} answers but is not llmux: {detail}"
         ))),
     }
 }
@@ -104,10 +104,10 @@ fn render(
     out
 }
 
-/// `version_string` is "teamagent X (channel id)" — drop the binary name
+/// `version_string` is "llmux X (channel id)" — drop the binary name
 /// for display (the section labels already say whose version it is).
 fn display_version(version: &str) -> &str {
-    version.strip_prefix("teamagent ").unwrap_or(version)
+    version.strip_prefix("llmux ").unwrap_or(version)
 }
 
 /// "3 (2 ready, 1 cooldown)" — ready = active/ok; cooldown and auth-failed
@@ -227,7 +227,7 @@ mod tests {
 
     #[test]
     fn render_running_server_has_all_sections() {
-        let client = "teamagent 0.1.0 (dev dev)";
+        let client = "llmux 0.1.0 (dev dev)";
         let out = render(client, Some(&status_doc(client)), 3456, test_now());
         let expected = "\
 client:
@@ -254,8 +254,8 @@ update:
     #[test]
     fn render_version_mismatch_says_restart() {
         let out = render(
-            "teamagent 0.2.0 (dev dev)",
-            Some(&status_doc("teamagent 0.1.0 (dev dev)")),
+            "llmux 0.2.0 (dev dev)",
+            Some(&status_doc("llmux 0.1.0 (dev dev)")),
             3456,
             test_now(),
         );
@@ -270,7 +270,7 @@ update:
 
     #[test]
     fn render_not_running_prints_client_only() {
-        let out = render("teamagent 0.1.0 (dev dev)", None, 3456, test_now());
+        let out = render("llmux 0.1.0 (dev dev)", None, 3456, test_now());
         let expected = "\
 client:
   version: 0.1.0 (dev dev)
@@ -287,11 +287,11 @@ server:
         // A pre-A3 server has no pid/uptime_secs/port — those lines are
         // simply omitted (backwards compat is additive both ways).
         let doc = serde_json::json!({
-            "version": "teamagent 0.1.0 (dev dev)",
+            "version": "llmux 0.1.0 (dev dev)",
             "current": null,
             "accounts": [{ "name": "a", "status": "auth_failed" }],
         });
-        let out = render("teamagent 0.1.0 (dev dev)", Some(&doc), 3456, test_now());
+        let out = render("llmux 0.1.0 (dev dev)", Some(&doc), 3456, test_now());
         assert!(
             out.contains("  port: 3456"),
             "falls back to config port:\n{out}"

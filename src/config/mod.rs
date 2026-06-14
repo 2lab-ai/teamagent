@@ -1,4 +1,4 @@
-//! Load/save of `~/.config/teamagent.json` — atomic writes, 0600 perms, and
+//! Load/save of `~/.config/llmux.json` — atomic writes, 0600 perms, and
 //! read-merge-write so server and CLI can edit concurrently.
 
 pub mod migrate;
@@ -14,10 +14,10 @@ pub use schema::{
 };
 
 /// Environment variable overriding the config file location.
-pub const CONFIG_ENV: &str = "TEAMAGENT_CONFIG";
+pub const CONFIG_ENV: &str = "LLMUX_CONFIG";
 
 /// Prefix of auto-generated proxy api keys.
-const API_KEY_PREFIX: &str = "ta-";
+const API_KEY_PREFIX: &str = "lm-";
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -44,8 +44,8 @@ fn io_err(path: &Path, source: std::io::Error) -> ConfigError {
     }
 }
 
-/// Resolve the config path: `$TEAMAGENT_CONFIG` if set, else
-/// `$XDG_CONFIG_HOME/teamagent.json`, else `~/.config/teamagent.json`.
+/// Resolve the config path: `$LLMUX_CONFIG` if set, else
+/// `$XDG_CONFIG_HOME/llmux.json`, else `~/.config/llmux.json`.
 ///
 /// Deliberately NOT `dirs::config_dir()`: on macOS that is
 /// `~/Library/Application Support`, but the contract (FR2, teamclaude
@@ -57,7 +57,7 @@ pub fn config_path() -> Result<PathBuf, ConfigError> {
         }
     }
     xdg_config_dir()
-        .map(|dir| dir.join("teamagent.json"))
+        .map(|dir| dir.join("llmux.json"))
         .ok_or(ConfigError::NoConfigDir)
 }
 
@@ -71,10 +71,55 @@ pub(crate) fn xdg_config_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|home| home.join(".config"))
 }
 
+/// One-time `teamagent` → `llmux` config adoption. When the config is resolved
+/// from the DEFAULT location (no `$LLMUX_CONFIG` override) and `llmux.json` does
+/// not yet exist but the previous tool's `teamagent.json` sits beside it, copy
+/// it across so a renamed install keeps its accounts. The original is left in
+/// place as a fallback — copy, never move.
+///
+/// TODO(remove after public uptake): drop once installs have migrated.
+fn adopt_legacy_config_if_needed() -> Result<(), ConfigError> {
+    if std::env::var_os(CONFIG_ENV).is_some_and(|v| !v.is_empty()) {
+        return Ok(()); // explicit override path: never adopt implicitly
+    }
+    match xdg_config_dir() {
+        Some(dir) => adopt_legacy_in_dir(&dir),
+        None => Ok(()),
+    }
+}
+
+/// Byte-for-byte copy `teamagent.json` → `llmux.json` in `dir`, but only when
+/// the new file is absent and the legacy one is present. Idempotent.
+fn adopt_legacy_in_dir(dir: &Path) -> Result<(), ConfigError> {
+    let new = dir.join("llmux.json");
+    let legacy = dir.join("teamagent.json");
+    if new.exists() || !legacy.exists() {
+        return Ok(());
+    }
+    let raw = fs::read(&legacy).map_err(|e| io_err(&legacy, e))?;
+    fs::create_dir_all(dir).map_err(|e| io_err(dir, e))?;
+    let tmp = dir.join(format!(
+        ".llmux.json.tmp.{}.{}",
+        std::process::id(),
+        ulid::Ulid::new()
+    ));
+    if let Err(err) = write_tmp_and_rename(&tmp, &new, &raw) {
+        let _ = fs::remove_file(&tmp);
+        return Err(err);
+    }
+    tracing::info!(
+        from = %legacy.display(),
+        to = %new.display(),
+        "adopted legacy teamagent.json into llmux.json"
+    );
+    Ok(())
+}
+
 /// Load the config from [`config_path`]. A missing file yields
 /// `Config::default()` (first run); nothing is written — use
 /// [`load_or_init`] to also create the file with a fresh api key.
 pub fn load() -> Result<Config, ConfigError> {
+    adopt_legacy_config_if_needed()?;
     load_path(&config_path()?)
 }
 
@@ -87,9 +132,17 @@ pub fn load_path(path: &Path) -> Result<Config, ConfigError> {
         }
         Err(err) => return Err(io_err(path, err)),
     };
-    let config: Config = serde_json::from_str(&raw)?;
+    let mut config: Config = serde_json::from_str(&raw)?;
     if config.version != 1 {
         return Err(ConfigError::UnsupportedVersion(config.version));
+    }
+    // Demo mode: swap account identities for stable fakes at the source so every
+    // surface (dashboard, logs, status) shows the alias. Credentials are keyed
+    // by token/uuid, not name, so they keep working.
+    if crate::demo::enabled() {
+        for account in &mut config.accounts {
+            account.name = crate::demo::alias(&account.name);
+        }
     }
     Ok(config)
 }
@@ -98,6 +151,7 @@ pub fn load_path(path: &Path) -> Result<Config, ConfigError> {
 /// a default config with a freshly generated proxy api key is written
 /// (mode 0600) and returned.
 pub fn load_or_init() -> Result<Config, ConfigError> {
+    adopt_legacy_config_if_needed()?;
     load_or_init_path(&config_path()?)
 }
 
@@ -121,6 +175,11 @@ pub fn save(config: &Config) -> Result<(), ConfigError> {
 
 /// [`save`] against an explicit path.
 pub fn save_path(path: &Path, config: &Config) -> Result<(), ConfigError> {
+    // Demo mode loads aliased account names; never let those reach disk.
+    if crate::demo::enabled() {
+        tracing::debug!("LLMUX_DEMO_MODE: config save suppressed");
+        return Ok(());
+    }
     let dir = match path.parent() {
         Some(dir) if !dir.as_os_str().is_empty() => {
             fs::create_dir_all(dir).map_err(|e| io_err(dir, e))?;
@@ -132,7 +191,7 @@ pub fn save_path(path: &Path, config: &Config) -> Result<(), ConfigError> {
     let file_name = path
         .file_name()
         .and_then(|n| n.to_str())
-        .unwrap_or("teamagent.json");
+        .unwrap_or("llmux.json");
     let tmp = dir.join(format!(
         ".{file_name}.tmp.{}.{}",
         std::process::id(),
@@ -248,7 +307,7 @@ mod tests {
     impl TempDir {
         pub(crate) fn new() -> Self {
             let dir = std::env::temp_dir().join(format!(
-                "teamagent-test-{}-{}",
+                "llmux-test-{}-{}",
                 std::process::id(),
                 ulid::Ulid::new()
             ));
@@ -306,7 +365,7 @@ mod tests {
     #[test]
     fn missing_file_loads_default() {
         let dir = TempDir::new();
-        let path = dir.path().join("teamagent.json");
+        let path = dir.path().join("llmux.json");
         let config = load_path(&path).expect("load");
         assert_eq!(config, Config::default());
         assert!(!path.exists(), "plain load must not create the file");
@@ -315,11 +374,11 @@ mod tests {
     #[test]
     fn load_or_init_creates_file_with_api_key_and_0600() {
         let dir = TempDir::new();
-        let path = dir.path().join("teamagent.json");
+        let path = dir.path().join("llmux.json");
         let config = load_or_init_path(&path).expect("init");
 
         let key = config.proxy.api_key.as_deref().expect("api key generated");
-        assert!(key.starts_with("ta-"), "prefix: {key}");
+        assert!(key.starts_with("lm-"), "prefix: {key}");
         // 32 bytes -> 43 base64url chars, no padding.
         assert_eq!(key.len(), 3 + 43, "key length: {key}");
         assert!(path.exists());
@@ -339,7 +398,7 @@ mod tests {
     #[test]
     fn partial_file_fills_defaults() {
         let dir = TempDir::new();
-        let path = dir.path().join("teamagent.json");
+        let path = dir.path().join("llmux.json");
         fs::write(&path, r#"{ "proxy": { "port": 9999 } }"#).expect("write");
 
         let config = load_path(&path).expect("load");
@@ -356,13 +415,55 @@ mod tests {
     }
 
     #[test]
+    fn adopts_legacy_teamagent_config_as_byte_copy() {
+        let dir = TempDir::new();
+        let legacy = dir.path().join("teamagent.json");
+        let new = dir.path().join("llmux.json");
+        let body = r#"{ "version": 1, "proxy": { "port": 9999, "api_key": "ta-keep-me" } }"#;
+        fs::write(&legacy, body).expect("write legacy");
+
+        adopt_legacy_in_dir(dir.path()).expect("adopt");
+
+        assert!(new.exists(), "llmux.json created");
+        assert!(legacy.exists(), "legacy left in place (copy, not move)");
+        assert_eq!(
+            fs::read(&new).expect("read new"),
+            body.as_bytes(),
+            "byte-for-byte copy preserves the stored api key"
+        );
+        let config = load_path(&new).expect("load adopted");
+        assert_eq!(config.proxy.port, 9999);
+        assert_eq!(config.proxy.api_key.as_deref(), Some("ta-keep-me"));
+    }
+
+    #[test]
+    fn adopt_is_idempotent_and_never_overwrites() {
+        let dir = TempDir::new();
+        let legacy = dir.path().join("teamagent.json");
+        let new = dir.path().join("llmux.json");
+        fs::write(&legacy, r#"{ "version": 1, "proxy": { "port": 1111 } }"#).expect("legacy");
+        fs::write(&new, r#"{ "version": 1, "proxy": { "port": 2222 } }"#).expect("new");
+
+        // llmux.json already exists → adoption is a no-op, must not clobber it.
+        adopt_legacy_in_dir(dir.path()).expect("adopt");
+        assert_eq!(load_path(&new).expect("load").proxy.port, 2222);
+    }
+
+    #[test]
+    fn adopt_is_noop_without_a_legacy_file() {
+        let dir = TempDir::new();
+        adopt_legacy_in_dir(dir.path()).expect("adopt");
+        assert!(!dir.path().join("llmux.json").exists());
+    }
+
+    #[test]
     fn round_trip_preserves_all_fields() {
         let dir = TempDir::new();
-        let path = dir.path().join("teamagent.json");
+        let path = dir.path().join("llmux.json");
 
         let mut config = Config::default();
         config.proxy.port = 4000;
-        config.proxy.api_key = Some("ta-test".into());
+        config.proxy.api_key = Some("lm-test".into());
         config.upstream = "https://example.test".into();
         config.scheduler.five_hour_max = 0.5;
         config.accounts.push(oauth_account("a@x.com", "uuid-a"));
@@ -481,7 +582,7 @@ mod tests {
 
         // A stamped refresh round-trips through save/load.
         let dir = TempDir::new();
-        let path = dir.path().join("teamagent.json");
+        let path = dir.path().join("llmux.json");
         let mut config = config;
         assert!(config.update_oauth_tokens("uuid-a", "at-new", None, 99, 88));
         save_path(&path, &config).expect("save");
@@ -493,7 +594,7 @@ mod tests {
     #[test]
     fn unsupported_version_is_rejected() {
         let dir = TempDir::new();
-        let path = dir.path().join("teamagent.json");
+        let path = dir.path().join("llmux.json");
         fs::write(&path, r#"{ "version": 2 }"#).expect("write");
         match load_path(&path) {
             Err(ConfigError::UnsupportedVersion(2)) => {}
@@ -504,7 +605,7 @@ mod tests {
     #[test]
     fn update_two_writers_preserve_each_others_accounts() {
         let dir = TempDir::new();
-        let path = dir.path().join("teamagent.json");
+        let path = dir.path().join("llmux.json");
         save_path(&path, &Config::default()).expect("seed");
 
         // Both "processes" hold the same stale snapshot, then write
@@ -589,7 +690,7 @@ mod tests {
     #[test]
     fn atomic_save_leaves_no_temp_files() {
         let dir = TempDir::new();
-        let path = dir.path().join("teamagent.json");
+        let path = dir.path().join("llmux.json");
         save_path(&path, &Config::default()).expect("save");
         save_path(&path, &Config::default()).expect("overwrite");
 
@@ -597,7 +698,7 @@ mod tests {
             .expect("read dir")
             .map(|e| e.expect("entry").file_name())
             .collect();
-        assert_eq!(entries, vec![std::ffi::OsString::from("teamagent.json")]);
+        assert_eq!(entries, vec![std::ffi::OsString::from("llmux.json")]);
 
         #[cfg(unix)]
         {
@@ -609,11 +710,11 @@ mod tests {
 
     #[test]
     fn config_path_env_override() {
-        // Only this test touches TEAMAGENT_CONFIG; every other test uses
+        // Only this test touches LLMUX_CONFIG; every other test uses
         // the *_path variants, so no env race across the parallel runner.
-        std::env::set_var(CONFIG_ENV, "/tmp/teamagent-override.json");
+        std::env::set_var(CONFIG_ENV, "/tmp/llmux-override.json");
         let path = config_path().expect("path");
         std::env::remove_var(CONFIG_ENV);
-        assert_eq!(path, PathBuf::from("/tmp/teamagent-override.json"));
+        assert_eq!(path, PathBuf::from("/tmp/llmux-override.json"));
     }
 }

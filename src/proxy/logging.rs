@@ -94,11 +94,11 @@ fn is_token_char(byte: u8) -> bool {
 
 /// Mask every credential-shaped substring before anything reaches disk:
 /// `sk-ant-*` tokens keep their first 15 chars, `Bearer <token>` values keep
-/// their first 20 chars (teamclaude's truncation widths), `ta-*` proxy keys
+/// their first 20 chars (teamclaude's truncation widths), `lm-*` proxy keys
 /// keep their first 8 — each followed by `...`.
 pub fn mask_credentials(text: &str) -> String {
     // (prefix, chars kept from the start of the whole match)
-    const RULES: [(&str, usize); 3] = [("Bearer ", 20), ("sk-ant-", 15), ("ta-", 8)];
+    const RULES: [(&str, usize); 3] = [("Bearer ", 20), ("sk-ant-", 15), ("lm-", 8)];
     let bytes = text.as_bytes();
     let mut out = String::with_capacity(text.len());
     let mut i = 0;
@@ -172,8 +172,8 @@ mod tests {
 
     #[test]
     fn masks_proxy_api_keys() {
-        let input = "x-api-key: ta-AAAABBBBCCCCDDDDEEEE";
-        assert_eq!(mask_credentials(input), "x-api-key: ta-AAAAB...");
+        let input = "x-api-key: lm-AAAABBBBCCCCDDDDEEEE";
+        assert_eq!(mask_credentials(input), "x-api-key: lm-AAAAB...");
     }
 
     #[test]
@@ -194,7 +194,7 @@ mod tests {
     #[tokio::test]
     async fn write_is_best_effort_and_masked() {
         let dir = std::env::temp_dir().join(format!(
-            "teamagent-logtest-{}-{}",
+            "llmux-logtest-{}-{}",
             std::process::id(),
             ulid::Ulid::new()
         ));

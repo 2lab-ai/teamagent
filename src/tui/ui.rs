@@ -109,7 +109,7 @@ fn draw_connecting(frame: &mut Frame, chrome: &Chrome) {
 
     let mut header = vec![
         Span::styled(
-            " teamagent ",
+            " llmux ",
             Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         ),
         Span::styled(crate::build_info::version_with_build(), dim()),
@@ -158,7 +158,7 @@ fn attach_spans(chrome: &Chrome) -> Vec<Span<'static>> {
 fn draw_header(frame: &mut Frame, area: Rect, view: &DashboardView, chrome: &Chrome) {
     let mut spans = vec![
         Span::styled(
-            " teamagent ",
+            " llmux ",
             Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         ),
         Span::styled(view.display_version().to_string(), dim()),
@@ -191,7 +191,7 @@ fn draw_accounts(
     let block = Block::new().borders(Borders::TOP).title(" accounts ");
     if snapshot.accounts.is_empty() {
         let empty = Paragraph::new(Line::from(Span::styled(
-            "no accounts — run `teamagent login` or `teamagent import`, then press R",
+            "no accounts — run `llmux login` or `llmux import`, then press R",
             Style::new().fg(Color::Yellow),
         )))
         .block(block);

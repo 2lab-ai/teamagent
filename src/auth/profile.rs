@@ -5,7 +5,7 @@ use serde::Deserialize;
 
 use super::AuthError;
 
-/// Subset of the profile response teamagent cares about. Parsing is
+/// Subset of the profile response llmux cares about. Parsing is
 /// tolerant: only `account.uuid` (the dedup key) and `account.email` (the
 /// account display name) are required; everything else is `None` when absent.
 #[derive(Debug, Clone, PartialEq, Eq)]

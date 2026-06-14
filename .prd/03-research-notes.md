@@ -1,4 +1,4 @@
-# teamagent — Research notes (2026-06-12 → 2026-06-13)
+# llmux — Research notes (2026-06-12 → 2026-06-13)
 
 Distilled inputs behind the shipped Rust v0.1.0 implementation. Original research streams: teamclaude
 compatibility audit, soma-work rotation audit, herdr convention audit, and a 20-source verified web survey
@@ -6,11 +6,11 @@ compatibility audit, soma-work rotation audit, herdr convention audit, and a 20-
 2026-06-13 added live backend findings for Codex, token refresh, dashboard attach mode, and brew
 release mechanics.
 
-Historical note: teamagent started from teamclaude proxy/OAuth mechanics, but this document describes the current Rust implementation and its import compatibility surface.
+Historical note: llmux started from teamclaude proxy/OAuth mechanics, but this document describes the current Rust implementation and its import compatibility surface.
 
 ## Landscape
 
-Two project families, not combined in one tool before teamagent:
+Two project families, not combined in one tool before llmux:
 
 | Family | Projects | What they prove |
 |---|---|---|
@@ -70,19 +70,19 @@ surfaced in the dashboard (`7h53m ↻6m`).
 
 Sticky sessions: pick an account and stay on it for the 5h window; rotate only on
 threshold/expiry/429. Their docs assert per-request switching can trigger anti-abuse bans; unverified
-by Anthropic, but it is the field's only operational signal. teamagent = stickiness + window-aware
+by Anthropic, but it is the field's only operational signal. llmux = stickiness + window-aware
 ranking + manual override.
 
 ## herdr lesson (2026-06-13 dogfood)
 
 Foreground `server` is not enough once `run` auto-starts a daemon: the daemon owns the port, so a
-second `teamagent server` must not bind and crash. Herdr's pattern is the right one:
+second `llmux server` must not bind and crash. Herdr's pattern is the right one:
 - probe first;
 - if server exists, attach as a client;
 - if foreign process owns the port, print a clean one-line error;
 - initialize TUI only after bind/probe decisions are settled.
 
-Implemented in v0.1 as `teamagent dashboard` + `GET /teamagent/dashboard` + shared
+Implemented in v0.1 as `llmux dashboard` + `GET /llmux/dashboard` + shared
 `DashboardView`. This prevents the old failure mode where a bind error painted over a partially
 initialized TUI.
 
@@ -128,7 +128,7 @@ refreshed via `https://auth.openai.com/oauth/token` with client id
    `role:"system"` (e.g. `<system-reminder>` / operator channel), not only top-level `system`.
 4. Therefore the translator must fold **both** top-level system and message-level system into
    `instructions`, preserving order, and must never emit a Codex input item with `role:"system"`.
-5. `role:"developer"` is accepted, but teamagent only emits it when the client sent developer;
+5. `role:"developer"` is accepted, but llmux only emits it when the client sent developer;
    unknown roles degrade to user.
 6. Tool round-trips (`tool_use` → `function_call`; `tool_result` → `function_call_output`) work.
 7. A live request through the stable build returned Anthropic SSE `message_start.model: gpt-5.5`,
@@ -137,12 +137,12 @@ refreshed via `https://auth.openai.com/oauth/token` with client id
 ## Release / distribution notes
 
 - Preview releases are generated on main pushes as `preview-<date>-<sha>` and rendered into
-  `Formula/teamagent-preview.rb`.
+  `Formula/llmux-preview.rb`.
 - Stable releases are tag-driven. The release workflow rejects a tag if Cargo.toml's version does
-  not match. Because Cargo.toml is `0.1.0`, the first stable teamagent tag is
+  not match. Because Cargo.toml is `0.1.0`, the first stable llmux tag is
   `v0.1.0`; the old `v1.0.1` tag belongs to the historical teamclaude tree.
 - `v0.1.0` released from `f99573f`, with 4 binaries and SHA256SUMS. `homebrew-tap` generated
-  `Formula/teamagent.rb`; local stable install and `brew test` passed.
+  `Formula/llmux.rb`; local stable install and `brew test` passed.
 
 ## Risk register
 
@@ -150,7 +150,7 @@ refreshed via `https://auth.openai.com/oauth/token` with client id
    → 429/retry-after.
 2. Codex backend is not a public API. The provider mimics Codex CLI headers and is personal-use
    only; backend shape can change without notice.
-3. Per-request rotation ban risk is unverified but acted on by ccflare; teamagent avoids it.
+3. Per-request rotation ban risk is unverified but acted on by ccflare; llmux avoids it.
 4. ToS gray zones: multi-account Claude proxying and Codex subscription token use outside the
    official CLI. Single user's own accounts only, no pooling, no resale.
 5. Active usage polling itself can 429. The dashboard must show poller health and not hide stale
@@ -161,5 +161,5 @@ refreshed via `https://auth.openai.com/oauth/token` with client id
 - Header stability across Claude plan tiers and Codex plan tiers.
 - Whether Codex's `x-codex-*` semantics differ by model or plan.
 - Whether Codex reasoning encrypted content should be round-tripped for longer sessions beyond v0.1.
-- Whether `teamagent dashboard` should support add/remove/reload against the daemon (v0.1 attach
+- Whether `llmux dashboard` should support add/remove/reload against the daemon (v0.1 attach
   intentionally disables config mutation keys).
