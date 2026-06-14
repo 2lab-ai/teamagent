@@ -240,8 +240,10 @@ fn draw_accounts(
     let wide = area.width >= WIDE_TABLE_AT;
 
     let selected = match chrome.mode {
-        Mode::Select { idx } => Some(idx.min(ctx.order.len().saturating_sub(1))),
-        Mode::Normal => None,
+        Mode::Select { idx } | Mode::ConfirmRemove { idx } => {
+            Some(idx.min(ctx.order.len().saturating_sub(1)))
+        }
+        Mode::Normal | Mode::AddKey => None,
     };
     let rows = ctx.order.iter().enumerate().map(|(pos, &account_idx)| {
         let account = &snapshot.accounts[account_idx];
@@ -800,8 +802,10 @@ fn draw_detail(
 ) {
     let snapshot = &view.snapshot;
     let pos = match chrome.mode {
-        Mode::Select { idx } => idx.min(ctx.order.len().saturating_sub(1)),
-        Mode::Normal => snapshot
+        Mode::Select { idx } | Mode::ConfirmRemove { idx } => {
+            idx.min(ctx.order.len().saturating_sub(1))
+        }
+        Mode::Normal | Mode::AddKey => snapshot
             .representative_current()
             .and_then(|cur| {
                 ctx.order
@@ -1628,12 +1632,19 @@ fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome) {
         ])
     } else {
         match chrome.mode {
+            // a (add) and r (remove) now act on the DAEMON via the control
+            // endpoints, so they are live in attach mode too; only R (reload
+            // from the local config file) stays local-only.
             Mode::Normal if attached => Line::from(vec![
                 Span::raw(" "),
                 key("q"),
                 Span::raw(" quit  "),
                 key("s"),
                 Span::raw(" switch  "),
+                key("a"),
+                Span::raw(" add  "),
+                key("r"),
+                Span::raw(" remove  "),
                 key("d"),
                 Span::raw(" detail  "),
                 key("g"),
@@ -1642,9 +1653,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome) {
                 Span::raw(" logs  "),
                 key("f/m/e"),
                 Span::raw(" codex  "),
-                key("↑↓"),
-                Span::raw(" scroll  "),
-                Span::styled("a/r/R disabled (attached)", dim()),
+                Span::styled("R disabled (attached)", dim()),
             ]),
             Mode::Normal => Line::from(vec![
                 Span::raw(" "),
@@ -1676,6 +1685,30 @@ fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome) {
                 key("Enter"),
                 Span::raw(" switch  "),
                 key("Esc"),
+                Span::raw(" cancel"),
+            ]),
+            // The typed key is shown ONLY as a masked width — never the raw
+            // characters (AGENTS.md credential rule).
+            Mode::AddKey => Line::from(vec![
+                Span::raw(" add account — key: "),
+                Span::styled(
+                    "•".repeat(chrome.add_input_len),
+                    Style::new().fg(Color::Cyan),
+                ),
+                Span::raw("  "),
+                key("Enter"),
+                Span::raw(" add  "),
+                key("Esc"),
+                Span::raw(" cancel"),
+            ]),
+            Mode::ConfirmRemove { .. } => Line::from(vec![
+                Span::raw(" "),
+                key("↑/k ↓/j"),
+                Span::raw(" pick  "),
+                Span::styled("remove selected? ", Style::new().fg(Color::Red)),
+                key("y"),
+                Span::raw(" confirm  "),
+                key("Esc/n"),
                 Span::raw(" cancel"),
             ]),
         }
@@ -1752,6 +1785,7 @@ mod tests {
             activity_scroll: 0,
             show_models,
             model_cursor: 0,
+            add_input_len: 0,
             attach: None,
         }
     }

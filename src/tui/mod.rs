@@ -1,7 +1,8 @@
 //! ratatui dashboard (FR6): per-account quota gauges (5h/7d) with reset
 //! countdowns, active/cooldown status, activity log, log console, totals.
-//! Keys: `q`uit, `R`eload config, `s`witch (select mode), `a`dd / `r`emove
-//! (pointers to the CLI), `l` log-panel size, `d` detail toggle.
+//! Keys: `q`uit, `R`eload config, `s`witch (select mode), `a`dd API-key
+//! account / `r`emove account (confirm-gated), `l` log-panel size, `d` detail
+//! toggle.
 //!
 //! Two entry points, ONE renderer:
 //! - [`run_local`] — in-process mode (`llmux server` on a TTY): renders
@@ -9,9 +10,10 @@
 //! - [`run_remote`] — attach mode (`llmux dashboard`, or `llmux
 //!   server` when a daemon already owns the port): polls
 //!   `GET /llmux/dashboard` every second and renders the fetched
-//!   document. Mostly read-only: manual switch goes through
-//!   `POST /llmux/switch`; config mutation keys (`a`/`r`/`R`) are
-//!   local-mode-only.
+//!   document. Manual switch goes through `POST /llmux/switch`; account
+//!   add/remove (issue #3) go through `POST /llmux/add-account` /
+//!   `POST /llmux/remove-account`, so they work in attach mode too. Only `R`
+//!   (reload from the local config file) stays local-mode-only.
 //!
 //! Both paths build the same [`view::DashboardView`] (local: from an
 //! in-process [`crate::dashboard::DashboardDoc`]; remote: from the fetched
@@ -93,12 +95,25 @@ pub(crate) struct PollHealth {
     pub next_at: SystemTime,
 }
 
-/// Input mode: normal keybar vs. account-selection (the `s` key).
+/// Input mode: normal keybar vs. account-selection (the `s` key) vs. the
+/// add-account key entry (`a`) vs. the remove confirmation (`r`).
+///
+/// Deliberately `Copy` (no owned buffer inside): the add-account input text
+/// lives in [`App::add_input`] so the masked render never has to clone a
+/// secret through this enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Mode {
     Normal,
     /// Cursor row for the pending switch.
     Select {
+        idx: usize,
+    },
+    /// Entering an API key for a new account (the `a` key). The typed text is
+    /// held in [`App::add_input`] and rendered masked.
+    AddKey,
+    /// Confirming a destructive account removal (the `r` key). `idx` is the
+    /// display row being removed; the name is resolved at confirm time.
+    ConfirmRemove {
         idx: usize,
     },
 }
@@ -121,6 +136,9 @@ pub(crate) struct Chrome {
     pub model_cursor: usize,
     /// `Some` in attach mode.
     pub attach: Option<Attach>,
+    /// Number of characters typed so far in `Mode::AddKey` — the footer shows
+    /// a masked prompt (`••••`) of this width, never the raw key.
+    pub add_input_len: usize,
 }
 
 /// Attach-mode banner state.
@@ -170,6 +188,13 @@ struct Remote {
     /// Codex settings change (fast/model/effort) queued by a key, performed by
     /// the event loop via `POST /llmux/codex` (req8.1).
     pending_codex: Option<crate::dashboard::CodexSettingsDoc>,
+    /// API key for a new account, queued by the `a` flow and performed by the
+    /// event loop via `POST /llmux/add-account`. Held only until the POST
+    /// fires; never logged or rendered raw.
+    pending_add: Option<String>,
+    /// Account name queued for removal (`r` confirm), performed by the event
+    /// loop via `POST /llmux/remove-account`.
+    pending_remove: Option<String>,
 }
 
 /// One message from the remote fetch task.
@@ -194,6 +219,10 @@ struct App {
     /// Detailed model-usage view active (`g`), with its cursor row.
     show_models: bool,
     model_cursor: usize,
+    /// API-key buffer for `Mode::AddKey`. Held outside `Mode` so the enum
+    /// stays `Copy` and the secret is owned in exactly one place; cleared on
+    /// submit/cancel. Never rendered raw — the footer shows a masked width.
+    add_input: String,
 }
 
 impl App {
@@ -209,11 +238,8 @@ impl App {
             activity_scroll: 0,
             show_models: false,
             model_cursor: 0,
+            add_input: String::new(),
         }
-    }
-
-    fn is_remote(&self) -> bool {
-        matches!(self.backend, Backend::Remote(_))
     }
 
     /// Build the view-model for one frame. `None` only in remote mode before
@@ -236,6 +262,7 @@ impl App {
             activity_scroll: self.activity_scroll,
             show_models: self.show_models,
             model_cursor: self.model_cursor,
+            add_input_len: self.add_input.chars().count(),
             status_line: self.status_line().map(str::to_string),
             attach: match &self.backend {
                 Backend::Local(_) => None,
@@ -291,6 +318,8 @@ impl App {
             Mode::Normal if self.show_models => self.on_key_models(key.code, view),
             Mode::Normal => self.on_key_normal(key.code, view),
             Mode::Select { idx } => self.on_key_select(key.code, idx, view),
+            Mode::AddKey => self.on_key_add(key.code),
+            Mode::ConfirmRemove { idx } => self.on_key_confirm_remove(key.code, idx, view),
         }
     }
 
@@ -336,22 +365,28 @@ impl App {
                 // (when one exists) is always row 0 — start the cursor there.
                 self.mode = Mode::Select { idx: 0 };
             }
-            // v0.1: add/remove are CLI flows (OAuth browser dance / confirm
-            // prompt); the TUI points at them. In attach mode they are
-            // local-mode-only (config mutation stays on the server host).
+            // Add an API-key account from the dashboard (issue #3): works in
+            // BOTH local and attach mode (local: in-process config update +
+            // pool reload; remote: POST /llmux/add-account). OAuth/codex
+            // login-from-dashboard remains a CLI flow (issue #4).
             KeyCode::Char('a') => {
-                self.set_status(if self.is_remote() {
-                    "add: local mode only — run `llmux login` on the server host".into()
-                } else {
-                    "add: run `llmux login` (or `llmux login --api`)".into()
-                });
+                self.add_input.clear();
+                self.mode = Mode::AddKey;
+                self.set_status(
+                    "add account: paste an Anthropic API key, Enter to add, Esc to cancel".into(),
+                );
             }
+            // Remove the selected account (issue #3): a destructive delete, so
+            // it opens a confirm step (y/N) — never a silent delete. Works in
+            // both modes. Targets the cursor row when an account is highlighted,
+            // else the current/active account.
             KeyCode::Char('r') => {
-                self.set_status(if self.is_remote() {
-                    "remove: local mode only — run `llmux remove <name>` on the server host".into()
+                let len = view.map_or(0, |v| v.snapshot.accounts.len());
+                if len == 0 {
+                    self.set_status("no accounts to remove".into());
                 } else {
-                    "remove: run `llmux remove <name>`".into()
-                });
+                    self.mode = Mode::ConfirmRemove { idx: 0 };
+                }
             }
             KeyCode::Char('l') => self.log_panel = self.log_panel.cycle(),
             KeyCode::Char('d') => self.show_detail = !self.show_detail,
@@ -519,6 +554,187 @@ impl App {
         }
     }
 
+    /// Key handling for `Mode::AddKey` — typing the new account's API key.
+    /// Printable chars append to the buffer; Backspace deletes; Enter submits;
+    /// Esc cancels. The buffer is never rendered raw (the footer shows a masked
+    /// width via [`Chrome::add_input_len`]).
+    fn on_key_add(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Esc => {
+                self.add_input.clear();
+                self.mode = Mode::Normal;
+                self.set_status("add account cancelled".into());
+            }
+            KeyCode::Enter => self.submit_add(),
+            KeyCode::Backspace => {
+                self.add_input.pop();
+            }
+            KeyCode::Char(c) => {
+                // Guard against accidental control chars; only printable input.
+                if !c.is_control() {
+                    self.add_input.push(c);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Submit the typed API key: add the account in-process (local) or queue a
+    /// `POST /llmux/add-account` (remote). The buffer is cleared either way so
+    /// the secret does not linger in memory longer than necessary.
+    fn submit_add(&mut self) {
+        let api_key = self.add_input.trim().to_string();
+        self.add_input.clear();
+        self.mode = Mode::Normal;
+        if api_key.is_empty() {
+            self.set_status("add account cancelled: empty key".into());
+            return;
+        }
+        match &mut self.backend {
+            Backend::Local(state) => match state.add_apikey_account(None, &api_key) {
+                // Status echoes the assigned NAME only — never the key.
+                Ok((name, _outcome)) => self.set_status(format!("added account {name}")),
+                Err(err) => self.set_status(format!("add account failed: {err}")),
+            },
+            Backend::Remote(remote) => {
+                remote.pending_add = Some(api_key);
+                self.set_status("adding account…".into());
+            }
+        }
+    }
+
+    /// Key handling for `Mode::ConfirmRemove` — a destructive delete gate.
+    /// `y` confirms the removal; any other key cancels. Arrow/j/k move the
+    /// target row so the operator can pick which account to delete.
+    fn on_key_confirm_remove(&mut self, code: KeyCode, idx: usize, view: Option<&DashboardView>) {
+        let len = view.map_or(0, |v| v.snapshot.accounts.len());
+        if len == 0 {
+            self.mode = Mode::Normal;
+            return;
+        }
+        let idx = idx.min(len - 1);
+        match code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.mode = Mode::ConfirmRemove {
+                    idx: idx.saturating_sub(1),
+                };
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.mode = Mode::ConfirmRemove {
+                    idx: (idx + 1).min(len - 1),
+                };
+            }
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                self.submit_remove(idx, view);
+                self.mode = Mode::Normal;
+            }
+            // Any other key (Esc/n/q/…) cancels — delete is never silent.
+            _ => {
+                self.mode = Mode::Normal;
+                self.set_status("remove cancelled".into());
+            }
+        }
+    }
+
+    /// Resolve the display row to an account name, then remove it in-process
+    /// (local) or queue a `POST /llmux/remove-account` (remote).
+    fn submit_remove(&mut self, idx: usize, view: Option<&DashboardView>) {
+        let Some(view) = view else { return };
+        let now = SystemTime::now();
+        // The cursor indexes DISPLAY rows (selection order), not config order.
+        let order = view.display_order(now);
+        let Some(target) = order.get(idx).and_then(|&i| view.snapshot.accounts.get(i)) else {
+            return;
+        };
+        let name = target.id.0.clone();
+        match &mut self.backend {
+            Backend::Local(state) => match state.remove_account(&name) {
+                Ok(true) => self.set_status(format!("removed account {name}")),
+                Ok(false) => self.set_status(format!("account {name} not found")),
+                Err(err) => self.set_status(format!("remove failed: {err}")),
+            },
+            Backend::Remote(remote) => {
+                remote.pending_remove = Some(name.clone());
+                self.set_status(format!("removing {name}…"));
+            }
+        }
+    }
+
+    fn take_pending_add(&mut self) -> Option<String> {
+        match &mut self.backend {
+            Backend::Remote(remote) => remote.pending_add.take(),
+            Backend::Local(_) => None,
+        }
+    }
+
+    fn take_pending_remove(&mut self) -> Option<String> {
+        match &mut self.backend {
+            Backend::Remote(remote) => remote.pending_remove.take(),
+            Backend::Local(_) => None,
+        }
+    }
+
+    /// Perform the queued remote add (`POST /llmux/add-account`). The api key
+    /// travels in the JSON body over the (loopback or api-key-gated) control
+    /// channel; the response echoes only a masked form, so nothing here logs
+    /// or displays the raw key.
+    async fn perform_remote_add(&mut self, api_key: String) {
+        let Backend::Remote(remote) = &mut self.backend else {
+            return;
+        };
+        let url = format!("{}/llmux/add-account", remote.base_url);
+        let mut request = remote
+            .client
+            .post(&url)
+            .json(&serde_json::json!({ "api_key": api_key }));
+        if let Some(key) = &remote.api_key {
+            request = request.header("x-api-key", key);
+        }
+        let message = match request.send().await {
+            Ok(response) if response.status().is_success() => {
+                let name = response
+                    .json::<serde_json::Value>()
+                    .await
+                    .ok()
+                    .and_then(|v| v["name"].as_str().map(str::to_string))
+                    .unwrap_or_else(|| "account".into());
+                format!("added account {name}")
+            }
+            Ok(response) => format!("add account failed: {}", response.status()),
+            Err(err) => format!("add account failed: {err}"),
+        };
+        self.set_status(message);
+    }
+
+    /// Perform the queued remote removal (`POST /llmux/remove-account`).
+    async fn perform_remote_remove(&mut self, name: String) {
+        let Backend::Remote(remote) = &mut self.backend else {
+            return;
+        };
+        let url = format!("{}/llmux/remove-account", remote.base_url);
+        let mut request = remote
+            .client
+            .post(&url)
+            .json(&serde_json::json!({ "name": name, "confirm": true }));
+        if let Some(key) = &remote.api_key {
+            request = request.header("x-api-key", key);
+        }
+        let message = match request.send().await {
+            Ok(response) if response.status().is_success() => format!("removed account {name}"),
+            Ok(response) => {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                let detail = serde_json::from_str::<serde_json::Value>(&body)
+                    .ok()
+                    .and_then(|v| v["error"]["message"].as_str().map(str::to_string))
+                    .unwrap_or_else(|| status.to_string());
+                format!("remove {name} failed: {detail}")
+            }
+            Err(err) => format!("remove {name} failed: {err}"),
+        };
+        self.set_status(message);
+    }
+
     /// `R` — re-read the config file and swap the roster into the live pool
     /// (`AccountPool::reload_accounts` keeps window/cooldown state for
     /// surviving accounts). Local mode only: an attached client must not
@@ -664,6 +880,8 @@ pub async fn run_remote(opts: RemoteOptions) -> std::io::Result<()> {
         connected: false,
         pending_switch: None,
         pending_codex: None,
+        pending_add: None,
+        pending_remove: None,
     })));
     let result = event_loop(&mut terminal, &mut app, Some(rx)).await;
     ratatui::restore();
@@ -744,6 +962,14 @@ async fn event_loop(
         }
         if let Some(codex) = app.take_pending_codex() {
             app.perform_remote_codex(codex).await;
+            redraw = true;
+        }
+        if let Some(api_key) = app.take_pending_add() {
+            app.perform_remote_add(api_key).await;
+            redraw = true;
+        }
+        if let Some(name) = app.take_pending_remove() {
+            app.perform_remote_remove(name).await;
             redraw = true;
         }
         if app.should_quit {

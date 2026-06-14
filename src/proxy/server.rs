@@ -18,7 +18,7 @@ use http::{header, HeaderValue, StatusCode};
 use super::logging::RequestLogger;
 use super::{forward, ProxyError};
 use crate::auth::oauth::RefreshCoalescer;
-use crate::config::{AccountCredential, Config};
+use crate::config::{AccountConfig, AccountCredential, Config};
 use crate::dashboard::{self, DashboardHub};
 use crate::logging::LogLine;
 use crate::provider::anthropic::AnthropicPassthrough;
@@ -215,6 +215,80 @@ impl AppState {
     pub fn emit(&self, event: ActivityEvent) {
         if let Some(events) = &self.events {
             let _ = events.try_send(event);
+        }
+    }
+
+    /// Add (upsert) an API-key account: read-merge-write the config, then swap
+    /// the merged roster into the live pool and re-select so the running daemon
+    /// serves it with no restart. The SINGLE in-process implementation behind
+    /// both the local TUI `a`-key path and the `POST /llmux/add-account`
+    /// endpoint. `name = None` assigns the next `api-N` on the FRESH on-disk
+    /// state. The api key is never logged. Returns `(resolved_name, outcome)`.
+    pub fn add_apikey_account(
+        &self,
+        name: Option<&str>,
+        api_key: &str,
+    ) -> Result<(String, crate::config::Upsert), crate::config::ConfigError> {
+        let Some(path) = &self.config_path else {
+            return Err(crate::config::ConfigError::NoConfigDir);
+        };
+        let mut resolved = String::new();
+        let mut outcome = crate::config::Upsert::Added;
+        let merged = crate::config::update_path(path, |c| {
+            resolved = match name {
+                Some(n) => n.to_string(),
+                None => {
+                    let next = c
+                        .accounts
+                        .iter()
+                        .filter(|a| a.name.starts_with("api-"))
+                        .count()
+                        + 1;
+                    format!("api-{next}")
+                }
+            };
+            outcome = c.upsert_account(AccountConfig {
+                name: resolved.clone(),
+                credential: AccountCredential::Apikey {
+                    api_key: api_key.to_string(),
+                },
+            });
+        })?;
+        self.apply_roster(&merged);
+        // Names are not credentials; the api key never reaches a log line.
+        tracing::info!(account = %resolved, action = ?outcome, "account added");
+        Ok((resolved, outcome))
+    }
+
+    /// Remove an account by name: read-merge-write removal, then reload the
+    /// live pool. The SINGLE in-process implementation behind both the local
+    /// TUI `r`-key path and the `POST /llmux/remove-account` endpoint. Returns
+    /// `Ok(true)` when an account was removed, `Ok(false)` when none matched.
+    pub fn remove_account(&self, name: &str) -> Result<bool, crate::config::ConfigError> {
+        let Some(path) = &self.config_path else {
+            return Err(crate::config::ConfigError::NoConfigDir);
+        };
+        let mut removed = false;
+        let merged = crate::config::update_path(path, |c| {
+            removed = c.remove_account(name);
+        })?;
+        if removed {
+            self.apply_roster(&merged);
+            tracing::info!(account = %name, "account removed");
+        }
+        Ok(removed)
+    }
+
+    /// Swap a freshly-merged config's roster into the live pool and re-select
+    /// every backend group (a removed `current` is cleared by
+    /// `reload_accounts`; the re-eval picks a replacement). Shared tail of
+    /// [`Self::add_apikey_account`] / [`Self::remove_account`].
+    fn apply_roster(&self, merged: &Config) {
+        self.pool.reload_accounts(&merged.accounts);
+        let params = self.select_params();
+        let now = SystemTime::now();
+        for group in eval_groups(&self.pool, self.config.routing.enabled) {
+            self.pool.evaluate(group, &params, now);
         }
     }
 }
@@ -482,6 +556,8 @@ pub fn router(state: AppState) -> Router {
         .route("/llmux/dashboard", get(dashboard_endpoint))
         .route("/llmux/switch", post(switch_endpoint))
         .route("/llmux/codex", post(codex_config_endpoint))
+        .route("/llmux/add-account", post(add_account_endpoint))
+        .route("/llmux/remove-account", post(remove_account_endpoint))
         .route("/llmux/shutdown", post(shutdown))
         .route("/v1/oauth/token", post(oauth_token_relay))
         .fallback(forward_any)
@@ -779,6 +855,118 @@ async fn codex_config_endpoint(
         .to_string(),
     )
         .into_response()
+}
+
+/// Request body for `POST /llmux/add-account` — an API-key account
+/// (issue #3; OAuth/codex login-from-dashboard is issue #4, out of scope).
+/// `name` is optional: when omitted the server assigns the next `api-N` name,
+/// mirroring `cli::login::login_api`.
+#[derive(serde::Deserialize)]
+struct AddAccountRequest {
+    #[serde(default)]
+    name: Option<String>,
+    api_key: String,
+}
+
+/// `POST /llmux/add-account` `{"api_key":"...","name":"..."?}` — add (upsert)
+/// an API-key account from the dashboard, in BOTH local and attach mode. Same
+/// loopback / proxy-api-key gate as every route (it sits on the shared
+/// `.route(...)` chain behind `client_auth`). The credential is written
+/// read-merge-write via [`crate::config::update_path`] (never load/edit/save
+/// around the running server) and the live pool is reloaded so the daemon
+/// picks it up with no restart. The api key is NEVER logged and the response
+/// echoes only a masked form (`crate::proxy::logging::mask_credentials`).
+async fn add_account_endpoint(
+    State(state): State<AppState>,
+    body: axum::extract::Json<AddAccountRequest>,
+) -> Response {
+    let api_key = body.api_key.trim();
+    if api_key.is_empty() {
+        return relay_error(StatusCode::BAD_REQUEST, "api_key is required");
+    }
+    let requested_name = body
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| !n.is_empty());
+
+    match state.add_apikey_account(requested_name, api_key) {
+        Ok((name, outcome)) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/json")],
+            serde_json::json!({
+                "ok": true,
+                "name": name,
+                "type": "apikey",
+                "added": matches!(outcome, crate::config::Upsert::Added),
+                // Masked echo only — never the raw key (AGENTS.md credential rule).
+                "api_key_masked": crate::proxy::logging::mask_credentials(api_key),
+            })
+            .to_string(),
+        )
+            .into_response(),
+        Err(crate::config::ConfigError::NoConfigDir) => relay_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "config persistence disabled; cannot add account",
+        ),
+        Err(err) => relay_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("config write failed: {err}"),
+        ),
+    }
+}
+
+/// Request body for `POST /llmux/remove-account`. `confirm` must be `true` —
+/// a destructive delete requires explicit confirmation (matches the CLI's
+/// `remove --yes` gate); the TUI supplies it via a second-key confirm.
+#[derive(serde::Deserialize)]
+struct RemoveAccountRequest {
+    name: String,
+    #[serde(default)]
+    confirm: bool,
+}
+
+/// `POST /llmux/remove-account` `{"name":"...","confirm":true}` — remove an
+/// account from the dashboard in BOTH local and attach mode. Same gate as
+/// every route. Read-merge-write removal via [`crate::config::update_path`]
+/// (preserves every other account) and a live pool reload so the change takes
+/// effect with no restart. Refuses without `confirm: true` (a 400) so a
+/// destructive delete is never silent.
+async fn remove_account_endpoint(
+    State(state): State<AppState>,
+    body: axum::extract::Json<RemoveAccountRequest>,
+) -> Response {
+    let name = body.name.trim().to_string();
+    if name.is_empty() {
+        return relay_error(StatusCode::BAD_REQUEST, "name is required");
+    }
+    if !body.confirm {
+        return relay_error(
+            StatusCode::BAD_REQUEST,
+            &format!("refusing to remove {name:?} without confirmation; set confirm=true"),
+        );
+    }
+
+    match state.remove_account(&name) {
+        Ok(true) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/json")],
+            serde_json::json!({ "ok": true, "name": name, "removed": true }).to_string(),
+        )
+            .into_response(),
+        Ok(false) => relay_error(
+            StatusCode::NOT_FOUND,
+            &format!("account {name:?} not found"),
+        ),
+        Err(crate::config::ConfigError::NoConfigDir) => relay_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "config persistence disabled; cannot remove account",
+        ),
+        Err(err) => relay_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("config write failed: {err}"),
+        ),
+    }
 }
 
 /// `POST /llmux/shutdown` — graceful server exit (same loopback /
@@ -1167,5 +1355,227 @@ mod tests {
                 output_tokens: 8,
             }
         );
+    }
+
+    // --- account add/remove endpoints (issue #3) ---------------------------
+
+    /// Self-cleaning unique temp dir (no tempfile dev-dependency), mirroring
+    /// the pattern in `config::tests` / `forward::tests`.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "llmux-server-test-{}-{}",
+                std::process::id(),
+                ulid::Ulid::new()
+            ));
+            std::fs::create_dir_all(&dir).expect("create temp dir");
+            Self(dir)
+        }
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Build an `AppState` whose config is persisted at `config_path` (seeded
+    /// with `accounts`), so the add/remove handlers exercise the real
+    /// read-merge-write path against a throwaway file — never the user config.
+    fn endpoint_state(config_path: &std::path::Path, accounts: Vec<AccountConfig>) -> AppState {
+        let config = Config {
+            accounts,
+            ..Default::default()
+        };
+        crate::config::save_path(config_path, &config).expect("seed config");
+        let pool = AccountPool::new(&config.accounts);
+        let mut state = AppState::new(config, pool, None, None).expect("state");
+        state.config_path = Some(config_path.to_path_buf());
+        state
+            .pool
+            .evaluate(None, &state.select_params(), SystemTime::now());
+        state
+    }
+
+    async fn response_json(response: Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        serde_json::from_slice(&bytes).expect("json")
+    }
+
+    #[tokio::test]
+    async fn add_account_persists_apikey_masks_response_and_reloads_pool() {
+        let dir = TempDir::new();
+        let path = dir.path().join("llmux.json");
+        let state = endpoint_state(&path, vec![oauth_account("keep")]);
+
+        let response = add_account_endpoint(
+            State(state.clone()),
+            axum::extract::Json(AddAccountRequest {
+                name: Some("api-mine".into()),
+                api_key: "sk-ant-api03-SUPERSECRETVALUE".into(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["name"], "api-mine");
+        assert_eq!(body["type"], "apikey");
+        assert_eq!(body["added"], true);
+        // Response echoes ONLY a masked key — never the raw secret.
+        assert_eq!(body["api_key_masked"], "sk-ant-api03-SU...");
+        let masked = body["api_key_masked"].as_str().expect("masked");
+        assert!(
+            !masked.contains("SUPERSECRET"),
+            "raw key must not leak: {masked}"
+        );
+
+        // Persisted via read-merge-write: the seeded account is preserved and
+        // the new apikey account is on disk with the real (unmasked) key.
+        let on_disk = crate::config::load_path(&path).expect("reload");
+        let names: Vec<&str> = on_disk.accounts.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, vec!["keep", "api-mine"]);
+        match &on_disk.accounts[1].credential {
+            AccountCredential::Apikey { api_key } => {
+                assert_eq!(api_key, "sk-ant-api03-SUPERSECRETVALUE")
+            }
+            other => panic!("expected apikey, got {other:?}"),
+        }
+
+        // Live pool reflects the add with no restart.
+        let live: Vec<String> = state
+            .pool
+            .snapshot()
+            .accounts
+            .iter()
+            .map(|a| a.id.0.clone())
+            .collect();
+        assert!(
+            live.contains(&"api-mine".to_string()),
+            "live pool reloaded: {live:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_account_assigns_default_name_when_omitted() {
+        let dir = TempDir::new();
+        let path = dir.path().join("llmux.json");
+        let state = endpoint_state(&path, vec![apikey_account("api-1")]);
+
+        let response = add_account_endpoint(
+            State(state),
+            axum::extract::Json(AddAccountRequest {
+                name: None,
+                api_key: "sk-ant-api03-ANOTHERONE".into(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        // Next free `api-N`, computed off the fresh on-disk state.
+        assert_eq!(body["name"], "api-2");
+    }
+
+    #[tokio::test]
+    async fn add_account_rejects_empty_key() {
+        let dir = TempDir::new();
+        let path = dir.path().join("llmux.json");
+        let state = endpoint_state(&path, vec![]);
+
+        let response = add_account_endpoint(
+            State(state),
+            axum::extract::Json(AddAccountRequest {
+                name: None,
+                api_key: "   ".into(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        // Nothing written.
+        let on_disk = crate::config::load_path(&path).expect("reload");
+        assert!(on_disk.accounts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn remove_account_preserves_others_and_reloads_pool() {
+        let dir = TempDir::new();
+        let path = dir.path().join("llmux.json");
+        let state = endpoint_state(
+            &path,
+            vec![oauth_account("a"), apikey_account("b"), oauth_account("c")],
+        );
+
+        let response = remove_account_endpoint(
+            State(state.clone()),
+            axum::extract::Json(RemoveAccountRequest {
+                name: "b".into(),
+                confirm: true,
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["removed"], true);
+
+        // Read-merge-write removal preserves the other accounts.
+        let on_disk = crate::config::load_path(&path).expect("reload");
+        let names: Vec<&str> = on_disk.accounts.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, vec!["a", "c"]);
+
+        // Live pool dropped the removed account with no restart.
+        let live: Vec<String> = state
+            .pool
+            .snapshot()
+            .accounts
+            .iter()
+            .map(|a| a.id.0.clone())
+            .collect();
+        assert_eq!(live, vec!["a".to_string(), "c".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn remove_account_requires_confirmation() {
+        let dir = TempDir::new();
+        let path = dir.path().join("llmux.json");
+        let state = endpoint_state(&path, vec![oauth_account("a")]);
+
+        let response = remove_account_endpoint(
+            State(state),
+            axum::extract::Json(RemoveAccountRequest {
+                name: "a".into(),
+                confirm: false,
+            }),
+        )
+        .await;
+        // No confirm → 400, and the account is left untouched (never silent).
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let on_disk = crate::config::load_path(&path).expect("reload");
+        assert_eq!(on_disk.accounts.len(), 1);
+        assert_eq!(on_disk.accounts[0].name, "a");
+    }
+
+    #[tokio::test]
+    async fn remove_account_unknown_name_is_404() {
+        let dir = TempDir::new();
+        let path = dir.path().join("llmux.json");
+        let state = endpoint_state(&path, vec![oauth_account("a")]);
+
+        let response = remove_account_endpoint(
+            State(state),
+            axum::extract::Json(RemoveAccountRequest {
+                name: "ghost".into(),
+                confirm: true,
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 }
