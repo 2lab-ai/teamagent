@@ -13,6 +13,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 use ratatui::Frame;
 
+use crate::dashboard::ModelUsageDoc;
 use crate::logging::LogLine;
 use crate::routing::BackendGroup;
 use crate::scheduler::select::IneligibleReason;
@@ -30,6 +31,12 @@ const GAUGE_BAR_WIDTH: usize = 8;
 const WIDE_TABLE_AT: u16 = 150;
 /// Width at/above which the middle row fits summary + detail side by side.
 const SIDE_BY_SIDE_AT: u16 = 110;
+/// Rows shown in the always-visible compact model strip (req12). Width of its
+/// token-share mini-bar.
+const MODEL_STRIP_ROWS: usize = 3;
+const MODEL_BAR_WIDTH: usize = 10;
+/// A model used within this window counts as "recently active" (req15).
+const MODEL_RECENT_WINDOW: Duration = Duration::from_secs(60);
 
 fn dim() -> Style {
     Style::new().fg(Color::DarkGray)
@@ -74,13 +81,42 @@ pub(crate) fn draw(frame: &mut Frame, view: Option<&DashboardView>, chrome: &Chr
         frame: chrome.frame,
     };
     let table_height = (snapshot.accounts.len().max(1) as u16).saturating_add(2);
+
+    // Detailed model-usage view (req13): keep the header + account table for
+    // context, then give the rest of the screen to the full model table +
+    // drill-down. The account quota table stays the priority surface above it.
+    if chrome.show_models {
+        let [header_area, table_area, body_area, footer_area] = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Length(table_height),
+            Constraint::Min(3),
+            Constraint::Length(2),
+        ])
+        .areas(frame.area());
+        draw_header(frame, header_area, view, chrome);
+        draw_accounts(frame, table_area, view, &ctx, chrome);
+        draw_models_full(frame, body_area, view, &ctx, chrome);
+        draw_footer(frame, footer_area, chrome);
+        return;
+    }
+
     // Log console sits at the bottom, between activity and the keybar.
     let logs_height = chrome.log_panel.height();
-    let [header_area, table_area, middle_area, activity_area, logs_area, footer_area] =
+    // Compact model strip (req12): only when model data exists. 0 height (no
+    // pane) otherwise, so the idle layout is unchanged.
+    let strip_rows = view.model_usage.len().min(MODEL_STRIP_ROWS);
+    // +2 for the table's top border (title) and header row.
+    let strip_height = if strip_rows > 0 {
+        strip_rows as u16 + 2
+    } else {
+        0
+    };
+    let [header_area, table_area, middle_area, strip_area, activity_area, logs_area, footer_area] =
         Layout::vertical([
             Constraint::Length(1),
             Constraint::Length(table_height),
             Constraint::Length(8),
+            Constraint::Length(strip_height),
             Constraint::Min(3),
             Constraint::Length(logs_height),
             Constraint::Length(2),
@@ -90,6 +126,9 @@ pub(crate) fn draw(frame: &mut Frame, view: Option<&DashboardView>, chrome: &Chr
     draw_header(frame, header_area, view, chrome);
     draw_accounts(frame, table_area, view, &ctx, chrome);
     draw_middle(frame, middle_area, view, &ctx, chrome);
+    if strip_height > 0 {
+        draw_models_strip(frame, strip_area, view, now);
+    }
     draw_activity(frame, activity_area, view, chrome, now);
     if logs_height > 0 {
         draw_logs(frame, logs_area, view);
@@ -1138,6 +1177,409 @@ fn log_line(line: &LogLine) -> Line<'_> {
     ])
 }
 
+// ---------------------------------------------------------------------------
+// Model usage (req1-20): compact strip + detailed table/drill-down.
+// ---------------------------------------------------------------------------
+
+fn model_total(m: &ModelUsageDoc) -> u64 {
+    m.tokens_in.saturating_add(m.tokens_out)
+}
+
+/// "—" when unavailable (the upstream never reported it), else a human count —
+/// so the UI never implies a precise zero it does not have (req9).
+fn opt_count(v: Option<u64>) -> String {
+    match v {
+        Some(n) => format::human_count(n),
+        None => "—".to_string(),
+    }
+}
+
+/// Compact "last used" age for the strip ("12s", "3m"); "—" for in-flight-only
+/// rows that have no completed request yet.
+fn model_age_compact(last_used_ms: u64, now: SystemTime) -> String {
+    if last_used_ms == 0 {
+        return "—".to_string();
+    }
+    let at = UNIX_EPOCH + Duration::from_millis(last_used_ms);
+    now.duration_since(at)
+        .map(select::compact_duration)
+        .unwrap_or_else(|_| "now".to_string())
+}
+
+fn model_is_recent(last_used_ms: u64, now: SystemTime) -> bool {
+    if last_used_ms == 0 {
+        return false;
+    }
+    let at = UNIX_EPOCH + Duration::from_millis(last_used_ms);
+    now.duration_since(at)
+        .map(|age| age <= MODEL_RECENT_WINDOW)
+        .unwrap_or(true)
+}
+
+/// Leading marker for a model row: a group-colored working spinner while it has
+/// in-flight traffic (req11), a `●` when recently used (req15), else blank.
+fn model_active_marker(m: &ModelUsageDoc, now: SystemTime, frame: usize) -> Span<'static> {
+    if m.in_flight > 0 {
+        let glyph = if m.group == "codex" {
+            anim::block_spin(frame)
+        } else {
+            anim::braille_spin(frame)
+        };
+        Span::styled(glyph.to_string(), group_color(Some(m.group.as_str())))
+    } else if model_is_recent(m.last_used_ms, now) {
+        Span::styled("●", Style::new().fg(Color::Green))
+    } else {
+        Span::raw(" ")
+    }
+}
+
+/// A `GROUP model` label pair, group-colored, model bold when active.
+fn model_name_cells(m: &ModelUsageDoc, active: bool) -> (Cell<'static>, Cell<'static>) {
+    let group = Cell::from(Span::styled(
+        m.group.to_uppercase(),
+        group_color(Some(m.group.as_str())).add_modifier(Modifier::BOLD),
+    ));
+    let name_style = if active {
+        Style::new().add_modifier(Modifier::BOLD)
+    } else {
+        Style::new()
+    };
+    (group, Cell::from(Span::styled(m.model.clone(), name_style)))
+}
+
+/// Always-visible compact strip: the top models by total tokens, each with a
+/// proportional mini-bar and req/tok/last-used (req12/28). Narrow terminals
+/// drop the bar so the column set stays readable (req29).
+fn draw_models_strip(frame: &mut Frame, area: Rect, view: &DashboardView, now: SystemTime) {
+    let rows_data: Vec<&ModelUsageDoc> = view.model_usage.iter().take(MODEL_STRIP_ROWS).collect();
+    let max_total = view
+        .model_usage
+        .iter()
+        .map(model_total)
+        .max()
+        .unwrap_or(0)
+        .max(1);
+    let wide = area.width >= SIDE_BY_SIDE_AT;
+    let frame_n = 0; // strip markers don't need to animate per draw tick
+
+    let rows = rows_data.into_iter().map(|m| {
+        let active = m.in_flight > 0 || model_is_recent(m.last_used_ms, now);
+        let (group_cell, name_cell) = model_name_cells(m, active);
+        let share = model_total(m) as f64 / max_total as f64;
+        let mut cells = vec![
+            Cell::from(model_active_marker(m, now, frame_n)),
+            group_cell,
+            name_cell,
+        ];
+        if wide {
+            cells.push(Cell::from(Span::styled(
+                format::gauge_bar(share, MODEL_BAR_WIDTH),
+                group_color(Some(m.group.as_str())),
+            )));
+        }
+        cells.push(Cell::from(format::human_count(m.requests)));
+        cells.push(Cell::from(format::human_count(model_total(m))));
+        let mut last = model_age_compact(m.last_used_ms, now);
+        if m.in_flight > 0 {
+            last = format!("{} in-flight", m.in_flight);
+        }
+        cells.push(Cell::from(Span::styled(last, dim())));
+        Row::new(cells)
+    });
+
+    let (header, constraints): (Vec<&'static str>, Vec<Constraint>) = if wide {
+        (
+            vec!["", "group", "model", "share", "req", "tok", "last"],
+            vec![
+                Constraint::Length(2),
+                Constraint::Length(7),
+                Constraint::Fill(1),
+                Constraint::Length(MODEL_BAR_WIDTH as u16 + 1),
+                Constraint::Length(7),
+                Constraint::Length(8),
+                Constraint::Length(12),
+            ],
+        )
+    } else {
+        (
+            vec!["", "group", "model", "req", "tok", "last"],
+            vec![
+                Constraint::Length(2),
+                Constraint::Length(7),
+                Constraint::Fill(1),
+                Constraint::Length(7),
+                Constraint::Length(8),
+                Constraint::Length(12),
+            ],
+        )
+    };
+    let title = format!(
+        " models — top {} by tokens (g: all) ",
+        view.model_usage.len()
+    );
+    let table = Table::new(rows, constraints)
+        .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)))
+        .block(Block::new().borders(Borders::TOP).title(title));
+    frame.render_widget(table, area);
+}
+
+/// Detailed model view body: the full scrollable table beside (or above) the
+/// drill-down panel for the cursored model row.
+fn draw_models_full(
+    frame: &mut Frame,
+    area: Rect,
+    view: &DashboardView,
+    ctx: &FrameCtx,
+    chrome: &Chrome,
+) {
+    if view.model_usage.is_empty() {
+        let empty = Paragraph::new(Line::from(Span::styled(
+            "no model usage yet — send a request through the proxy",
+            Style::new().fg(Color::Yellow),
+        )))
+        .block(Block::new().borders(Borders::TOP).title(" models "));
+        frame.render_widget(empty, area);
+        return;
+    }
+    if area.width >= SIDE_BY_SIDE_AT {
+        let [table_area, detail_area] =
+            Layout::horizontal([Constraint::Fill(1), Constraint::Length(46)]).areas(area);
+        draw_models_table(frame, table_area, view, ctx, chrome);
+        draw_model_detail(frame, detail_area, view, ctx, chrome);
+    } else {
+        draw_models_table(frame, area, view, ctx, chrome);
+    }
+}
+
+/// The full model table (all rows reachable via the cursor, req13). Columns
+/// drop on narrow widths. The title shows the cursor position and total so it
+/// is obvious more rows exist off-screen.
+fn draw_models_table(
+    frame: &mut Frame,
+    area: Rect,
+    view: &DashboardView,
+    ctx: &FrameCtx,
+    chrome: &Chrome,
+) {
+    let now = ctx.now;
+    let total = view.model_usage.len();
+    let cursor = chrome.model_cursor.min(total.saturating_sub(1));
+    let capacity = (area.height.saturating_sub(2) as usize).max(1); // border + header
+    let start = if cursor >= capacity {
+        cursor + 1 - capacity
+    } else {
+        0
+    };
+    let end = (start + capacity).min(total);
+    let wide = area.width >= WIDE_TABLE_AT;
+
+    let rows = view.model_usage[start..end]
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            let idx = start + i;
+            let active = m.in_flight > 0 || model_is_recent(m.last_used_ms, now);
+            let (group_cell, name_cell) = model_name_cells(m, active);
+            let ok_err = Line::from(vec![
+                Span::styled(format::human_count(m.ok), Style::new().fg(Color::Green)),
+                Span::raw("/"),
+                Span::styled(
+                    format::human_count(m.errors),
+                    if m.errors > 0 {
+                        Style::new().fg(Color::Red)
+                    } else {
+                        dim()
+                    },
+                ),
+            ]);
+            let mut cells = vec![
+                Cell::from(model_active_marker(m, now, ctx.frame)),
+                group_cell,
+                name_cell,
+                Cell::from(format::human_count(m.requests)),
+                Cell::from(ok_err),
+                Cell::from(format::human_count(m.tokens_in)),
+                Cell::from(format::human_count(m.tokens_out)),
+            ];
+            if wide {
+                cells.push(Cell::from(Span::styled(opt_count(m.cache_read), dim())));
+            }
+            cells.push(Cell::from(Span::styled(
+                model_age_compact(m.last_used_ms, now),
+                dim(),
+            )));
+            cells.push(Cell::from(in_flight_span(m.in_flight)));
+            let row = Row::new(cells);
+            if idx == cursor {
+                row.style(Style::new().add_modifier(Modifier::REVERSED))
+            } else {
+                row
+            }
+        });
+
+    let (header, constraints): (Vec<&'static str>, Vec<Constraint>) = if wide {
+        (
+            vec![
+                "", "group", "model", "req", "ok/err", "in", "out", "cache", "last", "if",
+            ],
+            vec![
+                Constraint::Length(2),
+                Constraint::Length(7),
+                Constraint::Fill(1),
+                Constraint::Length(7),
+                Constraint::Length(9),
+                Constraint::Length(8),
+                Constraint::Length(8),
+                Constraint::Length(8),
+                Constraint::Length(8),
+                Constraint::Length(3),
+            ],
+        )
+    } else {
+        (
+            vec!["", "group", "model", "req", "ok/err", "in", "out", "if"],
+            vec![
+                Constraint::Length(2),
+                Constraint::Length(7),
+                Constraint::Fill(1),
+                Constraint::Length(7),
+                Constraint::Length(9),
+                Constraint::Length(8),
+                Constraint::Length(8),
+                Constraint::Length(3),
+            ],
+        )
+    };
+    let title = format!(" models — {} of {total} ", cursor + 1);
+    let table = Table::new(rows, constraints)
+        .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)))
+        .block(Block::new().borders(Borders::TOP).title(title));
+    frame.render_widget(table, area);
+}
+
+/// Drill-down panel for the cursored model row: token + cache split, account
+/// breakdown (req19), effort (req18) and endpoint (req20) distributions.
+fn draw_model_detail(
+    frame: &mut Frame,
+    area: Rect,
+    view: &DashboardView,
+    ctx: &FrameCtx,
+    chrome: &Chrome,
+) {
+    let now = ctx.now;
+    let cursor = chrome
+        .model_cursor
+        .min(view.model_usage.len().saturating_sub(1));
+    let Some(m) = view.model_usage.get(cursor) else {
+        return;
+    };
+    let counts = |items: &[crate::dashboard::ModelCountDoc]| {
+        if items.is_empty() {
+            "—".to_string()
+        } else {
+            items
+                .iter()
+                .map(|c| format!("{}×{}", c.label, c.requests))
+                .collect::<Vec<_>>()
+                .join("  ")
+        }
+    };
+
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!(" {} ", m.group.to_uppercase()),
+            group_color(Some(m.group.as_str())).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(m.model.clone(), Style::new().add_modifier(Modifier::BOLD)),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled(" req   ", dim()),
+        Span::raw(format!("{} (", format::human_count(m.requests))),
+        Span::styled(
+            format!("{} ok", format::human_count(m.ok)),
+            Style::new().fg(Color::Green),
+        ),
+        Span::raw("/"),
+        Span::styled(
+            format!("{} err", format::human_count(m.errors)),
+            if m.errors > 0 {
+                Style::new().fg(Color::Red)
+            } else {
+                dim()
+            },
+        ),
+        Span::raw(")"),
+        Span::styled(
+            if m.in_flight > 0 {
+                format!(" · {} in-flight", m.in_flight)
+            } else {
+                String::new()
+            },
+            Style::new().fg(Color::Cyan),
+        ),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled(" tok   ", dim()),
+        Span::raw(format!(
+            "in {} · out {}",
+            format::human_count(m.tokens_in),
+            format::human_count(m.tokens_out)
+        )),
+    ]));
+    // Cache split — explicit "—" when the upstream did not report it (req9),
+    // and a reminder that quota windows are account-level only (req27).
+    lines.push(Line::from(vec![
+        Span::styled(" cache ", dim()),
+        Span::raw(format!(
+            "read {} · creation {}",
+            opt_count(m.cache_read),
+            opt_count(m.cache_creation)
+        )),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled(" last  ", dim()),
+        Span::raw(model_age_compact(m.last_used_ms, now)),
+        Span::styled(" ago", dim()),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled(" effort", dim()),
+        Span::raw(format!(" {}", counts(&m.efforts))),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled(" route ", dim()),
+        Span::raw(counts(&m.endpoints)),
+    ]));
+    lines.push(Line::from(Span::styled(" accounts", dim())));
+    if m.accounts.is_empty() {
+        lines.push(Line::from(Span::styled("   —", dim())));
+    } else {
+        for a in &m.accounts {
+            lines.push(Line::from(vec![
+                Span::raw(format!("   {} ", a.name)),
+                Span::styled(
+                    format!(
+                        "{} req · in {}/out {}",
+                        format::human_count(a.requests),
+                        format::human_count(a.tokens_in),
+                        format::human_count(a.tokens_out),
+                    ),
+                    dim(),
+                ),
+            ]));
+        }
+    }
+    // Quota windows are an account/provider fact, never per-model (req27) — make
+    // that explicit so the per-account list above isn't read as a model limit.
+    lines.push(Line::from(Span::styled(
+        " quota is account-level (see accounts table)",
+        dim(),
+    )));
+
+    let block = Block::new().borders(Borders::TOP).title(" model detail ");
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
 fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome) {
     let status = Line::from(Span::styled(
         format!(" {}", chrome.status_line.as_deref().unwrap_or("")),
@@ -1149,53 +1591,186 @@ fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome) {
     // Attach mode disables the config-mutation keys (a/r/R act on the server
     // host's config); the keybar shows what is actually available.
     let attached = chrome.attach.is_some();
-    let keybar = match chrome.mode {
-        Mode::Normal if attached => Line::from(vec![
+    let keybar = if chrome.show_models {
+        // Detailed model view: navigation + back, regardless of attach mode.
+        Line::from(vec![
             Span::raw(" "),
-            key("q"),
-            Span::raw(" quit  "),
-            key("s"),
-            Span::raw(" switch  "),
-            key("d"),
-            Span::raw(" detail  "),
-            key("l"),
-            Span::raw(" logs  "),
-            key("f/m/e"),
-            Span::raw(" codex  "),
-            key("↑↓"),
-            Span::raw(" scroll  "),
-            Span::styled("a/r/R disabled (attached)", dim()),
-        ]),
-        Mode::Normal => Line::from(vec![
-            Span::raw(" "),
-            key("q"),
-            Span::raw(" quit  "),
-            key("s"),
-            Span::raw(" switch  "),
-            key("d"),
-            Span::raw(" detail  "),
-            key("a"),
-            Span::raw(" add  "),
-            key("r"),
-            Span::raw(" remove  "),
-            key("R"),
-            Span::raw(" reload  "),
-            key("l"),
-            Span::raw(" logs  "),
-            key("f/m/e"),
-            Span::raw(" codex  "),
-            key("↑↓"),
-            Span::raw(" scroll"),
-        ]),
-        Mode::Select { .. } => Line::from(vec![
-            Span::raw(" "),
+            key("g/Esc"),
+            Span::raw(" back  "),
             key("↑/k ↓/j"),
-            Span::raw(" move  "),
-            key("Enter"),
-            Span::raw(" switch  "),
-            key("Esc"),
-            Span::raw(" cancel"),
-        ]),
+            Span::raw(" model  "),
+            key("PgUp/PgDn"),
+            Span::raw(" page  "),
+            key("l"),
+            Span::raw(" logs  "),
+            key("q"),
+            Span::raw(" quit"),
+        ])
+    } else {
+        match chrome.mode {
+            Mode::Normal if attached => Line::from(vec![
+                Span::raw(" "),
+                key("q"),
+                Span::raw(" quit  "),
+                key("s"),
+                Span::raw(" switch  "),
+                key("d"),
+                Span::raw(" detail  "),
+                key("g"),
+                Span::raw(" models  "),
+                key("l"),
+                Span::raw(" logs  "),
+                key("f/m/e"),
+                Span::raw(" codex  "),
+                key("↑↓"),
+                Span::raw(" scroll  "),
+                Span::styled("a/r/R disabled (attached)", dim()),
+            ]),
+            Mode::Normal => Line::from(vec![
+                Span::raw(" "),
+                key("q"),
+                Span::raw(" quit  "),
+                key("s"),
+                Span::raw(" switch  "),
+                key("d"),
+                Span::raw(" detail  "),
+                key("g"),
+                Span::raw(" models  "),
+                key("a"),
+                Span::raw(" add  "),
+                key("r"),
+                Span::raw(" remove  "),
+                key("R"),
+                Span::raw(" reload  "),
+                key("l"),
+                Span::raw(" logs  "),
+                key("f/m/e"),
+                Span::raw(" codex  "),
+                key("↑↓"),
+                Span::raw(" scroll"),
+            ]),
+            Mode::Select { .. } => Line::from(vec![
+                Span::raw(" "),
+                key("↑/k ↓/j"),
+                Span::raw(" move  "),
+                key("Enter"),
+                Span::raw(" switch  "),
+                key("Esc"),
+                Span::raw(" cancel"),
+            ]),
+        }
     };
     frame.render_widget(Paragraph::new(vec![status, keybar]), area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scheduler::PoolSnapshot;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    use std::collections::{BTreeMap, HashMap};
+
+    fn model_row(group: &str, model: &str, tokens_in: u64, tokens_out: u64) -> ModelUsageDoc {
+        ModelUsageDoc {
+            group: group.into(),
+            model: model.into(),
+            requests: 3,
+            ok: 3,
+            errors: 0,
+            tokens_in,
+            tokens_out,
+            cache_read: Some(40_000),
+            cache_creation: None,
+            last_used_ms: 0,
+            in_flight: 0,
+            accounts: Vec::new(),
+            efforts: Vec::new(),
+            endpoints: Vec::new(),
+        }
+    }
+
+    fn view_with(model_usage: Vec<ModelUsageDoc>) -> DashboardView {
+        DashboardView {
+            version: "llmux 0.0 (test)".into(),
+            pid: 1,
+            uptime: Duration::from_secs(1),
+            port: 3456,
+            upstream: None,
+            config_path: None,
+            select_params: select::SelectParams {
+                five_hour_max: 0.9,
+                seven_day_max: 0.99,
+                usage_max_age: Duration::from_secs(600),
+            },
+            refresh_ahead: Duration::from_secs(25_200),
+            evaluate_tick: Duration::from_secs(60),
+            snapshot: PoolSnapshot {
+                accounts: Vec::new(),
+                current: BTreeMap::new(),
+            },
+            last_switch: None,
+            poll_health: HashMap::new(),
+            session_totals: HashMap::new(),
+            global_totals: super::super::activity::Totals::default(),
+            rpm_5m: 0.0,
+            in_flight: Vec::new(),
+            completed: Vec::new(),
+            logs: Vec::new(),
+            model_usage,
+            codex: crate::dashboard::CodexSettingsDoc::default(),
+        }
+    }
+
+    fn chrome(show_models: bool) -> Chrome {
+        Chrome {
+            frame: 0,
+            mode: Mode::Normal,
+            show_detail: false,
+            log_panel: super::super::logs::LogPanelSize::Small,
+            status_line: None,
+            activity_scroll: 0,
+            show_models,
+            model_cursor: 0,
+            attach: None,
+        }
+    }
+
+    fn render(view: &DashboardView, chrome: &Chrome, w: u16, h: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).expect("terminal");
+        terminal
+            .draw(|f| draw(f, Some(view), chrome))
+            .expect("draw");
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn compact_strip_shows_top_model_and_keybar_advertises_view() {
+        let view = view_with(vec![model_row("codex", "gpt-5.5", 700, 300)]);
+        let text = render(&view, &chrome(false), 160, 30);
+        // Discoverability (req30) + the compact strip's top-model label (req12).
+        assert!(text.contains("models"), "keybar/strip mentions models");
+        assert!(text.contains("gpt-5.5"), "strip shows the top model");
+    }
+
+    #[test]
+    fn detailed_view_lists_all_model_rows_and_drilldown() {
+        let view = view_with(vec![
+            model_row("codex", "gpt-5.5", 700, 300),
+            model_row("claude", "claude-sonnet-4-5", 100, 50),
+        ]);
+        let text = render(&view, &chrome(true), 160, 30);
+        assert!(text.contains("gpt-5.5"));
+        assert!(
+            text.contains("claude-sonnet-4-5"),
+            "lower rows reachable (req13)"
+        );
+        assert!(text.contains("model detail"), "drill-down panel present");
+    }
 }

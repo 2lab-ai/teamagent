@@ -13,18 +13,42 @@
 use bytes::Bytes;
 use tokio_stream::StreamExt as _;
 
-/// Token usage extracted from a message stream.
+/// Token usage extracted from a message stream. `input_tokens` is the FRESH
+/// (non-cached) prompt count on both providers; the cached components are kept
+/// separately and optionally — `None` means the upstream did not report that
+/// field (rendered "—"), distinct from `Some(0)` (an explicit zero).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct StreamUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
+    pub cache_read_input_tokens: Option<u64>,
+    pub cache_creation_input_tokens: Option<u64>,
 }
 
 impl StreamUsage {
-    /// Accumulate another observation (saturating).
+    /// Accumulate another observation (saturating). For the optional cache
+    /// counters the result is present iff at least one side reported a value.
     pub fn add(&mut self, other: StreamUsage) {
         self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
         self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
+        self.cache_read_input_tokens =
+            add_opt(self.cache_read_input_tokens, other.cache_read_input_tokens);
+        self.cache_creation_input_tokens = add_opt(
+            self.cache_creation_input_tokens,
+            other.cache_creation_input_tokens,
+        );
+    }
+}
+
+/// Saturating add of two optional counters where `None` means "unavailable":
+/// the sum is present iff at least one operand reported a value. Shared by the
+/// stream-usage accumulator and the model-usage aggregation.
+pub fn add_opt(a: Option<u64>, b: Option<u64>) -> Option<u64> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x.saturating_add(y)),
+        (Some(x), None) => Some(x),
+        (None, Some(y)) => Some(y),
+        (None, None) => None,
     }
 }
 
@@ -81,14 +105,19 @@ pub fn extract_usage(event: &str) -> Option<StreamUsage> {
     let value: serde_json::Value = serde_json::from_str(data.trim()).ok()?;
     match value.get("type")?.as_str()? {
         "message_start" => {
-            let input = value
-                .get("message")?
-                .get("usage")?
-                .get("input_tokens")?
-                .as_u64()?;
+            let usage = value.get("message")?.get("usage")?;
+            let input = usage.get("input_tokens")?.as_u64()?;
             Some(StreamUsage {
                 input_tokens: input,
                 output_tokens: 0,
+                // Anthropic prompt-caching counters, present only when the
+                // request used caching — captured opportunistically (req8/9).
+                cache_read_input_tokens: usage
+                    .get("cache_read_input_tokens")
+                    .and_then(serde_json::Value::as_u64),
+                cache_creation_input_tokens: usage
+                    .get("cache_creation_input_tokens")
+                    .and_then(serde_json::Value::as_u64),
             })
         }
         "message_delta" => {
@@ -96,6 +125,8 @@ pub fn extract_usage(event: &str) -> Option<StreamUsage> {
             Some(StreamUsage {
                 input_tokens: 0,
                 output_tokens: output,
+                cache_read_input_tokens: None,
+                cache_creation_input_tokens: None,
             })
         }
         _ => None,
@@ -333,6 +364,24 @@ mod tests {
             Some(StreamUsage {
                 input_tokens: 25,
                 output_tokens: 0,
+                // No cache keys in the payload → unavailable, not zero.
+                cache_read_input_tokens: None,
+                cache_creation_input_tokens: None,
+            })
+        );
+    }
+
+    #[test]
+    fn extract_usage_message_start_captures_cache_fields() {
+        let event = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":2679,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":40000,\"output_tokens\":3}}}";
+        assert_eq!(
+            extract_usage(event),
+            Some(StreamUsage {
+                input_tokens: 2679,
+                output_tokens: 0,
+                // Present in the payload → captured (explicit 0 stays Some(0)).
+                cache_read_input_tokens: Some(40000),
+                cache_creation_input_tokens: Some(0),
             })
         );
     }
@@ -344,6 +393,8 @@ mod tests {
             Some(StreamUsage {
                 input_tokens: 0,
                 output_tokens: 42,
+                cache_read_input_tokens: None,
+                cache_creation_input_tokens: None,
             })
         );
     }
@@ -369,17 +420,33 @@ mod tests {
         total.add(StreamUsage {
             input_tokens: 10,
             output_tokens: 0,
+            cache_read_input_tokens: Some(5),
+            cache_creation_input_tokens: None,
         });
         total.add(StreamUsage {
             input_tokens: 0,
             output_tokens: 7,
+            cache_read_input_tokens: None,
+            cache_creation_input_tokens: None,
         });
         assert_eq!(
             total,
             StreamUsage {
                 input_tokens: 10,
                 output_tokens: 7,
+                // cache_read carried from the first observation; cache_creation
+                // never reported → stays unavailable.
+                cache_read_input_tokens: Some(5),
+                cache_creation_input_tokens: None,
             }
         );
+    }
+
+    #[test]
+    fn add_opt_is_present_iff_either_side_is() {
+        assert_eq!(add_opt(None, None), None);
+        assert_eq!(add_opt(Some(3), None), Some(3));
+        assert_eq!(add_opt(None, Some(4)), Some(4));
+        assert_eq!(add_opt(Some(3), Some(4)), Some(7));
     }
 }

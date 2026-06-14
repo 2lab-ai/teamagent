@@ -516,9 +516,18 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
             group.map(|g| g.as_str()).unwrap_or("legacy"),
             account,
         );
+        // Served (group, model) for in-flight model attribution (req11): codex
+        // → the configured upstream model; claude → the inbound model. Mirrors
+        // `finished_meta` so the in-flight row matches its eventual finish.
+        let (served_group, served_model) = match BackendGroup::from_kind(credential.kind()) {
+            BackendGroup::Codex => (Some("codex".to_string()), Some(state.codex.model())),
+            _ => (Some("claude".to_string()), ctx.model.clone()),
+        };
         state.emit(ActivityEvent::RequestRouted {
             id: ctx.activity_id,
             account: account.0.clone(),
+            group: served_group,
+            model: served_model,
         });
 
         // 2. Proactive refresh: oauth-style tokens (anthropic oauth AND
@@ -1213,10 +1222,7 @@ async fn relay(
                     account: Some(account.0.clone()),
                     status: status.as_u16(),
                     duration: started.elapsed(),
-                    tokens: Some(TokenCounts {
-                        input: usage.input_tokens,
-                        output: usage.output_tokens,
-                    }),
+                    tokens: Some(token_counts(usage)),
                     group,
                     model,
                     effort,
@@ -1248,15 +1254,7 @@ async fn relay(
             body_excerpt(&bytes)
         ));
         ctx.flush_log(state);
-        ctx.emit_finished(
-            state,
-            Some(&account),
-            status,
-            Some(TokenCounts {
-                input: usage.input_tokens,
-                output: usage.output_tokens,
-            }),
-        );
+        ctx.emit_finished(state, Some(&account), status, Some(token_counts(usage)));
         drop(lease);
         axum::body::Body::from(bytes)
     };
@@ -1383,10 +1381,7 @@ async fn relay_codex(
                         account: Some(account.0.clone()),
                         status: StatusCode::OK.as_u16(),
                         duration: started.elapsed(),
-                        tokens: Some(TokenCounts {
-                            input: usage.input_tokens,
-                            output: usage.output_tokens,
-                        }),
+                        tokens: Some(token_counts(usage)),
                         group,
                         model,
                         effort,
@@ -1448,10 +1443,7 @@ async fn relay_codex(
                 state,
                 Some(&account),
                 StatusCode::OK,
-                Some(TokenCounts {
-                    input: usage.input_tokens,
-                    output: usage.output_tokens,
-                }),
+                Some(token_counts(usage)),
             );
             let mut out = Response::new(axum::body::Body::from(message.to_string()));
             out.headers_mut().insert(
@@ -1491,6 +1483,24 @@ fn usage_from_json_body(body: &[u8]) -> sse::StreamUsage {
             .get("output_tokens")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0),
+        // Cache counters present only when the upstream reported them (req8/9).
+        cache_read_input_tokens: usage
+            .get("cache_read_input_tokens")
+            .and_then(serde_json::Value::as_u64),
+        cache_creation_input_tokens: usage
+            .get("cache_creation_input_tokens")
+            .and_then(serde_json::Value::as_u64),
+    }
+}
+
+/// Map observed stream usage into the activity-event token counts, carrying the
+/// optional cache counters through to the model-usage rows.
+fn token_counts(usage: sse::StreamUsage) -> TokenCounts {
+    TokenCounts {
+        input: usage.input_tokens,
+        output: usage.output_tokens,
+        cache_read: usage.cache_read_input_tokens,
+        cache_creation: usage.cache_creation_input_tokens,
     }
 }
 

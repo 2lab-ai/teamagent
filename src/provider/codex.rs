@@ -707,17 +707,22 @@ impl CodexSseConverter {
                 .get("input_tokens")
                 .and_then(Value::as_u64)
                 .unwrap_or(0);
-            self.cached_input_tokens = usage
+            // `cached` is `Some` only when the upstream reported the field, so
+            // the dashboard renders unavailable (not 0) when it is absent.
+            let cached = usage
                 .get("input_tokens_details")
                 .and_then(|d| d.get("cached_tokens"))
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
+                .and_then(Value::as_u64);
+            self.cached_input_tokens = cached.unwrap_or(0);
             self.usage = StreamUsage {
                 input_tokens: total_input.saturating_sub(self.cached_input_tokens),
                 output_tokens: usage
                     .get("output_tokens")
                     .and_then(Value::as_u64)
                     .unwrap_or(0),
+                cache_read_input_tokens: cached,
+                // OpenAI Responses does not report cache-creation tokens.
+                cache_creation_input_tokens: None,
             };
         }
         let stop_reason = if self.saw_tool_use {
@@ -1467,7 +1472,10 @@ mod tests {
             converter.usage(),
             StreamUsage {
                 input_tokens: 12,
-                output_tokens: 5
+                output_tokens: 5,
+                // No cached_tokens key in the payload → unavailable, not zero.
+                cache_read_input_tokens: None,
+                cache_creation_input_tokens: None,
             }
         );
     }
@@ -1499,12 +1507,14 @@ mod tests {
         );
         assert_eq!(message_delta["usage"]["cache_read_input_tokens"], 199_000);
         assert_eq!(message_delta["usage"]["output_tokens"], 42);
-        // Dashboard totals read converter.usage(): fresh only.
+        // Dashboard totals read converter.usage(): fresh only, cached surfaced.
         assert_eq!(
             converter.usage(),
             StreamUsage {
                 input_tokens: 1_000,
-                output_tokens: 42
+                output_tokens: 42,
+                cache_read_input_tokens: Some(199_000),
+                cache_creation_input_tokens: None,
             }
         );
     }
@@ -1780,7 +1790,11 @@ mod tests {
             converter.usage(),
             StreamUsage {
                 input_tokens: 8,
-                output_tokens: 5
+                output_tokens: 5,
+                // The live payload reports input_tokens_details.cached_tokens=0,
+                // so cache-read is an explicit Some(0), not unavailable.
+                cache_read_input_tokens: Some(0),
+                cache_creation_input_tokens: None,
             }
         );
     }

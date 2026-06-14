@@ -21,7 +21,9 @@ use crate::logging::LogLine;
 use crate::proxy::server::{AppState, UsageTotals, EVALUATE_TICK};
 use crate::scheduler::select::{self, SelectParams};
 use crate::scheduler::{AccountSnapshot, CooldownSource, PoolSnapshot};
-use crate::tui::activity::{ActivityLog, Completed, CompletedBody, InFlight, Totals};
+use crate::tui::activity::{
+    normalize_model, ActivityLog, Completed, CompletedBody, InFlight, ModelUsage, Totals,
+};
 use crate::tui::logs::LogConsole;
 use crate::tui::{ActivityEvent, LastSwitch, PollHealth, TokenCounts};
 
@@ -132,6 +134,7 @@ impl DashboardHub {
             account_totals: state.log.totals_map(),
             global_totals: state.log.totals_global(),
             rpm_5m: state.log.requests_per_minute(now, RPM_WINDOW),
+            model_usage: state.log.model_usage(),
             logs: state.console.tail(LOG_TAIL).cloned().collect(),
         }
     }
@@ -147,6 +150,8 @@ pub(crate) struct HubView {
     pub account_totals: HashMap<String, Totals>,
     pub global_totals: Totals,
     pub rpm_5m: f64,
+    /// Aggregated per-(group, model) usage rows, sorted by total tokens desc.
+    pub model_usage: Vec<ModelUsage>,
     /// Oldest→newest (console renders the tail at the bottom).
     pub logs: Vec<LogLine>,
 }
@@ -199,8 +204,19 @@ fn trace_event(event: &ActivityEvent) {
         ActivityEvent::RequestStarted { id, method, path } => {
             tracing::debug!(id, %method, %path, "request started");
         }
-        ActivityEvent::RequestRouted { id, account } => {
-            tracing::debug!(id, %account, "request routed");
+        ActivityEvent::RequestRouted {
+            id,
+            account,
+            group,
+            model,
+        } => {
+            tracing::debug!(
+                id,
+                %account,
+                group = group.as_deref().unwrap_or("-"),
+                model = model.as_deref().unwrap_or("-"),
+                "request routed"
+            );
         }
         ActivityEvent::RequestFinished {
             id,
@@ -295,6 +311,11 @@ pub struct DashboardDoc {
     pub scheduler: SchedulerDoc,
     pub poller: Vec<PollerDoc>,
     pub totals: GlobalTotalsDoc,
+    /// Per-(group, served model) usage rows (req1-20). Additive: absent in docs
+    /// written before this existed → an older client parses it as empty and an
+    /// upgraded client attaching to an older daemon renders no model panel.
+    #[serde(default)]
+    pub model_usage: Vec<ModelUsageDoc>,
     pub activity: ActivityDoc,
     /// Tracing tail, oldest→newest.
     pub logs: Vec<LogLineDoc>,
@@ -437,6 +458,56 @@ pub struct GlobalTotalsDoc {
     pub in_flight: u32,
 }
 
+/// One model-usage row in the document (req1-20). Cache counters are omitted
+/// from the JSON when unavailable (`None`), so the client distinguishes
+/// "unavailable" from an explicit zero.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelUsageDoc {
+    pub group: String,
+    pub model: String,
+    pub requests: u64,
+    pub ok: u64,
+    pub errors: u64,
+    /// Fresh (non-cached) input + output tokens.
+    pub tokens_in: u64,
+    pub tokens_out: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation: Option<u64>,
+    /// Epoch ms of the last completed request for this model.
+    pub last_used_ms: u64,
+    /// In-flight requests currently attributed to this model (req11).
+    #[serde(default)]
+    pub in_flight: u32,
+    /// Which account(s) served it (req19).
+    #[serde(default)]
+    pub accounts: Vec<ModelAccountDoc>,
+    /// Reasoning/effort distribution (req18).
+    #[serde(default)]
+    pub efforts: Vec<ModelCountDoc>,
+    /// Endpoint-class distribution (req20).
+    #[serde(default)]
+    pub endpoints: Vec<ModelCountDoc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelAccountDoc {
+    pub name: String,
+    pub requests: u64,
+    pub ok: u64,
+    pub errors: u64,
+    pub tokens_in: u64,
+    pub tokens_out: u64,
+}
+
+/// A labelled request count (an effort level or an endpoint class).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelCountDoc {
+    pub label: String,
+    pub requests: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActivityDoc {
     /// Started-but-unfinished requests, oldest→newest (render reversed).
@@ -562,6 +633,91 @@ fn window_doc(
             crate::scheduler::window::WindowSource::UsagePoll => "poll".into(),
         },
     })
+}
+
+/// Build the model-usage rows for the document: the finished aggregation from
+/// the hub, with in-flight requests overlaid per model (req11). A model seen
+/// only in-flight (no completed request yet) still gets a row so a long active
+/// request is visible before it finishes.
+fn model_usage_docs(hub: &HubView, now: SystemTime) -> Vec<ModelUsageDoc> {
+    let row = |m: &ModelUsage| ModelUsageDoc {
+        group: m.group.clone(),
+        model: m.model.clone(),
+        requests: m.requests,
+        ok: m.ok,
+        errors: m.errors,
+        tokens_in: m.tokens_in,
+        tokens_out: m.tokens_out,
+        cache_read: m.cache_read,
+        cache_creation: m.cache_creation,
+        last_used_ms: epoch_ms(m.last_used),
+        in_flight: 0,
+        accounts: m
+            .accounts
+            .iter()
+            .map(|a| ModelAccountDoc {
+                name: a.name.clone(),
+                requests: a.requests,
+                ok: a.ok,
+                errors: a.errors,
+                tokens_in: a.tokens_in,
+                tokens_out: a.tokens_out,
+            })
+            .collect(),
+        efforts: m
+            .efforts
+            .iter()
+            .map(|c| ModelCountDoc {
+                label: c.label.clone(),
+                requests: c.requests,
+            })
+            .collect(),
+        endpoints: m
+            .endpoints
+            .iter()
+            .map(|c| ModelCountDoc {
+                label: c.label.clone(),
+                requests: c.requests,
+            })
+            .collect(),
+    };
+    let mut docs: Vec<ModelUsageDoc> = hub.model_usage.iter().map(row).collect();
+
+    // Count in-flight requests per (group, normalized model) — the in-flight
+    // entries carry the served identity set at routing time.
+    let mut in_flight: BTreeMap<(String, String), u32> = BTreeMap::new();
+    for r in &hub.in_flight {
+        if let (Some(group), Some(model)) = (&r.group, &r.model) {
+            *in_flight
+                .entry((group.clone(), normalize_model(model)))
+                .or_default() += 1;
+        }
+    }
+    for doc in docs.iter_mut() {
+        if let Some(n) = in_flight.remove(&(doc.group.clone(), doc.model.clone())) {
+            doc.in_flight = n;
+        }
+    }
+    // Append rows for models that are ONLY in-flight (sorted by the BTreeMap).
+    for ((group, model), n) in in_flight {
+        docs.push(ModelUsageDoc {
+            group,
+            model,
+            requests: 0,
+            ok: 0,
+            errors: 0,
+            tokens_in: 0,
+            tokens_out: 0,
+            cache_read: None,
+            cache_creation: None,
+            last_used_ms: epoch_ms(now),
+            in_flight: n,
+            accounts: Vec::new(),
+            efforts: Vec::new(),
+            endpoints: Vec::new(),
+        });
+    }
+    docs
 }
 
 /// Build the dashboard document — pure over snapshot/hub/totals/params so
@@ -734,6 +890,7 @@ pub(crate) fn dashboard_doc(
             rpm_5m: hub.rpm_5m,
             in_flight: in_flight_total,
         },
+        model_usage: model_usage_docs(hub, now),
         activity,
         logs: hub
             .logs
@@ -872,6 +1029,8 @@ mod tests {
                 tokens: Some(TokenCounts {
                     input: 700,
                     output: 300,
+                    cache_read: Some(120),
+                    cache_creation: None,
                 }),
                 group: Some("codex".into()),
                 model: Some("gpt-5.5".into()),
@@ -886,6 +1045,17 @@ mod tests {
                 path: "/v1/messages".into(),
             },
             now() - Duration::from_secs(3),
+        );
+        // In-flight request routed to the same codex model — exercises the
+        // per-model in-flight overlay (req11).
+        hub.apply_event(
+            ActivityEvent::RequestRouted {
+                id: 2,
+                account: "a".into(),
+                group: Some("codex".into()),
+                model: Some("gpt-5.5".into()),
+            },
+            now() - Duration::from_secs(2),
         );
         hub.apply_event(
             ActivityEvent::UsagePolled {
@@ -1071,6 +1241,66 @@ mod tests {
     }
 
     #[test]
+    fn doc_carries_model_usage_rows_with_cache_breakdowns_and_in_flight() {
+        let doc = seeded_doc();
+        // One finished codex/gpt-5.5 request + one in-flight routed to it.
+        assert_eq!(doc.model_usage.len(), 1);
+        let row = &doc.model_usage[0];
+        assert_eq!(row.group, "codex");
+        assert_eq!(row.model, "gpt-5.5");
+        assert_eq!(row.requests, 1);
+        assert_eq!(row.ok, 1);
+        assert_eq!(row.errors, 0);
+        assert_eq!(row.tokens_in, 700);
+        assert_eq!(row.tokens_out, 300);
+        // cache_read captured; cache_creation never reported → omitted.
+        assert_eq!(row.cache_read, Some(120));
+        assert_eq!(row.cache_creation, None);
+        assert_eq!(row.last_used_ms, (NOW_SECS - 58) * 1000);
+        // The routed-but-unfinished request overlays as in-flight (req11).
+        assert_eq!(row.in_flight, 1);
+        // Breakdowns.
+        assert_eq!(row.accounts.len(), 1);
+        assert_eq!(row.accounts[0].name, "a");
+        assert_eq!(row.accounts[0].tokens_in, 700);
+        assert_eq!(
+            row.efforts
+                .iter()
+                .find(|e| e.label == "high")
+                .map(|e| e.requests),
+            Some(1)
+        );
+        assert_eq!(
+            row.endpoints
+                .iter()
+                .find(|e| e.label == "messages")
+                .map(|e| e.requests),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn cache_creation_omitted_from_json_when_unavailable() {
+        let doc = seeded_doc();
+        let value: serde_json::Value = serde_json::to_value(&doc).expect("serialize");
+        let row = &value["model_usage"][0];
+        assert_eq!(row["cache_read"], 120);
+        // None → skipped entirely, so the client renders "unavailable" not 0.
+        assert!(row.get("cache_creation").is_none());
+    }
+
+    #[test]
+    fn doc_without_model_usage_field_parses_to_empty() {
+        // An older daemon's document predates `model_usage` — additive default
+        // keeps it parseable so an upgraded client can still attach (req23/33).
+        let doc = seeded_doc();
+        let mut value = serde_json::to_value(&doc).expect("serialize");
+        value.as_object_mut().unwrap().remove("model_usage");
+        let parsed: DashboardDoc = serde_json::from_value(value).expect("parse");
+        assert!(parsed.model_usage.is_empty());
+    }
+
+    #[test]
     fn doc_round_trips_through_json() {
         let doc = seeded_doc();
         let json = serde_json::to_string(&doc).expect("serialize");
@@ -1093,6 +1323,9 @@ mod tests {
             parsed.activity.completed.len(),
             doc.activity.completed.len()
         );
+        assert_eq!(parsed.model_usage.len(), doc.model_usage.len());
+        assert_eq!(parsed.model_usage[0].model, "gpt-5.5");
+        assert_eq!(parsed.model_usage[0].in_flight, 1);
         assert_eq!(parsed.logs[0].level, "INFO");
         // The JSON keys stay status-compatible ("type", not "kind").
         let value: serde_json::Value = serde_json::from_str(&json).expect("value");

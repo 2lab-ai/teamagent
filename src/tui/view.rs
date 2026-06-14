@@ -42,6 +42,10 @@ pub(crate) struct DashboardView {
     pub completed: Vec<Completed>,
     /// Oldest→newest tail.
     pub logs: Vec<LogLine>,
+    /// Per-(group, model) usage rows (req1-20), already sorted by total tokens.
+    /// One representation — the serializable doc row — used by both the
+    /// document and the renderer, so local and attach render identically.
+    pub model_usage: Vec<crate::dashboard::ModelUsageDoc>,
     /// Live codex settings (req8.1): shown + toggled from the dashboard.
     pub codex: crate::dashboard::CodexSettingsDoc,
 }
@@ -162,6 +166,11 @@ impl DashboardView {
                 method: r.method.clone(),
                 path: r.path.clone(),
                 account: r.account.clone(),
+                // Per-model in-flight counts are precomputed server-side into
+                // the model-usage rows, so the view's in-flight entries (used
+                // only for the activity spinner) don't carry group/model.
+                group: None,
+                model: None,
                 started_at: ms_time(r.started_at_ms),
             })
             .collect();
@@ -189,9 +198,12 @@ impl DashboardView {
                         account: account.clone(),
                         status: *status,
                         duration: Duration::from_millis(*duration_ms),
+                        // The activity line shows only the in/out total; cache
+                        // detail rides the model-usage rows, not these entries.
                         tokens: tokens.map(|t| TokenCounts {
                             input: t.input,
                             output: t.output,
+                            ..Default::default()
                         }),
                         group: group.clone(),
                         model: model.clone(),
@@ -246,6 +258,7 @@ impl DashboardView {
             in_flight,
             completed,
             logs,
+            model_usage: doc.model_usage.clone(),
             codex: doc.codex.clone(),
         }
     }
@@ -328,6 +341,16 @@ mod tests {
             ],
             "totals": { "requests": 3, "ok": 2, "errors": 1, "tokens_in": 100,
                         "tokens_out": 50, "rpm_5m": 0.6, "in_flight": 1 },
+            "model_usage": [
+                { "group": "claude", "model": "claude-sonnet-4-5", "requests": 3,
+                  "ok": 2, "errors": 1, "tokens_in": 100, "tokens_out": 50,
+                  "cache_read": 4000, "last_used_ms": 999_940_000u64, "in_flight": 1,
+                  "accounts": [ { "name": "a", "requests": 3, "ok": 2, "errors": 1,
+                                  "tokens_in": 100, "tokens_out": 50 } ],
+                  "efforts": [ { "label": "16k", "requests": 1 },
+                               { "label": "none", "requests": 2 } ],
+                  "endpoints": [ { "label": "messages", "requests": 3 } ] },
+            ],
             "activity": {
                 "in_flight": [
                     { "id": 7, "method": "POST", "path": "/v1/messages", "account": "a",
@@ -470,7 +493,8 @@ mod tests {
                     *tokens,
                     Some(TokenCounts {
                         input: 70,
-                        output: 30
+                        output: 30,
+                        ..Default::default()
                     })
                 );
             }
@@ -482,6 +506,35 @@ mod tests {
         let switch = view.last_switch.expect("last switch");
         assert_eq!(switch.to, "a");
         assert_eq!(switch.from, None);
+    }
+
+    #[test]
+    fn model_usage_survives_doc_to_view_without_loss() {
+        // Local and attach both go through from_doc, so a row produced by the
+        // document builder must reach the renderer input intact (req21/31).
+        let doc: DashboardDoc = serde_json::from_value(doc_json()).expect("parse doc");
+        let view = DashboardView::from_doc(&doc);
+        assert_eq!(view.model_usage.len(), 1);
+        let row = &view.model_usage[0];
+        assert_eq!(row.group, "claude");
+        assert_eq!(row.model, "claude-sonnet-4-5");
+        assert_eq!(row.tokens_in, 100);
+        assert_eq!(row.tokens_out, 50);
+        assert_eq!(row.cache_read, Some(4000));
+        assert_eq!(row.cache_creation, None);
+        assert_eq!(row.in_flight, 1);
+        assert_eq!(row.accounts.len(), 1);
+        assert_eq!(row.efforts.len(), 2);
+        assert_eq!(row.endpoints[0].label, "messages");
+    }
+
+    #[test]
+    fn model_usage_defaults_to_empty_for_older_documents() {
+        let mut value = doc_json();
+        value.as_object_mut().unwrap().remove("model_usage");
+        let doc: DashboardDoc = serde_json::from_value(value).expect("parse doc");
+        let view = DashboardView::from_doc(&doc);
+        assert!(view.model_usage.is_empty());
     }
 
     #[test]

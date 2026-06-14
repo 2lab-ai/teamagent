@@ -1,7 +1,8 @@
 # PRD — model usage dashboard (2026-06-14)
 
-Status: **proposed / spec only**. This document describes the target product behavior for a
-future implementation; it does not record shipped behavior yet.
+Status: **designed → implementing**. The Problem/Solution/User-Stories sections below state the
+target behavior; the **Finalized Design** and **Implementation Plan** sections at the end pin the
+concrete data model, document fields, keybinding, and layout that the implementation follows.
 
 ## Problem Statement
 
@@ -218,3 +219,93 @@ TUI but not to attach mode is a product bug.
 The feature should be implemented in small layers: first extend usage counters and model aggregation,
 then expose them in the dashboard document, then map them into the view model, then render compact
 and detailed model-usage panes, then add focused tests at each seam.
+
+## Finalized Design (HOW)
+
+This section pins the concrete contract the implementation follows. It is the design half of the
+"complete the spec" step; the user stories above are the requirement half.
+
+### Token normalization (the one comparable unit)
+
+Both providers already report **fresh (non-cached) input** separately from cached input, so the
+dashboard's input column means the same thing on both sides:
+
+| Display field | Anthropic (`message_start.message.usage`) | Codex (Responses `usage`) |
+|---|---|---|
+| `tokens_in` (fresh) | `input_tokens` | `input_tokens − input_tokens_details.cached_tokens` |
+| `tokens_out` | `output_tokens` (cumulative, from `message_delta`) | `output_tokens` |
+| `cache_read` | `cache_read_input_tokens` (when present) | `input_tokens_details.cached_tokens` (when present) |
+| `cache_creation` | `cache_creation_input_tokens` (when present) | *unavailable* (Responses does not report it) |
+
+Cache fields are `Option<u64>`: **present iff the upstream emitted the key** (so an explicit `0` is
+`Some(0)` and a missing field is `None` → rendered "—", not "0"). This satisfies req8/req9.
+`account` lifetime totals and the existing in/out token split are unchanged — cache counters live
+only on the new model rows (and are accumulated `saturating`).
+
+### Aggregation key + identity
+
+- Primary row key = **`(group, served_model)`** where `group ∈ {claude, codex}` (req1/req2). Rows are
+  never merged across groups even if the model label matches.
+- Served model = what the provider path actually served: Codex → the configured upstream model at
+  finish time (`state.codex.model()`); Claude → the inbound model after stripping a trailing
+  display-only context suffix `…[1m]` (req16/req17). Normalization = strip from the first `[`.
+- A request is folded into a model row **iff both `group` and `model` are known**. Pre-routing
+  failures (body-read error, routing-off early failure) keep `group=None`/`model=None` → they stay
+  in the existing global/unrouted accounting and never create a bogus row (req-test "pre-routing").
+  A *failed* request with a known model still increments that row's `errors` even with no tokens
+  (req-test "failure attribution").
+
+### Per-row dimensions
+
+Each model row carries: `requests`, `ok`, `errors`, `tokens_in`, `tokens_out`, `cache_read?`,
+`cache_creation?`, `last_used_ms`, `in_flight`, and three drill-down breakdowns:
+- `accounts[]` — which account(s) served it (req19): name + req/ok/err + token split.
+- `efforts[]` — reasoning/effort distribution (req18): label (`none` when unset) + req count.
+- `endpoints[]` — endpoint class (req20): `messages` vs `count_tokens` vs other, + req count.
+
+`in_flight` is computed separately from completed totals (req11): the in-flight request list now
+carries the served `(group, model)` (threaded through `RequestRouted` → `InFlight`), and the
+document builder counts matching in-flight rows per model and overlays them — including rows that
+are *only* in-flight (an active request visible before its first finish).
+
+Default sort: `tokens_in + tokens_out` desc, then `requests` desc, then key (req14).
+
+### Document / view-model / render contract (single path)
+
+- `DashboardDoc` gains `#[serde(default)] model_usage: Vec<ModelUsageDoc>` — additive, so older
+  documents parse to an empty list and older daemons degrade gracefully (req23/req33). The nested
+  `ModelAccountDoc` / `ModelCountDoc` are likewise plain serde structs.
+- `dashboard_doc()` populates it from the hub's aggregation + the in-flight overlay. Both local TUI
+  and attach mode go through this one builder and `DashboardView::from_doc`, so there is no render
+  fork (req21/req22/req31). `DashboardView` holds `Vec<ModelUsageDoc>` directly (one representation).
+
+### UI surfaces
+
+1. **Compact strip** (always visible, req12/req28): a thin pane between the scheduler middle row and
+   the activity log, shown only when ≥1 model row exists. Top models by total tokens, each a
+   group-colored name + a proportional mini-bar of token share + `req`/`tok`/last-used age, with an
+   active marker (spinner) when `in_flight>0` or used within the recency window (req15). Hidden /
+   column-reduced on narrow terminals so the account table stays usable (req29).
+2. **Detailed view** (req13): a full-body mode toggled by **`g`** ("models"; advertised in the
+   keybar, req30). A scrollable table of *all* rows with a row count / "more" affordance, and a
+   drill-down panel for the cursored row showing accounts, efforts, endpoints, and the cache split.
+   Arrow/`j`/`k`/PageUp/PageDown move the model cursor; `g`/`Esc` exits; `q` quits.
+
+No dollar cost, no per-model quota window (account-level quota only, req27), no durable storage —
+rows are runtime-only and reset on daemon restart (req26). No raw prompt/response content is stored
+(req25): only the metadata above.
+
+## Implementation Plan (layers, test-first)
+
+1. **Counters + aggregation.** Extend `sse::StreamUsage` + `tui::TokenCounts` with optional
+   `cache_read`/`cache_creation`; capture Anthropic cache fields in `sse::extract_usage` and
+   `usage_from_json_body`; expose Codex `cached_input_tokens` (present-only) from the converter.
+   Add `ModelStats` aggregation to `tui::activity::ActivityLog` (folded on `RequestFinished`), plus
+   `(group, model)` on `RequestRouted`/`InFlight`. Unit tests at this seam.
+2. **Document.** Add `ModelUsageDoc` (+ nested) to `dashboard.rs`; populate in `dashboard_doc()`
+   with the in-flight overlay; round-trip + backward-compat tests.
+3. **View model.** Carry `model_usage` into `DashboardView`; local/attach parity test.
+4. **Render.** Compact strip + `g` detailed view + keybar entry + narrow-terminal handling. Minimal
+   renderer assertions for the keybar label and the strip's top-model label only.
+5. **Verify.** `just check` green; build + hot-deploy; confirm rows appear in the live dashboard and
+   in attach mode.

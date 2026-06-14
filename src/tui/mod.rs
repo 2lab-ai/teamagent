@@ -114,6 +114,11 @@ pub(crate) struct Chrome {
     /// Activity-log scroll offset: number of newest completed entries skipped
     /// (0 = live tail). Lets the panel page through the full history (req6).
     pub activity_scroll: usize,
+    /// Detailed model-usage view active (`g`) — replaces the middle/activity
+    /// region with the full model table + drill-down (req13).
+    pub show_models: bool,
+    /// Cursor row in the detailed model view.
+    pub model_cursor: usize,
     /// `Some` in attach mode.
     pub attach: Option<Attach>,
 }
@@ -186,6 +191,9 @@ struct App {
     log_panel: LogPanelSize,
     /// Activity-log scroll offset (newest entries skipped; 0 = live tail).
     activity_scroll: usize,
+    /// Detailed model-usage view active (`g`), with its cursor row.
+    show_models: bool,
+    model_cursor: usize,
 }
 
 impl App {
@@ -199,6 +207,8 @@ impl App {
             show_detail: true,
             log_panel: LogPanelSize::Small,
             activity_scroll: 0,
+            show_models: false,
+            model_cursor: 0,
         }
     }
 
@@ -224,6 +234,8 @@ impl App {
             show_detail: self.show_detail,
             log_panel: self.log_panel,
             activity_scroll: self.activity_scroll,
+            show_models: self.show_models,
+            model_cursor: self.model_cursor,
             status_line: self.status_line().map(str::to_string),
             attach: match &self.backend {
                 Backend::Local(_) => None,
@@ -276,9 +288,38 @@ impl App {
             return;
         }
         match self.mode {
+            Mode::Normal if self.show_models => self.on_key_models(key.code, view),
             Mode::Normal => self.on_key_normal(key.code, view),
             Mode::Select { idx } => self.on_key_select(key.code, idx, view),
         }
+    }
+
+    /// Key handling for the detailed model-usage view (`g`). Arrows/`j`/`k`
+    /// move the cursor through model rows; `g`/`Esc` exits; `q` quits.
+    fn on_key_models(&mut self, code: KeyCode, view: Option<&DashboardView>) {
+        let len = view.map_or(0, |v| v.model_usage.len());
+        match code {
+            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('g') | KeyCode::Esc => self.show_models = false,
+            KeyCode::Up | KeyCode::Char('k') => self.move_model_cursor(-1, len),
+            KeyCode::Down | KeyCode::Char('j') => self.move_model_cursor(1, len),
+            KeyCode::PageUp => self.move_model_cursor(-10, len),
+            KeyCode::PageDown => self.move_model_cursor(10, len),
+            KeyCode::Home => self.model_cursor = 0,
+            KeyCode::End => self.model_cursor = len.saturating_sub(1),
+            KeyCode::Char('l') => self.log_panel = self.log_panel.cycle(),
+            _ => {}
+        }
+    }
+
+    /// Move the model cursor by `delta` rows, clamped to `[0, len-1]`.
+    fn move_model_cursor(&mut self, delta: i64, len: usize) {
+        if len == 0 {
+            self.model_cursor = 0;
+            return;
+        }
+        let next = (self.model_cursor as i64).saturating_add(delta);
+        self.model_cursor = next.clamp(0, (len - 1) as i64) as usize;
     }
 
     fn on_key_normal(&mut self, code: KeyCode, view: Option<&DashboardView>) {
@@ -314,6 +355,16 @@ impl App {
             }
             KeyCode::Char('l') => self.log_panel = self.log_panel.cycle(),
             KeyCode::Char('d') => self.show_detail = !self.show_detail,
+            // Detailed model-usage view (req13). No-op (with a hint) until at
+            // least one model row exists.
+            KeyCode::Char('g') => {
+                if view.is_some_and(|v| !v.model_usage.is_empty()) {
+                    self.show_models = true;
+                    self.model_cursor = 0;
+                } else {
+                    self.set_status("models: no model usage yet".into());
+                }
+            }
             // Activity-log scrolling (req6): up = into history, down = toward
             // the live tail. Clamped to the number of completed entries.
             KeyCode::Up | KeyCode::Char('k') => self.scroll_activity(1, view),

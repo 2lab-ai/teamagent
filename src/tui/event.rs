@@ -9,15 +9,20 @@
 use std::time::Duration;
 
 /// Input/output token counts for one completed request, when the upstream
-/// response carried usage. Split so the dashboard can show in/out totals.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// response carried usage. `input`/`output` are the fresh (non-cached) prompt
+/// and completion counts; the optional cache counters feed the model-usage
+/// rows and are `None` when the upstream did not report them (distinct from an
+/// explicit `Some(0)`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct TokenCounts {
     pub input: u64,
     pub output: u64,
+    pub cache_read: Option<u64>,
+    pub cache_creation: Option<u64>,
 }
 
 impl TokenCounts {
-    /// Combined count for single-number displays.
+    /// Combined fresh in/out count for single-number displays.
     pub fn total(self) -> u64 {
         self.input.saturating_add(self.output)
     }
@@ -39,8 +44,19 @@ pub enum ActivityEvent {
         method: String,
         path: String,
     },
-    /// The scheduler leased an account for request `id`.
-    RequestRouted { id: u64, account: String },
+    /// The scheduler leased an account for request `id`. Carries the served
+    /// `(group, model)` identity decided at lease time so the dashboard can
+    /// attribute in-flight requests to a model row before they finish.
+    RequestRouted {
+        id: u64,
+        account: String,
+        /// Backend group of the leased account (`"claude"`/`"codex"`), when
+        /// routing attributed one.
+        group: Option<String>,
+        /// Served model: codex → the configured upstream model; claude → the
+        /// inbound model string.
+        model: Option<String>,
+    },
     /// Request `id` completed (any status, including upstream errors).
     RequestFinished {
         id: u64,
