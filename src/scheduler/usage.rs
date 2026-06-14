@@ -35,39 +35,37 @@ pub enum UsageError {
 }
 
 /// Parse the usage endpoint body. Tolerant by design: a missing window is
-/// `None`, `utilization` accepts a 0..=1 fraction or a 0..=100 percentage
-/// (field shape differs across observed responses), `resets_at` accepts
-/// epoch seconds or an RFC3339 string. Only undecodable JSON is an error.
+/// `None`, `resets_at` accepts epoch seconds or an RFC3339 string, and only
+/// undecodable JSON is an error.
+///
+/// SCALE IS FIXED, NOT GUESSED. The live `GET /api/oauth/usage` endpoint
+/// always returns `utilization` as a PERCENTAGE 0..=100 — exactly like the
+/// codex `x-codex-*-used-percent` headers, and unlike the Anthropic unified
+/// headers which are 0..=1 fractions. Each evidence source has its own known
+/// scale; this one is divided by 100 unconditionally.
+///
+/// Ground truth (captured 2026-06-14, three live accounts):
+///   ai3@: five_hour=5.0, seven_day=3.0      (== 5% / 3%)
+///   ai@:  five_hour=1.0, seven_day=0.0      (== 1% / 0%)
+///   ai2@: five_hour=1.0, seven_day=1.0      (== 1% / 1%)
+///
+/// The previous code guessed the scale per response (`as_percentage =
+/// max_raw > 1.0`) and treated all-≤1.0 responses as fractions. That stranded
+/// any account whose every window sat at ≤1% utilization: ai@/ai2@ above were
+/// recorded as 1.0 == 100% and gated as exhausted while in fact ~1% used and
+/// fully available. ai3@ only escaped because its 5.0 happened to exceed 1.0.
+/// There is no fraction-form response from this endpoint to preserve.
 pub fn parse_usage_body(body: &[u8]) -> Result<UsageSnapshot, UsageError> {
     let value: Value = serde_json::from_slice(body)?;
-    let five = raw_window(value.get("five_hour"));
-    let seven = raw_window(value.get("seven_day"));
-    // SCALE is decided PER RESPONSE, not per window. The live `/api/oauth/usage`
-    // endpoint returns PERCENTAGES (captured 2026-06-13: five_hour=16.0,
-    // seven_day=1.0 == 16% / 1%, matching the response headers' 0.15 / 0.01
-    // fractions). But a single sub-1.0 value is ambiguous — `0.9` could be
-    // 0.9% or a 90% fraction. The two windows always share one scale, so if
-    // EITHER raw value exceeds 1.0 the whole response is percentages (÷100);
-    // if both are ≤1.0 they are already 0..1 fractions and pass through.
-    //
-    // This fixes the "7d looks weird" bug: a 7d utilization of 1.0 (== 1%, the
-    // common state just after the weekly window resets) was previously read as
-    // the fraction 1.0 == 100% because it didn't exceed the old per-window
-    // `>1.0` threshold. Now it is normalized against the 5h value's scale.
-    let max_raw = five
-        .map(|(u, _)| u)
-        .unwrap_or(0.0)
-        .max(seven.map(|(u, _)| u).unwrap_or(0.0));
-    let as_percentage = max_raw > 1.0;
     Ok(UsageSnapshot {
-        five_hour: five.map(|(u, at)| scaled_reading(u, at, as_percentage)),
-        seven_day: seven.map(|(u, at)| scaled_reading(u, at, as_percentage)),
+        five_hour: raw_window(value.get("five_hour")).map(|(u, at)| percent_reading(u, at)),
+        seven_day: raw_window(value.get("seven_day")).map(|(u, at)| percent_reading(u, at)),
     })
 }
 
-/// Parse one window's RAW (un-scaled) utilization + reset, or `None` when
-/// either is missing/invalid. Scaling (percent vs fraction) is decided by the
-/// caller across both windows.
+/// Parse one window's RAW (still-percentage) utilization + reset, or `None`
+/// when either is missing/invalid. The caller divides by 100 via
+/// [`percent_reading`].
 fn raw_window(value: Option<&Value>) -> Option<(f64, std::time::SystemTime)> {
     let value = value?;
     let raw = value.get("utilization")?.as_f64()?;
@@ -82,15 +80,10 @@ fn raw_window(value: Option<&Value>) -> Option<(f64, std::time::SystemTime)> {
     Some((raw, resets_at))
 }
 
-/// Apply the response-wide scale and clamp to a 0..1 fraction.
-fn scaled_reading(
-    raw: f64,
-    resets_at: std::time::SystemTime,
-    as_percentage: bool,
-) -> WindowReading {
-    let utilization = if as_percentage { raw / 100.0 } else { raw };
+/// Convert a percentage (0..=100) utilization to a clamped 0..1 fraction.
+fn percent_reading(percent: f64, resets_at: std::time::SystemTime) -> WindowReading {
     WindowReading {
-        utilization: utilization.clamp(0.0, 1.0),
+        utilization: (percent / 100.0).clamp(0.0, 1.0),
         resets_at,
     }
 }
@@ -429,18 +422,19 @@ mod tests {
     // ---- body parsing ----
 
     #[test]
-    fn parses_fractional_utilization_and_rfc3339_reset() {
+    fn parses_percentage_utilization_and_rfc3339_reset() {
+        // Endpoint sends percentages (0..=100); parser divides by 100.
         let body = br#"{
-            "five_hour": {"utilization": 0.42, "resets_at": "2026-06-12T00:00:00Z"},
-            "seven_day": {"utilization": 0.9, "resets_at": "2026-06-14T00:00:00Z"}
+            "five_hour": {"utilization": 42.0, "resets_at": "2026-06-12T00:00:00Z"},
+            "seven_day": {"utilization": 90.0, "resets_at": "2026-06-14T00:00:00Z"}
         }"#;
         let snapshot = parse_usage_body(body).unwrap();
-        assert_eq!(snapshot.five_hour.unwrap().utilization, 0.42);
+        assert!((snapshot.five_hour.unwrap().utilization - 0.42).abs() < 1e-9);
         assert_eq!(
             snapshot.five_hour.unwrap().resets_at,
             at(1_781_222_400) // 2026-06-12T00:00:00Z
         );
-        assert_eq!(snapshot.seven_day.unwrap().utilization, 0.9);
+        assert!((snapshot.seven_day.unwrap().utilization - 0.90).abs() < 1e-9);
     }
 
     #[test]
@@ -468,24 +462,44 @@ mod tests {
     }
 
     #[test]
-    fn both_windows_share_one_scale() {
-        // All-fraction response (max ≤ 1.0) passes through unchanged.
-        let frac = br#"{
-            "five_hour": {"utilization": 0.42, "resets_at": 1781222400},
-            "seven_day": {"utilization": 0.9, "resets_at": 1781222400}
+    fn low_utilization_accounts_are_not_misread_as_full() {
+        // Regression for the live 2026-06-14 bug. Both accounts were ~1% used
+        // and fully available, but the old per-response scale guess
+        // (`max_raw > 1.0` ⇒ percentage, else fraction) read every window
+        // whose values were all ≤ 1.0 as fractions and recorded 1.0 == 100%,
+        // gating them as exhausted.
+
+        // ai2@: five_hour=1.0, seven_day=1.0  (== 1% / 1%, NOT 100% / 100%)
+        let ai2 = br#"{
+            "five_hour": {"utilization": 1.0, "resets_at": 1781222400},
+            "seven_day": {"utilization": 1.0, "resets_at": 1781222400}
         }"#;
-        let s = parse_usage_body(frac).unwrap();
-        assert_eq!(s.five_hour.unwrap().utilization, 0.42);
-        assert_eq!(s.seven_day.unwrap().utilization, 0.9);
-        // Percentage response (5h>1.0): BOTH windows divide by 100, including a
-        // 7d that on its own (0.5) would have looked like a fraction.
-        let pct = br#"{
-            "five_hour": {"utilization": 88.0, "resets_at": 1781222400},
-            "seven_day": {"utilization": 0.5, "resets_at": 1781222400}
+        let s = parse_usage_body(ai2).unwrap();
+        assert!((s.five_hour.unwrap().utilization - 0.01).abs() < 1e-9);
+        assert!((s.seven_day.unwrap().utilization - 0.01).abs() < 1e-9);
+
+        // ai@: five_hour=1.0, seven_day=0.0  (== 1% / 0%). A single sub-1.0
+        // window must still be a percentage, not a fraction.
+        let ai = br#"{
+            "five_hour": {"utilization": 1.0, "resets_at": 1781222400},
+            "seven_day": {"utilization": 0.0, "resets_at": 1781222400}
         }"#;
-        let s = parse_usage_body(pct).unwrap();
-        assert!((s.five_hour.unwrap().utilization - 0.88).abs() < 1e-9);
-        assert!((s.seven_day.unwrap().utilization - 0.005).abs() < 1e-9);
+        let s = parse_usage_body(ai).unwrap();
+        assert!((s.five_hour.unwrap().utilization - 0.01).abs() < 1e-9);
+        assert_eq!(s.seven_day.unwrap().utilization, 0.0);
+    }
+
+    #[test]
+    fn over_one_hundred_percent_clamps_to_full() {
+        let body = br#"{"five_hour": {"utilization": 137.0, "resets_at": 1781222400}}"#;
+        assert_eq!(
+            parse_usage_body(body)
+                .unwrap()
+                .five_hour
+                .unwrap()
+                .utilization,
+            1.0
+        );
     }
 
     #[test]

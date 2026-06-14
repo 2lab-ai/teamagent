@@ -176,13 +176,16 @@ impl MockUpstream {
     }
 
     /// Script `/api/oauth/usage` for the account whose bearer is
-    /// `access_token`. Windows are `(utilization, resets_in_secs)`.
+    /// `access_token`. Windows are `(utilization, resets_in_secs)` where
+    /// `utilization` is a 0..=1 FRACTION for test ergonomics; it is emitted on
+    /// the wire as a PERCENTAGE (×100) to match the live endpoint, which the
+    /// parser divides back by 100.
     pub fn set_usage(&self, access_token: &str, five_hour: WindowSpec, seven_day: WindowSpec) {
         let body = format!(
             r#"{{"five_hour":{{"utilization":{},"resets_at":{}}},"seven_day":{{"utilization":{},"resets_at":{}}}}}"#,
-            five_hour.0,
+            five_hour.0 * 100.0,
             epoch_in(five_hour.1),
-            seven_day.0,
+            seven_day.0 * 100.0,
             epoch_in(seven_day.1),
         );
         self.shared
