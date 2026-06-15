@@ -1268,6 +1268,11 @@ async fn relay(
 /// `/v1/messages/count_tokens` on a codex account: no upstream equivalent —
 /// answer locally with a naive chars/4 estimate (good enough for Claude
 /// Code's context-window bookkeeping, and strictly better than an error).
+///
+/// Deliberately NOT codex-traced: it makes no upstream call, so there is no
+/// "hung vs completed" question and no real upstream usage to record — the
+/// trace exists to diagnose the `/v1/messages` relay path. Tracing it would
+/// only add instant, usage-less noise to the file.
 fn codex_count_tokens_response(
     state: &AppState,
     ctx: &mut ForwardContext,
@@ -1310,6 +1315,16 @@ async fn relay_codex(
     client_stream: bool,
 ) -> Response {
     let status = response.status();
+    // Codex trace (best-effort): input breakdown captured now from the inbound
+    // body, terminal outcome written at each return below. `model` is what the
+    // request is served as (codex's configured model).
+    let trace = crate::proxy::codex_trace::CodexTrace::from_request(
+        state.config.codex.trace,
+        ctx.activity_id,
+        &ctx.path_query,
+        Some(state.codex.model()),
+        &ctx.body,
+    );
     ctx.log(format!(
         "=== RESPONSE {status} (codex) ===\n{}",
         format_headers(response.headers())
@@ -1329,6 +1344,11 @@ async fn relay_codex(
         } else {
             (status, "api_error")
         };
+        trace.write_error(
+            &format!("codex upstream {out_status}: {}", body_excerpt(&bytes)),
+            0,
+            ctx.started.elapsed().as_millis(),
+        );
         ctx.emit_finished(state, Some(&account), out_status, None);
         drop(lease);
         return error_response(
@@ -1358,8 +1378,24 @@ async fn relay_codex(
             response,
             converter,
             BODY_LOG_LIMIT,
-            move |usage, captured, error| {
+            move |usage, captured, error, converter, client_gone| {
                 totals.record(&account, 1, usage.input_tokens, usage.output_tokens);
+                // Codex trace: terminal outcome of the streamed request. A
+                // client disconnect mid-stream, an upstream stream error, or a
+                // clean completion are distinct outcomes for diagnosis.
+                let duration_ms = started.elapsed().as_millis();
+                let upstream_events = converter.events_seen();
+                if client_gone {
+                    trace.write_client_disconnect(upstream_events, duration_ms);
+                } else if let Some(error) = &error {
+                    trace.write_error(
+                        &format!("stream aborted: {error}"),
+                        upstream_events,
+                        duration_ms,
+                    );
+                } else {
+                    trace.write_completed(converter.raw_usage(), upstream_events, duration_ms);
+                }
                 if log_enabled {
                     sections.push(format!(
                         "=== RESPONSE BODY (codex→anthropic, first {} bytes) ===\n{}",
@@ -1419,6 +1455,11 @@ async fn relay_codex(
                 // Nothing was sent to the client yet — transient.
                 ctx.log(format!("=== ERROR ===\ncodex stream read failed: {err}"));
                 ctx.flush_log(state);
+                trace.write_error(
+                    &format!("codex upstream stream failed: {err}"),
+                    converter.events_seen(),
+                    ctx.started.elapsed().as_millis(),
+                );
                 ctx.emit_finished(state, Some(&account), StatusCode::BAD_GATEWAY, None);
                 drop(lease);
                 return transient_response(&format!("codex upstream stream failed: {err}"));
@@ -1433,12 +1474,21 @@ async fn relay_codex(
     state
         .totals
         .record(&account, 1, usage.input_tokens, usage.output_tokens);
+    // Capture converter-level trace detail BEFORE into_message_json consumes it.
+    let trace_raw_usage = converter.raw_usage().cloned();
+    let trace_events_seen = converter.events_seen();
+    let trace_duration_ms = ctx.started.elapsed().as_millis();
     let error_message = converter.error_message().map(str::to_string);
     let result = match converter.into_message_json() {
         Some(message) => {
             ctx.log(format!(
                 "=== RESPONSE BODY (codex aggregate) ===\n{message}"
             ));
+            trace.write_completed(
+                trace_raw_usage.as_ref(),
+                trace_events_seen,
+                trace_duration_ms,
+            );
             ctx.emit_finished(
                 state,
                 Some(&account),
@@ -1456,6 +1506,7 @@ async fn relay_codex(
             let message =
                 error_message.unwrap_or_else(|| "codex upstream produced no response".into());
             ctx.log(format!("=== ERROR ===\n{message}"));
+            trace.write_error(&message, trace_events_seen, trace_duration_ms);
             ctx.emit_finished(state, Some(&account), StatusCode::BAD_GATEWAY, None);
             error_response(StatusCode::BAD_GATEWAY, "api_error", &message)
         }

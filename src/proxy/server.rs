@@ -25,7 +25,7 @@ use crate::provider::anthropic::AnthropicPassthrough;
 use crate::scheduler::select::SelectParams;
 use crate::scheduler::usage::UsagePoller;
 use crate::scheduler::{AccountId, AccountPool, PoolSnapshot};
-use crate::tui::{ActivityEvent, EVENT_CHANNEL_CAPACITY};
+use crate::tui::{ActivityEvent, ACTIVITY_CHANNEL_CAP};
 
 /// Periodic scheduler re-evaluation (FR3: selection runs on a tick, never
 /// per-request). Public so the TUI can show a next-evaluation countdown.
@@ -151,7 +151,7 @@ impl AppState {
         logger: Option<Arc<RequestLogger>>,
         logs_rx: Option<tokio::sync::mpsc::Receiver<LogLine>>,
     ) -> Result<Self, ProxyError> {
-        let (events_tx, events_rx) = tokio::sync::mpsc::channel(EVENT_CHANNEL_CAPACITY);
+        let (events_tx, events_rx) = tokio::sync::mpsc::channel(ACTIVITY_CHANNEL_CAP);
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .redirect(reqwest::redirect::Policy::none())

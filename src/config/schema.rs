@@ -135,6 +135,12 @@ pub struct CodexConfig {
     /// the model's default. Display + request only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    /// Append a JSON-line trace of every codex request/response to
+    /// `$XDG_STATE_HOME/llmux/codex-trace.jsonl` (input size breakdown +
+    /// terminal outcome + verbatim upstream usage). Best-effort: write errors
+    /// never affect the request. Default `true` while we diagnose token issues.
+    #[serde(default = "default_true")]
+    pub trace: bool,
 }
 
 impl Default for CodexConfig {
@@ -145,6 +151,7 @@ impl Default for CodexConfig {
             default_model: default_codex_model(),
             fast: false,
             reasoning_effort: None,
+            trace: true,
         }
     }
 }

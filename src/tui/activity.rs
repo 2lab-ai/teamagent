@@ -13,6 +13,12 @@ pub(crate) const LOG_CAPACITY: usize = 200;
 /// dropped event), the oldest in-flight entry is retired as an error note
 /// instead of leaking forever.
 const MAX_IN_FLIGHT: usize = 64;
+/// Age after which an in-flight row is presumed finished and swept, even if no
+/// `RequestFinished` event ever arrived (the event was dropped on a full
+/// activity channel). Real requests finish in well under 90s per the daemon
+/// logs, so 300s is a wide safety margin that never retires a live request but
+/// still bounds a leaked row's lifetime — instead of growing to 25,000s+.
+const STALE_IN_FLIGHT: Duration = Duration::from_secs(300);
 
 /// A request that has started but not finished — rendered with a spinner.
 /// `group`/`model` are filled at routing time so the dashboard can attribute
@@ -211,6 +217,39 @@ impl ActivityLog {
         &self.in_flight
     }
 
+    /// Sweep in-flight rows older than [`STALE_IN_FLIGHT`]: their
+    /// `RequestFinished` event was almost certainly dropped on a full activity
+    /// channel (the daemon reports the request as completed while the dashboard
+    /// would otherwise show it pinned forever). Each swept row leaves a note so
+    /// the cause is visible in the log rather than silently vanishing.
+    ///
+    /// Called on every dashboard read (`view`) and at the top of `apply` so a
+    /// leaked row is bounded even with no further activity. Idempotent and
+    /// cheap (a single retain over a ≤64-entry vec).
+    pub(crate) fn prune_stale_in_flight(&mut self, now: SystemTime) {
+        let mut swept: Vec<InFlight> = Vec::new();
+        self.in_flight.retain(|entry| {
+            let stale = now
+                .duration_since(entry.started_at)
+                .map(|age| age >= STALE_IN_FLIGHT)
+                .unwrap_or(false);
+            if stale {
+                swept.push(entry.clone());
+            }
+            !stale
+        });
+        for entry in swept {
+            self.push_note(
+                format!(
+                    "{} {} presumed finished (activity event dropped)",
+                    entry.method, entry.path
+                ),
+                true,
+                now,
+            );
+        }
+    }
+
     /// Completed entries, newest first.
     pub(crate) fn completed(&self) -> impl Iterator<Item = &Completed> {
         self.completed.iter()
@@ -355,6 +394,9 @@ impl ActivityLog {
 
     /// Fold one proxy event into the log. `now` stamps the resulting entry.
     pub(crate) fn apply(&mut self, event: ActivityEvent, now: SystemTime) {
+        // Backstop against a dropped `RequestFinished`: any row older than the
+        // stale threshold is presumed finished before we fold the next event.
+        self.prune_stale_in_flight(now);
         match event {
             ActivityEvent::RequestStarted { id, method, path } => {
                 if self.in_flight.len() >= MAX_IN_FLIGHT {
@@ -667,6 +709,53 @@ mod tests {
             CompletedBody::Note { error, .. } => assert!(error),
             other => panic!("expected note, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn prune_stale_in_flight_sweeps_rows_past_threshold_with_a_note() {
+        let mut log = ActivityLog::new(200);
+        log.apply(started(1), at(0));
+        assert_eq!(log.in_flight().len(), 1, "row is in-flight");
+
+        // Still fresh just before the threshold: nothing swept.
+        log.prune_stale_in_flight(at(STALE_IN_FLIGHT.as_secs() - 1));
+        assert_eq!(log.in_flight().len(), 1, "not yet stale");
+
+        // Advance past the stale threshold (real requests finish in <90s, so a
+        // row this old means its RequestFinished was dropped).
+        log.prune_stale_in_flight(at(STALE_IN_FLIGHT.as_secs() + 1));
+        assert!(
+            log.in_flight().is_empty(),
+            "stale row swept, no zombie left"
+        );
+        let entry = log.completed().next().expect("sweep note").clone();
+        match &entry.body {
+            CompletedBody::Note { text, error } => {
+                assert!(error, "sweep note is an error note");
+                assert!(
+                    text.contains("presumed finished"),
+                    "note names the cause, got {text:?}"
+                );
+            }
+            other => panic!("expected note, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_sweeps_stale_in_flight_before_folding_next_event() {
+        let mut log = ActivityLog::new(200);
+        log.apply(started(1), at(0));
+        // A later, unrelated event arriving past the threshold sweeps the
+        // leaked row even though no RequestFinished for id 1 ever came.
+        log.apply(started(2), at(STALE_IN_FLIGHT.as_secs() + 5));
+        assert!(
+            !log.in_flight().iter().any(|r| r.id == 1),
+            "leaked row 1 swept on the next apply"
+        );
+        assert!(
+            log.in_flight().iter().any(|r| r.id == 2),
+            "fresh row 2 still in-flight"
+        );
     }
 
     // ---- totals ----

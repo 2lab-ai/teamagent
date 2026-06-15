@@ -166,7 +166,10 @@ pub fn transform_body<T, F>(
 ) -> axum::body::Body
 where
     T: SseTransform + 'static,
-    F: FnOnce(StreamUsage, Vec<u8>, Option<String>) + Send + 'static,
+    // `finish` also receives the finished transform (for converter-level detail
+    // like the codex trace's raw usage / event count) and whether the relay
+    // ended because the CLIENT disconnected (vs. upstream completing).
+    F: FnOnce(StreamUsage, Vec<u8>, Option<String>, &T, bool) + Send + 'static,
 {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(16);
     tokio::spawn(async move {
@@ -215,7 +218,7 @@ where
                 let _ = tx.send(Err(std::io::Error::other(err.clone()))).await;
             }
         }
-        finish(transform.usage(), captured, error);
+        finish(transform.usage(), captured, error, &transform, client_gone);
     });
     axum::body::Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx))
 }

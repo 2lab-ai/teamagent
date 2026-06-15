@@ -247,6 +247,14 @@ pub fn server_log_path() -> Result<PathBuf, CliError> {
     Ok(dir.join("server.log"))
 }
 
+/// Codex request/response trace: `$XDG_STATE_HOME/llmux/codex-trace.jsonl`,
+/// resolved the same way as [`server_log_path`] (state, not config). One JSON
+/// line per codex request when `codex.trace` is enabled. `None` when no state
+/// directory can be determined — the trace is best-effort and simply skipped.
+pub fn codex_trace_path() -> Option<PathBuf> {
+    Some(state_dir()?.join("codex-trace.jsonl"))
+}
+
 /// `$XDG_STATE_HOME/llmux` when set and non-empty, else
 /// `~/.local/state/llmux`.
 fn state_dir() -> Option<PathBuf> {

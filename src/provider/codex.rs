@@ -478,24 +478,34 @@ fn tools_to_functions(tools: &[Value]) -> Vec<Value> {
         .collect()
 }
 
+/// Total UTF-8 characters of every string anywhere under `value` (recurses
+/// arrays and object values). The atom of the chars/4 token estimate.
+fn section_chars(value: &Value) -> u64 {
+    match value {
+        Value::String(s) => s.chars().count() as u64,
+        Value::Array(items) => items.iter().map(section_chars).sum(),
+        Value::Object(map) => map.values().map(section_chars).sum(),
+        _ => 0,
+    }
+}
+
+/// chars/4 token estimate for one request section (e.g. just `system`, just
+/// `tools`, or just `messages`) so the trace can report the input breakdown
+/// per part. NOT floored — sum the parts, then floor the total if needed.
+pub fn estimate_section_tokens(value: &Value) -> u64 {
+    section_chars(value) / 4
+}
+
 /// Naive input-token estimate for `/v1/messages/count_tokens` on a codex
 /// account (no upstream equivalent): total characters of system + message
 /// text, divided by 4, floor 1.
 pub fn estimate_input_tokens(body: &Value) -> u64 {
-    fn chars(value: &Value) -> u64 {
-        match value {
-            Value::String(s) => s.chars().count() as u64,
-            Value::Array(items) => items.iter().map(chars).sum(),
-            Value::Object(map) => map.values().map(chars).sum(),
-            _ => 0,
-        }
-    }
     let mut total = 0u64;
     if let Some(system) = body.get("system") {
-        total += chars(system);
+        total += section_chars(system);
     }
     if let Some(messages) = body.get("messages") {
-        total += chars(messages);
+        total += section_chars(messages);
     }
     (total / 4).max(1)
 }
@@ -548,6 +558,15 @@ pub struct CodexSseConverter {
     blocks: Vec<AggBlock>,
     stop_reason: Option<String>,
     error: Option<String>,
+    /// Verbatim upstream `usage` object from `response.completed`, kept for the
+    /// codex trace (input_tokens / input_tokens_details.cached_tokens /
+    /// output_tokens / output_tokens_details.reasoning_tokens / total_tokens) —
+    /// the reduced `StreamUsage` drops the reasoning + total splits we want to
+    /// diagnose token issues from the log.
+    raw_usage: Option<Value>,
+    /// Count of upstream SSE events parsed (any `data:` event), so the trace
+    /// can show whether the stream produced events at all vs. hung.
+    events_seen: u64,
 }
 
 impl Default for CodexSseConverter {
@@ -578,6 +597,8 @@ impl CodexSseConverter {
             blocks: Vec::new(),
             stop_reason: None,
             error: None,
+            raw_usage: None,
+            events_seen: 0,
         }
     }
 
@@ -699,6 +720,9 @@ impl CodexSseConverter {
         self.ensure_started(out);
         self.close_block(out);
         if let Some(usage) = response.and_then(|r| r.get("usage")) {
+            // Keep the verbatim upstream usage for the codex trace before we
+            // reduce it (the trace wants reasoning + total splits too).
+            self.raw_usage = Some(usage.clone());
             // OpenAI `input_tokens` is the cache-INCLUSIVE total; the cached
             // subset is `input_tokens_details.cached_tokens`. Record fresh =
             // total − cached so codex is comparable to the Anthropic side
@@ -805,6 +829,19 @@ impl CodexSseConverter {
         self.error.as_deref()
     }
 
+    /// Verbatim upstream `usage` object captured at `response.completed`, for
+    /// the codex trace. `None` until a `response.completed` carrying `usage`
+    /// has been folded.
+    pub fn raw_usage(&self) -> Option<&Value> {
+        self.raw_usage.as_ref()
+    }
+
+    /// Count of real upstream SSE events parsed so far (keepalives, `[DONE]`,
+    /// and unparseable lines excluded).
+    pub fn events_seen(&self) -> u64 {
+        self.events_seen
+    }
+
     /// Concatenated `data:` payload of one SSE event (Responses events are
     /// single-line JSON in practice; multi-line data is joined per the SSE
     /// spec).
@@ -840,6 +877,9 @@ impl SseTransform for CodexSseConverter {
             tracing::debug!("codex: unparseable upstream SSE data dropped");
             return out;
         };
+        // One real upstream event parsed (keepalives / [DONE] / unparseable
+        // lines already returned above) — surfaced in the codex trace.
+        self.events_seen += 1;
         let event_type = value
             .get("type")
             .and_then(Value::as_str)

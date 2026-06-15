@@ -125,7 +125,11 @@ impl DashboardHub {
 
     /// Point-in-time clone of everything the dashboard document needs.
     pub(crate) fn view(&self, now: SystemTime) -> HubView {
-        let state = self.lock();
+        let mut state = self.lock();
+        // Sweep leaked in-flight rows on every read so the dashboard reflects
+        // the daemon's real `in_flight` even when a `RequestFinished` event was
+        // dropped on a full activity channel (BUG: zombie 25,000s+ rows).
+        state.log.prune_stale_in_flight(now);
         HubView {
             last_switch: state.last_switch.clone(),
             poll_health: state.poll_health.clone(),
