@@ -52,7 +52,10 @@ pub const ACTIVITY_CHANNEL_CAP: usize = 4096;
 
 use std::time::{Duration, Instant, SystemTime};
 
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+    MouseButton, MouseEvent, MouseEventKind,
+};
 use tokio::sync::mpsc;
 
 use crate::config::AccountConfig;
@@ -228,6 +231,60 @@ pub(crate) enum Overlay {
     Logs,
 }
 
+/// Stable identity of a completed activity entry, used to remember which row is
+/// expanded (issue #5: click-to-expand) across re-renders and new rows arriving.
+///
+/// The request `id` would be the natural key, but it is genuinely NOT available
+/// on a *completed* entry: the activity fold ([`activity::ActivityLog::apply`])
+/// consumes the started→finished `id` only to clear the in-flight row and never
+/// stores it on [`activity::Completed`], and the over-the-wire
+/// [`crate::dashboard::CompletedDoc::Request`] carries no `id` either. Both of
+/// those live in the data/persistence layer, which this change does not touch.
+///
+/// So the identity is derived from the fields that DO survive into the view:
+/// the completion timestamp (millisecond precision through the doc round-trip),
+/// plus method/path/status to disambiguate the rare same-millisecond pair.
+/// Because new completed entries are *prepended* (newest first) and an existing
+/// entry's fields never change, this key is stable while the list grows — the
+/// expanded row stays expanded as activity streams in, which a positional index
+/// would not survive.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct ExpandKey {
+    /// Completion timestamp in epoch millis (the view stores `at` as a
+    /// `SystemTime` built from the doc's `at_ms`).
+    pub at_ms: u128,
+    pub method: String,
+    pub path: String,
+    pub status: u16,
+}
+
+impl ExpandKey {
+    /// Derive the key for a completed *request* entry, or `None` for a note
+    /// (notes are not expandable — there is nothing more to show).
+    pub(crate) fn for_completed(entry: &activity::Completed) -> Option<Self> {
+        let activity::CompletedBody::Request {
+            method,
+            path,
+            status,
+            ..
+        } = &entry.body
+        else {
+            return None;
+        };
+        let at_ms = entry
+            .at
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        Some(Self {
+            at_ms,
+            method: method.clone(),
+            path: path.clone(),
+            status: *status,
+        })
+    }
+}
+
 /// UI-local state the renderer needs besides the data view: cursor, panes,
 /// spinner frame, status line, attach banner.
 pub(crate) struct Chrome {
@@ -241,6 +298,9 @@ pub(crate) struct Chrome {
     pub activity_scroll: usize,
     /// Cursor row in the Stats overlay's model table.
     pub model_cursor: usize,
+    /// The completed activity entry currently expanded in place (issue #5:
+    /// click-to-expand), if any. Keyed by [`ExpandKey`] so it survives new rows.
+    pub expanded: Option<ExpandKey>,
     /// `Some` in attach mode.
     pub attach: Option<Attach>,
     /// Number of characters typed so far in `Mode::AddKey` — the footer shows
@@ -325,6 +385,10 @@ struct App {
     activity_scroll: usize,
     /// Cursor row in the Stats overlay's model table.
     model_cursor: usize,
+    /// Completed activity entry expanded in place by a mouse click (issue #5).
+    /// Keyed by [`ExpandKey`] (not a list index) so the expansion survives new
+    /// completed rows being prepended as activity streams in.
+    expanded: Option<ExpandKey>,
     /// API-key buffer for `Mode::AddKey`. Held outside `Mode` so the enum
     /// stays `Copy` and the secret is owned in exactly one place; cleared on
     /// submit/cancel. Never rendered raw — the footer shows a masked width.
@@ -349,6 +413,7 @@ impl App {
             overlay: Overlay::None,
             activity_scroll: 0,
             model_cursor: 0,
+            expanded: None,
             add_input: String::new(),
             pending_login: None,
         }
@@ -379,6 +444,7 @@ impl App {
             overlay: self.overlay,
             activity_scroll: self.activity_scroll,
             model_cursor: self.model_cursor,
+            expanded: self.expanded.clone(),
             add_input_len: self.add_input.chars().count(),
             status_line: self.status_line().map(str::to_string),
             attach: match &self.backend {
@@ -448,6 +514,69 @@ impl App {
             Overlay::Accounts => self.on_key_accounts(key.code, view),
             Overlay::Stats => self.on_key_stats(key.code, view),
             Overlay::Logs => self.on_key_logs(key.code),
+        }
+    }
+
+    /// Handle one native mouse event (issue #5). Mouse is purely additive to the
+    /// keyboard: a left-button press inside the MAIN activity list toggles the
+    /// clicked completed row's expanded detail; the scroll wheel pages the
+    /// activity log (same axis as `↑↓`). Mouse input is ignored while an overlay
+    /// or a pending `Mode` interaction owns the screen, so it never fights the
+    /// account/stats/logs surfaces drawn over MAIN.
+    fn on_mouse(
+        &mut self,
+        mouse: MouseEvent,
+        view: Option<&DashboardView>,
+        area: ratatui::layout::Rect,
+    ) {
+        // Only MAIN (no overlay, no pending Mode) reacts to the mouse — the
+        // activity list lives on MAIN, and the overlays have their own surfaces.
+        if self.overlay != Overlay::None || self.mode != Mode::Normal {
+            return;
+        }
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.click_activity(mouse.column, mouse.row, view, area);
+            }
+            // Wheel maps onto the existing activity scroll (up = into history,
+            // down = toward the live tail), matching the `↑↓` keys.
+            MouseEventKind::ScrollUp => self.scroll_activity(3, view),
+            MouseEventKind::ScrollDown => self.scroll_activity(-3, view),
+            _ => {}
+        }
+    }
+
+    /// Resolve a left-click at `(col, row)` to a completed activity entry and
+    /// toggle its expanded state. Clicking the already-expanded row collapses
+    /// it; clicking a different row moves the expansion. Clicks that miss the
+    /// list (or land on an in-flight / note row) are no-ops.
+    fn click_activity(
+        &mut self,
+        col: u16,
+        row: u16,
+        view: Option<&DashboardView>,
+        area: ratatui::layout::Rect,
+    ) {
+        let Some(view) = view else { return };
+        let activity_area = ui::main_activity_area(area, view);
+        let layout = ui::activity_layout(
+            activity_area,
+            view,
+            self.expanded.as_ref(),
+            self.activity_scroll,
+        );
+        if let Some(key) = layout.hit(col, row) {
+            self.toggle_expanded(key);
+        }
+    }
+
+    /// Toggle the expanded entry: collapse if `key` is already expanded, else
+    /// expand it (replacing any previously expanded row).
+    fn toggle_expanded(&mut self, key: ExpandKey) {
+        if self.expanded.as_ref() == Some(&key) {
+            self.expanded = None;
+        } else {
+            self.expanded = Some(key);
         }
     }
 
@@ -1152,16 +1281,43 @@ impl App {
     }
 }
 
+/// Enter the TUI terminal: raw mode + alternate screen (via `ratatui::try_init`,
+/// which also installs a panic hook that restores those) PLUS native mouse
+/// capture (issue #5). The panic hook installed here CHAINS the existing one so
+/// mouse capture is also disabled on an unwinding panic — `ratatui::restore`
+/// alone does not turn it off, which would leave the user's real terminal
+/// emitting mouse escape codes after a crash.
+fn init_terminal() -> std::io::Result<ratatui::DefaultTerminal> {
+    let terminal = ratatui::try_init()?;
+    crossterm::execute!(std::io::stdout(), EnableMouseCapture)?;
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        // Best-effort: undo mouse capture before the (ratatui) hook restores
+        // raw mode / the alternate screen and prints the panic.
+        let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+        prev(info);
+    }));
+    Ok(terminal)
+}
+
+/// Leave the TUI terminal: disable mouse capture, then `ratatui::restore` (raw
+/// mode + alternate screen). Safe to call on every exit path; mirrors
+/// [`init_terminal`].
+fn restore_terminal() {
+    let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+    ratatui::restore();
+}
+
 /// Run the in-process dashboard over live server state until quit.
 ///
-/// Terminal lifecycle: `ratatui::try_init` enables raw mode + the alternate
-/// screen AND installs a panic hook that restores the terminal before
-/// unwinding; `ratatui::restore` runs on every exit path.
+/// Terminal lifecycle: [`init_terminal`] enables raw mode + the alternate
+/// screen + mouse capture AND installs a panic hook that restores the terminal
+/// before unwinding; [`restore_terminal`] runs on every exit path.
 pub async fn run_local(state: crate::proxy::server::AppState) -> std::io::Result<()> {
-    let mut terminal = ratatui::try_init()?;
+    let mut terminal = init_terminal()?;
     let mut app = App::new(Backend::Local(Box::new(state)));
     let result = event_loop(&mut terminal, &mut app, None).await;
-    ratatui::restore();
+    restore_terminal();
     result
 }
 
@@ -1182,7 +1338,7 @@ pub async fn run_remote(opts: RemoteOptions) -> std::io::Result<()> {
         opts.api_key.clone(),
         tx,
     ));
-    let mut terminal = ratatui::try_init()?;
+    let mut terminal = init_terminal()?;
     let mut app = App::new(Backend::Remote(Box::new(Remote {
         client,
         base_url: opts.base_url,
@@ -1196,7 +1352,7 @@ pub async fn run_remote(opts: RemoteOptions) -> std::io::Result<()> {
         pending_remove: None,
     })));
     let result = event_loop(&mut terminal, &mut app, Some(rx)).await;
-    ratatui::restore();
+    restore_terminal();
     fetcher.abort();
     result
 }
@@ -1249,7 +1405,7 @@ async fn event_loop(
                 app.frame = app.frame.wrapping_add(1);
                 true
             }
-            _ = input.tick() => drain_input(app)?,
+            _ = input.tick() => drain_input(app, terminal)?,
             msg = async {
                 match fetch.as_mut() {
                     Some(rx) => rx.recv().await,
@@ -1290,9 +1446,9 @@ async fn event_loop(
         // run the flow, then re-init and force a full redraw. The fetch poller
         // (remote mode) keeps running in the background meanwhile.
         if let Some(kind) = app.take_pending_login() {
-            ratatui::restore();
+            restore_terminal();
             app.perform_login(kind).await;
-            *terminal = ratatui::try_init()?;
+            *terminal = init_terminal()?;
             let _ = terminal.clear();
             redraw = true;
         }
@@ -1310,15 +1466,32 @@ async fn event_loop(
 /// Drain every pending terminal event without blocking the runtime
 /// (`poll(ZERO)` is a non-blocking readiness check). Returns whether
 /// anything happened that warrants a redraw.
-fn drain_input(app: &mut App) -> std::io::Result<bool> {
+///
+/// `terminal` is borrowed only to read the current size, so a mouse click can
+/// be hit-tested against the same frame rect the renderer lays MAIN out in.
+fn drain_input(app: &mut App, terminal: &ratatui::DefaultTerminal) -> std::io::Result<bool> {
     let mut dirty = false;
-    // Built once per drain: key handlers read the same frame the user saw.
+    // Built once per drain: key/mouse handlers read the same frame the user saw.
     let mut view: Option<Option<DashboardView>> = None;
     while crossterm::event::poll(Duration::ZERO)? {
         match crossterm::event::read()? {
             Event::Key(key) => {
                 let view = view.get_or_insert_with(|| app.view(SystemTime::now()));
                 app.on_key(key, view.as_ref());
+                dirty = true;
+            }
+            Event::Mouse(mouse) => {
+                // The frame rect is the whole terminal; mouse coords are
+                // absolute, so MAIN's layout is recomputed against this rect to
+                // map the click to an activity row.
+                let area = ratatui::layout::Rect::new(
+                    0,
+                    0,
+                    terminal.size()?.width,
+                    terminal.size()?.height,
+                );
+                let view = view.get_or_insert_with(|| app.view(SystemTime::now()));
+                app.on_mouse(mouse, view.as_ref(), area);
                 dirty = true;
             }
             Event::Resize(_, _) => dirty = true,
@@ -1523,6 +1696,140 @@ mod tests {
 
     fn press(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    // --- issue #5: native mouse + click-to-expand --------------------------
+
+    fn completed_request(at_secs: u64, account: &str) -> activity::Completed {
+        activity::Completed {
+            at: SystemTime::UNIX_EPOCH + Duration::from_secs(at_secs),
+            body: activity::CompletedBody::Request {
+                method: "POST".into(),
+                path: "/v1/messages".into(),
+                account: Some(account.into()),
+                status: 200,
+                duration: Duration::from_millis(1_400),
+                tokens: None,
+                group: Some("codex".into()),
+                model: Some("gpt-5.5".into()),
+                effort: None,
+            },
+        }
+    }
+
+    fn left_click(col: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn expand_key_distinguishes_completed_requests_and_skips_notes() {
+        let a = completed_request(10, "a");
+        let b = completed_request(20, "b");
+        let key_a = ExpandKey::for_completed(&a).expect("request has a key");
+        let key_b = ExpandKey::for_completed(&b).expect("request has a key");
+        assert_ne!(key_a, key_b, "different entries → different keys");
+        // Same entry → same key (stable identity).
+        assert_eq!(key_a, ExpandKey::for_completed(&a).unwrap());
+        // Notes are not expandable.
+        let note = activity::Completed {
+            at: SystemTime::UNIX_EPOCH,
+            body: activity::CompletedBody::Note {
+                text: "switch".into(),
+                error: false,
+            },
+        };
+        assert_eq!(ExpandKey::for_completed(&note), None);
+    }
+
+    #[test]
+    fn toggle_expanded_is_idempotent_open_close() {
+        let mut app = remote_app();
+        let key = ExpandKey::for_completed(&completed_request(10, "a")).unwrap();
+        assert_eq!(app.expanded, None);
+        app.toggle_expanded(key.clone());
+        assert_eq!(app.expanded.as_ref(), Some(&key), "first click expands");
+        app.toggle_expanded(key.clone());
+        assert_eq!(app.expanded, None, "second click on the same row collapses");
+    }
+
+    #[test]
+    fn clicking_a_different_row_moves_the_expansion() {
+        let mut app = remote_app();
+        let a = ExpandKey::for_completed(&completed_request(10, "a")).unwrap();
+        let b = ExpandKey::for_completed(&completed_request(20, "b")).unwrap();
+        app.toggle_expanded(a.clone());
+        app.toggle_expanded(b.clone());
+        assert_eq!(app.expanded.as_ref(), Some(&b), "expansion moves to b");
+    }
+
+    #[test]
+    fn click_activity_expands_the_row_under_the_cursor() {
+        let mut app = remote_app();
+        let mut view = empty_view();
+        view.completed = vec![completed_request(30, "a"), completed_request(20, "b")];
+        // A frame big enough that MAIN gives the activity panel real rows.
+        let area = ratatui::layout::Rect::new(0, 0, 120, 24);
+        let activity_area = ui::main_activity_area(area, &view);
+        // First content row (one below the top border) → newest entry "a".
+        let y = activity_area.y + 1;
+        app.click_activity(activity_area.x + 2, y, Some(&view), area);
+        assert_eq!(
+            app.expanded,
+            ExpandKey::for_completed(&view.completed[0]),
+            "click on row 0 expands the newest entry"
+        );
+        // Click it again → collapse.
+        app.click_activity(activity_area.x + 2, y, Some(&view), area);
+        assert_eq!(app.expanded, None, "re-click collapses");
+    }
+
+    #[test]
+    fn mouse_is_ignored_while_an_overlay_is_open() {
+        let mut app = remote_app();
+        let mut view = empty_view();
+        view.completed = vec![completed_request(10, "a")];
+        app.overlay = Overlay::Accounts;
+        let area = ratatui::layout::Rect::new(0, 0, 120, 24);
+        let activity_area = ui::main_activity_area(area, &view);
+        app.on_mouse(
+            left_click(activity_area.x + 2, activity_area.y + 1),
+            Some(&view),
+            area,
+        );
+        assert_eq!(app.expanded, None, "overlay swallows the click, no expand");
+    }
+
+    #[test]
+    fn scroll_wheel_pages_the_activity_log() {
+        let mut app = remote_app();
+        let mut view = empty_view();
+        view.completed = (0..10).map(|i| completed_request(i, "a")).collect();
+        let area = ratatui::layout::Rect::new(0, 0, 120, 24);
+        let up = MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 5,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.on_mouse(up, Some(&view), area);
+        assert!(app.activity_scroll > 0, "wheel up scrolls into history");
+        let before = app.activity_scroll;
+        let down = MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 5,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.on_mouse(down, Some(&view), area);
+        assert!(
+            app.activity_scroll < before,
+            "wheel down scrolls toward tail"
+        );
     }
 
     fn stats_view() -> DashboardView {

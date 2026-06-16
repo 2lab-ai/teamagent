@@ -23,7 +23,7 @@ use crate::scheduler::{select, AccountSnapshot};
 use super::activity::{Completed, CompletedBody};
 use super::format::{self, GaugeLevel};
 use super::view::DashboardView;
-use super::{anim, Chrome, Mode, Overlay};
+use super::{anim, Chrome, ExpandKey, Mode, Overlay};
 
 const GAUGE_BAR_WIDTH: usize = 8;
 /// Width at/above which the accounts table shows the wide column set
@@ -1327,6 +1327,235 @@ fn window_detail_line(
     ])
 }
 
+/// Recompute MAIN's activity-list `Rect` for a given frame area + view, so a
+/// mouse handler can hit-test clicks against the exact rect [`draw_main`] laid
+/// the activity panel into. MUST mirror the vertical [`Layout`] in `draw_main`
+/// (header · overview · domain map · model strip · activity · footer); kept here
+/// next to the activity code so the two move together. Returns a zero-height
+/// rect if the terminal is too short for the activity slot.
+pub(crate) fn main_activity_area(area: Rect, view: &DashboardView) -> Rect {
+    let compact = area.height < 30;
+    let strip_rows = view.model_usage.len().min(MODEL_STRIP_ROWS);
+    let strip_height = if !compact && strip_rows > 0 {
+        strip_rows as u16 + 2
+    } else {
+        0
+    };
+    let [_header, _overview, _domains, _strip, activity_area, _footer] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(if compact { 10 } else { 13 }),
+        Constraint::Length(if compact { 0 } else { 7 }),
+        Constraint::Length(strip_height),
+        Constraint::Min(3),
+        Constraint::Length(2),
+    ])
+    .areas(area);
+    activity_area
+}
+
+/// What a screen row in the activity list maps back to (for click hit-testing).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ActivityHit {
+    /// An in-flight (spinner) row — not expandable.
+    InFlight,
+    /// A completed note row — not expandable (nothing more to show).
+    Note,
+    /// A completed request row, identified by its stable [`ExpandKey`].
+    Request(ExpandKey),
+}
+
+/// One rendered activity row's vertical extent + what it maps to. `y_start` is
+/// absolute (screen) coordinates; `height` is 1 for a collapsed row and `1 + N`
+/// detail lines for the expanded request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ActivityRow {
+    pub y_start: u16,
+    pub height: u16,
+    pub hit: ActivityHit,
+}
+
+/// The full ordered set of rows drawn into the activity list this frame, plus
+/// the rendered lines. Produced once by [`activity_layout`] and consumed by BOTH
+/// the renderer (`draw_activity` reads `lines`) and the click handler
+/// (`hit` maps a `(col,row)` back to an entry). Doing the layout in one pure
+/// place is what keeps "what was drawn" and "what was clicked" in lock-step.
+pub(crate) struct ActivityLayout {
+    pub area: Rect,
+    pub rows: Vec<ActivityRow>,
+    pub lines: Vec<Line<'static>>,
+    /// Total completed entries (for the title), and the clamped scroll used.
+    pub total: usize,
+    pub scroll: usize,
+}
+
+impl ActivityLayout {
+    /// Map a click at absolute `(col, row)` to the expandable entry it lands on,
+    /// or `None` for a miss / a non-request row. Only clicks INSIDE the activity
+    /// rect count; in-flight and note rows return `None` (nothing to expand).
+    pub(crate) fn hit(&self, col: u16, row: u16) -> Option<ExpandKey> {
+        if col < self.area.left()
+            || col >= self.area.right()
+            || row < self.area.top()
+            || row >= self.area.bottom()
+        {
+            return None;
+        }
+        for r in &self.rows {
+            if row >= r.y_start && row < r.y_start + r.height {
+                return match &r.hit {
+                    ActivityHit::Request(key) => Some(key.clone()),
+                    _ => None,
+                };
+            }
+        }
+        None
+    }
+}
+
+/// Pure layout for the activity list: build the exact lines `draw_activity`
+/// renders AND the row→entry map the click handler hit-tests against, from the
+/// same inputs, so the two can never drift. `expanded` is the currently expanded
+/// entry's key (its row gets the ▾ marker + indented detail lines); everything
+/// else renders as a single ▸-less collapsed line. `now` is needed for the
+/// in-flight elapsed/spinner; pass a fixed time in tests for determinism.
+///
+/// The math mirrors the original `draw_activity`: in-flight rows pinned on top
+/// only at the live tail (scroll==0), then completed entries newest-first
+/// windowed by the scroll offset, all clamped to the panel's row `capacity`
+/// (height minus the top border).
+pub(crate) fn activity_layout(
+    area: Rect,
+    view: &DashboardView,
+    expanded: Option<&ExpandKey>,
+    scroll: usize,
+) -> ActivityLayout {
+    activity_layout_at(area, view, expanded, scroll, 0, SystemTime::UNIX_EPOCH)
+}
+
+/// [`activity_layout`] with explicit animation frame + `now` (for the live
+/// renderer and for deterministic tests).
+fn activity_layout_at(
+    area: Rect,
+    view: &DashboardView,
+    expanded: Option<&ExpandKey>,
+    scroll: usize,
+    anim_frame: usize,
+    now: SystemTime,
+) -> ActivityLayout {
+    let in_flight = &view.in_flight;
+    let capacity = area.height.saturating_sub(1) as usize; // top border
+                                                           // Content starts one row below the top border the Block draws.
+    let y0 = area.y.saturating_add(1);
+
+    let mut rows: Vec<ActivityRow> = Vec::new();
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(capacity);
+    let mut used: usize = 0; // content rows consumed so far
+
+    // In-flight rows pinned on top ONLY when viewing the live tail (scroll==0);
+    // while scrolled into history they'd steal rows from the page being read.
+    if scroll == 0 {
+        for request in in_flight.iter().rev() {
+            if used >= capacity {
+                break;
+            }
+            lines.push(in_flight_line(view, request, anim_frame, now));
+            rows.push(ActivityRow {
+                y_start: y0.saturating_add(used as u16),
+                height: 1,
+                hit: ActivityHit::InFlight,
+            });
+            used += 1;
+        }
+    }
+
+    // Completed entries, newest first, windowed by the scroll offset (req6:
+    // the whole history is reachable, not just the rows that happen to fit).
+    let total = view.completed.len();
+    let scroll = scroll.min(total.saturating_sub(1));
+    for entry in view.completed.iter().skip(scroll) {
+        if used >= capacity {
+            break;
+        }
+        let key = ExpandKey::for_completed(entry);
+        let is_expanded = matches!((&key, expanded), (Some(k), Some(e)) if k == e);
+        // Header line for this entry. The expand marker only applies to
+        // requests (notes are not expandable).
+        let header = completed_line(entry, key.is_some(), is_expanded);
+        lines.push(header);
+        let hit = match key.clone() {
+            Some(k) => ActivityHit::Request(k),
+            None => ActivityHit::Note,
+        };
+        let mut height: u16 = 1;
+        used += 1;
+
+        // Expanded detail lines, indented, as long as they fit in the panel.
+        if is_expanded {
+            for detail in expanded_detail_lines(entry) {
+                if used >= capacity {
+                    break;
+                }
+                lines.push(detail);
+                height += 1;
+                used += 1;
+            }
+        }
+        rows.push(ActivityRow {
+            y_start: y0.saturating_add((used as u16).saturating_sub(height)),
+            height,
+            hit,
+        });
+    }
+
+    ActivityLayout {
+        area,
+        rows,
+        lines,
+        total,
+        scroll,
+    }
+}
+
+/// Render one in-flight (spinner) row — extracted so [`activity_layout_at`] and
+/// any future caller share one definition.
+fn in_flight_line(
+    view: &DashboardView,
+    request: &super::activity::InFlight,
+    anim_frame: usize,
+    now: SystemTime,
+) -> Line<'static> {
+    let elapsed = now.duration_since(request.started_at).unwrap_or_default();
+    // Working spinner differs by backend group: Claude gets the braille
+    // orbit (magenta), Codex a quarter-block orbit (cyan) — the same
+    // colors as the group labels — so you can tell what's running where
+    // at a glance. Pre-routing rows (no account yet) are a dim braille.
+    let (glyph, color) = match request.account.as_deref().and_then(|a| group_of(view, a)) {
+        Some(BackendGroup::Codex) => (anim::block_spin(anim_frame), Color::Cyan),
+        Some(BackendGroup::Claude) => (anim::braille_spin(anim_frame), Color::Magenta),
+        None => (anim::braille_spin(anim_frame), Color::DarkGray),
+    };
+    let mut spans = vec![
+        Span::styled(format!(" {glyph} "), Style::new().fg(color)),
+        Span::styled(format::clock_hms_utc(request.started_at), dim()),
+        Span::raw(format!("  {} {}", request.method, request.path)),
+    ];
+    // [group model] badge while in flight (issue #2, 2a). The data is
+    // filled at routing time (req11); effort is not carried in-flight,
+    // so the badge mirrors completed rows minus the effort suffix.
+    if let Some(meta) = activity_meta(request.group.as_deref(), request.model.as_deref(), None) {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(meta, group_color(request.group.as_deref())));
+    }
+    if let Some(account) = &request.account {
+        spans.push(Span::raw(format!(" → {account}")));
+    }
+    spans.push(Span::styled(
+        format!(" ({}…)", format::elapsed_secs(elapsed)),
+        dim(),
+    ));
+    Line::from(spans)
+}
+
 fn draw_activity(
     frame: &mut Frame,
     area: Rect,
@@ -1335,59 +1564,26 @@ fn draw_activity(
     now: SystemTime,
 ) {
     let in_flight = &view.in_flight;
-    let capacity = area.height.saturating_sub(1) as usize; // top border
-
-    let anim_frame = chrome.frame;
-    let mut lines: Vec<Line> = Vec::with_capacity(capacity);
-    // In-flight rows pinned on top ONLY when viewing the live tail (scroll==0);
-    // while scrolled into history they'd steal rows from the page being read.
-    if chrome.activity_scroll == 0 {
-        for request in in_flight.iter().rev().take(capacity) {
-            let elapsed = now.duration_since(request.started_at).unwrap_or_default();
-            // Working spinner differs by backend group: Claude gets the braille
-            // orbit (magenta), Codex a quarter-block orbit (cyan) — the same
-            // colors as the group labels — so you can tell what's running where
-            // at a glance. Pre-routing rows (no account yet) are a dim braille.
-            let (glyph, color) = match request.account.as_deref().and_then(|a| group_of(view, a)) {
-                Some(BackendGroup::Codex) => (anim::block_spin(anim_frame), Color::Cyan),
-                Some(BackendGroup::Claude) => (anim::braille_spin(anim_frame), Color::Magenta),
-                None => (anim::braille_spin(anim_frame), Color::DarkGray),
-            };
-            let mut spans = vec![
-                Span::styled(format!(" {glyph} "), Style::new().fg(color)),
-                Span::styled(format::clock_hms_utc(request.started_at), dim()),
-                Span::raw(format!("  {} {}", request.method, request.path)),
-            ];
-            // [group model] badge while in flight (issue #2, 2a). The data is
-            // filled at routing time (req11); effort is not carried in-flight,
-            // so the badge mirrors completed rows minus the effort suffix.
-            if let Some(meta) =
-                activity_meta(request.group.as_deref(), request.model.as_deref(), None)
-            {
-                spans.push(Span::raw(" "));
-                spans.push(Span::styled(meta, group_color(request.group.as_deref())));
-            }
-            if let Some(account) = &request.account {
-                spans.push(Span::raw(format!(" → {account}")));
-            }
-            spans.push(Span::styled(
-                format!(" ({}…)", format::elapsed_secs(elapsed)),
-                dim(),
-            ));
-            lines.push(Line::from(spans));
-        }
-    }
-    // Completed entries, newest first, windowed by the scroll offset (req6:
-    // the whole history is reachable, not just the rows that happen to fit).
-    let total = view.completed.len();
-    let completed_rows = capacity.saturating_sub(lines.len());
-    let scroll = chrome.activity_scroll.min(total.saturating_sub(1));
-    for entry in view.completed.iter().skip(scroll).take(completed_rows) {
-        lines.push(completed_line(entry));
-    }
+    let layout = activity_layout_at(
+        area,
+        view,
+        chrome.expanded.as_ref(),
+        chrome.activity_scroll,
+        chrome.frame,
+        now,
+    );
+    let total = layout.total;
+    let scroll = layout.scroll;
+    // Rows actually shown of the completed history (for the title range). The
+    // layout already clamped everything to the panel capacity.
+    let completed_shown = layout
+        .rows
+        .iter()
+        .filter(|r| !matches!(r.hit, ActivityHit::InFlight))
+        .count();
+    let shown_last = (scroll + completed_shown).min(total);
 
     // Title carries the scroll position so it's obvious you're in history.
-    let shown_last = (scroll + completed_rows).min(total);
     let title = if scroll > 0 {
         format!(
             " activity — {}–{} of {total} (↑ history) ",
@@ -1400,11 +1596,137 @@ fn draw_activity(
         format!(" activity — {} in flight ", in_flight.len())
     };
     let block = Block::new().borders(Borders::TOP).title(title);
-    frame.render_widget(Paragraph::new(lines).block(block), area);
+    frame.render_widget(Paragraph::new(layout.lines).block(block), area);
 }
 
-fn completed_line(entry: &Completed) -> Line<'static> {
-    let stamp = Span::styled(format!("   {}  ", format::clock_hms_utc(entry.at)), dim());
+/// Indented detail lines for an expanded completed *request* (issue #5): full
+/// method+path, account, status, duration, group/model/effort, the token
+/// breakdown (input / output / cache_read / cache_creation / total), and the
+/// per-component + total API-equivalent cost via [`crate::pricing`]. Notes
+/// produce no detail lines. Cost uses the built-in default rate table (empty
+/// overrides) — same as the inline `completed_line` cost and the server.log path.
+///
+/// NOTE: the view-model drops the cache split for completed entries (only
+/// in/out survive the doc round-trip), so `cache_read`/`cache_creation` read as
+/// `—` here and the cost is the input+output cost. That is a data-layer fact,
+/// not a render bug — the model-usage rows (Stats overlay) carry the cache split.
+fn expanded_detail_lines(entry: &Completed) -> Vec<Line<'static>> {
+    let CompletedBody::Request {
+        method,
+        path,
+        account,
+        status,
+        duration,
+        tokens,
+        group,
+        model,
+        effort,
+    } = &entry.body
+    else {
+        return Vec::new();
+    };
+
+    // Indent under the timestamp column so detail reads as a child of its row.
+    let indent = "        ";
+    let label_style = dim();
+    let mut out: Vec<Line<'static>> = Vec::new();
+
+    let mut detail_line = |label: &str, value: String| {
+        out.push(Line::from(vec![
+            Span::styled(format!("{indent}{label:<9}"), label_style),
+            Span::raw(value),
+        ]));
+    };
+
+    detail_line("request", format!("{method} {path}"));
+    detail_line("account", account.clone().unwrap_or_else(|| "?".into()));
+    detail_line(
+        "status",
+        format!("{status} · {}", format::elapsed_secs(*duration)),
+    );
+
+    // group / model / effort, omitting the parts that are unknown.
+    let mut routed = String::new();
+    if let Some(g) = group {
+        routed.push_str(g);
+    }
+    if let Some(m) = model {
+        if !routed.is_empty() {
+            routed.push(' ');
+        }
+        routed.push_str(m);
+    }
+    if let Some(e) = effort {
+        routed.push_str(&format!(" · {e}"));
+    }
+    if routed.is_empty() {
+        routed.push_str("(unrouted)");
+    }
+    detail_line("model", routed);
+
+    // Token breakdown. Completed entries carry only input/output (the doc drops
+    // the cache split), so cache fields render as "—".
+    let fmt_tok = format::human_count;
+    let fmt_opt = |o: Option<u64>| o.map(format::human_count).unwrap_or_else(|| "—".into());
+    if let Some(t) = tokens {
+        detail_line(
+            "tokens",
+            format!(
+                "in {} · out {} · cache_r {} · cache_w {} · total {}",
+                fmt_tok(t.input),
+                fmt_tok(t.output),
+                fmt_opt(t.cache_read),
+                fmt_opt(t.cache_creation),
+                fmt_tok(t.total()),
+            ),
+        );
+
+        // Per-component + total API-equivalent cost, when group+model known.
+        if let (Some(g), Some(m)) = (group, model) {
+            let overrides = std::collections::HashMap::new();
+            let in_cost = crate::pricing::cost_from_parts(g, m, t.input, 0, None, None, &overrides);
+            let out_cost =
+                crate::pricing::cost_from_parts(g, m, 0, t.output, None, None, &overrides);
+            let cr_cost =
+                crate::pricing::cost_from_parts(g, m, 0, 0, t.cache_read, None, &overrides);
+            let cw_cost =
+                crate::pricing::cost_from_parts(g, m, 0, 0, None, t.cache_creation, &overrides);
+            let total_cost = crate::pricing::cost_usd(g, m, t, &overrides);
+            detail_line(
+                "cost",
+                format!(
+                    "in {} · out {} · cache_r {} · cache_w {} · total {}",
+                    format_cost(in_cost),
+                    format_cost(out_cost),
+                    format_cost(cr_cost),
+                    format_cost(cw_cost),
+                    format_cost(total_cost),
+                ),
+            );
+        } else {
+            detail_line("cost", "n/a (model unknown)".into());
+        }
+    } else {
+        detail_line("tokens", "—".into());
+    }
+
+    out
+}
+
+/// Render one completed entry's single header line. `expandable` adds a clickable
+/// ▸/▾ marker (issue #5) — ▾ when `expanded`, ▸ when collapsed; notes pass
+/// `expandable=false` and get a blank marker slot so columns stay aligned.
+fn completed_line(entry: &Completed, expandable: bool, expanded: bool) -> Line<'static> {
+    // Marker column: ▾ expanded, ▸ collapsed-but-expandable, space otherwise.
+    // Kept a fixed 1-char glyph + space so the timestamp column never shifts.
+    let marker = if !expandable {
+        Span::raw("  ")
+    } else if expanded {
+        Span::styled("▾ ", Style::new().fg(Color::Cyan))
+    } else {
+        Span::styled("▸ ", dim())
+    };
+    let stamp = Span::styled(format!(" {}  ", format::clock_hms_utc(entry.at)), dim());
     match &entry.body {
         CompletedBody::Request {
             method,
@@ -1439,7 +1761,7 @@ fn completed_line(entry: &Completed) -> Line<'static> {
                     detail.push_str(&format!(", {}", format_cost(cost)));
                 }
             }
-            let mut spans = vec![stamp, Span::raw(format!("{method} {path}"))];
+            let mut spans = vec![marker, stamp, Span::raw(format!("{method} {path}"))];
             // [group model·effort] badge, when known (req7).
             if let Some(meta) = activity_meta(group.as_deref(), model.as_deref(), effort.as_deref())
             {
@@ -1457,7 +1779,7 @@ fn completed_line(entry: &Completed) -> Line<'static> {
             } else {
                 Style::new()
             };
-            Line::from(vec![stamp, Span::styled(text.clone(), style)])
+            Line::from(vec![marker, stamp, Span::styled(text.clone(), style)])
         }
     }
 }
@@ -2208,6 +2530,7 @@ mod tests {
             status_line: None,
             activity_scroll: 0,
             model_cursor: 0,
+            expanded: None,
             add_input_len: 0,
             attach: None,
         }
@@ -2382,5 +2705,165 @@ mod tests {
             !text.contains("claude-opus-4-8"),
             "model label is abbreviated, not the raw claude- id (2b)"
         );
+    }
+
+    // --- issue #5: native mouse + click-to-expand activity rows -------------
+
+    use super::super::activity::{Completed, CompletedBody};
+
+    /// A completed request entry stamped at `at_secs` (so its `ExpandKey.at_ms`
+    /// is deterministic). `account` distinguishes rows for the assertions.
+    fn completed_request(at_secs: u64, account: &str, status: u16) -> Completed {
+        Completed {
+            at: std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(at_secs),
+            body: CompletedBody::Request {
+                method: "POST".into(),
+                path: "/v1/messages".into(),
+                account: Some(account.into()),
+                status,
+                duration: Duration::from_millis(1_400),
+                tokens: Some(super::super::TokenCounts {
+                    input: 1_000,
+                    output: 200,
+                    ..Default::default()
+                }),
+                group: Some("codex".into()),
+                model: Some("gpt-5.5".into()),
+                effort: Some("high".into()),
+            },
+        }
+    }
+
+    fn completed_note(at_secs: u64, text: &str) -> Completed {
+        Completed {
+            at: std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(at_secs),
+            body: CompletedBody::Note {
+                text: text.into(),
+                error: false,
+            },
+        }
+    }
+
+    /// The activity panel rect for a typical MAIN frame (no in-flight, no model
+    /// strip). 8-tall so the activity Min(3) slot lands at a known y.
+    fn activity_area() -> Rect {
+        let view = view_with(Vec::new());
+        main_activity_area(Rect::new(0, 0, 120, 24), &view)
+    }
+
+    #[test]
+    fn hit_test_maps_screen_row_to_the_clicked_completed_entry() {
+        // Three completed requests, newest first. The panel content begins one
+        // row below the top border, one row per (collapsed) entry.
+        let mut view = view_with(Vec::new());
+        view.completed = vec![
+            completed_request(30, "a", 200),
+            completed_request(20, "b", 200),
+            completed_request(10, "c", 500),
+        ];
+        let area = activity_area();
+        let layout = activity_layout(area, &view, None, 0);
+
+        // First content row → the newest entry ("a"); the third → "c".
+        let y0 = area.y + 1;
+        let hit0 = layout.hit(area.x + 2, y0).expect("row 0 hits an entry");
+        assert_eq!(hit0, ExpandKey::for_completed(&view.completed[0]).unwrap());
+        let hit2 = layout.hit(area.x + 2, y0 + 2).expect("row 2 hits an entry");
+        assert_eq!(hit2, ExpandKey::for_completed(&view.completed[2]).unwrap());
+        // Distinct entries → distinct keys.
+        assert_ne!(hit0, hit2);
+    }
+
+    #[test]
+    fn hit_test_misses_outside_the_rect_and_on_notes() {
+        let mut view = view_with(Vec::new());
+        view.completed = vec![
+            completed_note(20, "switch a → b"),
+            completed_request(10, "a", 200),
+        ];
+        let area = activity_area();
+        let layout = activity_layout(area, &view, None, 0);
+        let y0 = area.y + 1;
+
+        // The note row (row 0) is not expandable → miss.
+        assert_eq!(layout.hit(area.x + 2, y0), None, "notes are not expandable");
+        // Above the rect and below the last row → miss.
+        assert_eq!(
+            layout.hit(area.x + 2, area.y),
+            None,
+            "border/above is a miss"
+        );
+        assert_eq!(
+            layout.hit(area.x + 2, area.bottom() + 5),
+            None,
+            "below the rect is a miss"
+        );
+        // At/beyond the right edge → miss (the rect is half-open on the right).
+        assert_eq!(
+            layout.hit(area.right(), y0 + 1),
+            None,
+            "right edge is outside the rect"
+        );
+    }
+
+    #[test]
+    fn expanding_an_entry_inserts_detail_rows_and_shifts_later_rows_down() {
+        let mut view = view_with(Vec::new());
+        view.completed = vec![
+            completed_request(30, "a", 200),
+            completed_request(20, "b", 200),
+        ];
+        let area = activity_area();
+
+        // Collapsed: each entry is one row tall, back to back.
+        let collapsed = activity_layout(area, &view, None, 0);
+        assert_eq!(collapsed.rows[0].height, 1);
+        assert_eq!(collapsed.rows[1].height, 1);
+        assert_eq!(collapsed.rows[1].y_start, collapsed.rows[0].y_start + 1);
+
+        // Expand the first entry: its row grows by the detail lines, and the
+        // second entry's row starts *below* the expanded block — the click→entry
+        // map stays correct as rows move (stable identity, not index).
+        let key = ExpandKey::for_completed(&view.completed[0]).unwrap();
+        let expanded = activity_layout(area, &view, Some(&key), 0);
+        assert!(
+            expanded.rows[0].height > 1,
+            "expanded row carries detail lines"
+        );
+        assert_eq!(
+            expanded.rows[1].y_start,
+            expanded.rows[0].y_start + expanded.rows[0].height,
+            "the next entry shifts down by the expanded block height"
+        );
+        // Clicking the second entry's NEW position still resolves to entry b.
+        let hit = expanded
+            .hit(area.x + 2, expanded.rows[1].y_start)
+            .expect("second entry hittable at its shifted row");
+        assert_eq!(hit, ExpandKey::for_completed(&view.completed[1]).unwrap());
+    }
+
+    #[test]
+    fn expanded_row_renders_detail_with_tokens_and_cost() {
+        let mut view = view_with(Vec::new());
+        view.completed = vec![completed_request(10, "acct-x", 200)];
+        let key = ExpandKey::for_completed(&view.completed[0]).unwrap();
+        let mut chrome = chrome_overlay(Overlay::None);
+        chrome.expanded = Some(key);
+        // Tall enough that the activity panel has room for the detail lines.
+        let text = render(&view, &chrome, 120, 36);
+        assert!(text.contains("acct-x"), "detail names the account");
+        assert!(text.contains("tokens"), "detail shows the token breakdown");
+        assert!(text.contains("cost"), "detail shows the cost breakdown");
+        // gpt-5.5 output 200 tok @ $30/1e6 ⇒ a $ figure is present.
+        assert!(text.contains('$'), "cost is rendered as USD");
+        assert!(text.contains('▾'), "expanded row carries the open marker");
+    }
+
+    #[test]
+    fn collapsed_request_rows_show_the_expand_marker() {
+        let mut view = view_with(Vec::new());
+        view.completed = vec![completed_request(10, "a", 200)];
+        let text = render(&view, &chrome_overlay(Overlay::None), 120, 24);
+        assert!(text.contains('▸'), "collapsed request row shows ▸");
     }
 }
