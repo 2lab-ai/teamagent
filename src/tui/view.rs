@@ -190,6 +190,10 @@ impl DashboardView {
                     group,
                     model,
                     effort,
+                    // Per-request cost is carried in the doc for downstream
+                    // consumers (server.log, JSON); the in-process view-model
+                    // does not surface it — ui.rs reads the doc field directly.
+                    cost_usd: _,
                 } => Completed {
                     at: ms_time(*at_ms),
                     body: CompletedBody::Request {

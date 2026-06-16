@@ -1,7 +1,11 @@
 //! Config schema v1 for `~/.config/llmux.json` (see `.prd/02-architecture.md`).
 //! These structs are the on-disk contract; they are complete and purely declarative.
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
+
+use crate::pricing::ModelPrice;
 
 /// Default proxy listen port (teamclaude-compatible).
 pub const DEFAULT_PORT: u16 = 3456;
@@ -36,6 +40,22 @@ pub struct Config {
     /// overflow behavior). See [`RoutingConfig`].
     #[serde(default)]
     pub routing: RoutingConfig,
+    /// API-equivalent pricing overrides (Feature D). Keyed by the *normalized*
+    /// model slug (display suffixes like `[1m]` are stripped on lookup; match
+    /// is case-insensitive). An entry here wins over the built-in default rate
+    /// table in [`crate::pricing`]; absent/empty (the default) means "use the
+    /// built-in rates". All rates are USD per 1,000,000 tokens. Additive: a
+    /// config written before this field loads with an empty map.
+    #[serde(default)]
+    pub pricing: HashMap<String, ModelPrice>,
+    /// Raw input/output payload capture (Feature B). When `enabled` (the
+    /// default), the proxy appends one JSON line per request — the raw request
+    /// and response bodies — to `$XDG_STATE_HOME/llmux/raw-io.jsonl`, pruned to
+    /// `retention_days`. Best-effort: capture never affects the request path.
+    /// See [`RawIoConfig`]. Additive: a config written before this field loads
+    /// with the defaults (capture on, 90-day retention).
+    #[serde(default)]
+    pub raw_io: RawIoConfig,
     #[serde(default)]
     pub accounts: Vec<AccountConfig>,
 }
@@ -49,7 +69,57 @@ impl Default for Config {
             codex: CodexConfig::default(),
             scheduler: SchedulerConfig::default(),
             routing: RoutingConfig::default(),
+            pricing: HashMap::new(),
+            raw_io: RawIoConfig::default(),
             accounts: Vec::new(),
+        }
+    }
+}
+
+/// Raw input/output payload capture config (Feature B). The proxy keeps a
+/// verbatim record of each proxied request's request body and the response
+/// body delivered to the client, so traffic can be replayed/audited offline.
+///
+/// This is DISTINCT from activity persistence (`activity.jsonl`, per-request
+/// metadata): this store holds the actual payload bytes. Capture is strictly
+/// best-effort — it never blocks, mutates, or slows the bytes forwarded to the
+/// client, and every IO/serialization error is swallowed (see
+/// [`crate::proxy::raw_io`]). All fields are additive (`#[serde(default)]`), so
+/// a config written before this section existed loads with capture ON and a
+/// 90-day window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RawIoConfig {
+    /// Master switch. When `true` (the default), each request appends one
+    /// [`crate::proxy::raw_io::RawIoRecord`] to the raw-io log. When `false`,
+    /// nothing is captured or written.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Days of history to keep. On startup, records older than
+    /// `now - retention_days * 86_400_000 ms` are pruned. `0` = keep forever
+    /// (no pruning). Default `90`.
+    #[serde(default = "default_raw_io_retention_days")]
+    pub retention_days: u64,
+    /// Per-body capture cap, in bytes, applied identically to the request body
+    /// and the response body on BOTH the streaming and non-streaming paths. A
+    /// body over this is clipped on a UTF-8 char boundary with a
+    /// `…[truncated N bytes]` marker. This is the raw-io retention cap and is
+    /// DELIBERATELY decoupled from the debug request-log's 8 KiB
+    /// [`crate::proxy::logging::BODY_LOG_LIMIT`]: the debug log stays a short
+    /// 8 KiB excerpt while raw-io retains the full (bounded) payload — most LLM
+    /// responses stream tens to hundreds of KB, so an 8 KiB raw-io cap would
+    /// lose almost the entire response. Default
+    /// [`crate::proxy::raw_io::RESPONSE_CAP_BYTES`] (8 MiB), generous for a real
+    /// request/response yet bounding the memory a pathological body can pin.
+    #[serde(default = "default_raw_io_max_body_bytes")]
+    pub max_body_bytes: usize,
+}
+
+impl Default for RawIoConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            retention_days: default_raw_io_retention_days(),
+            max_body_bytes: default_raw_io_max_body_bytes(),
         }
     }
 }
@@ -123,6 +193,17 @@ pub struct CodexConfig {
     /// Additive: configs written before this field load with the default.
     #[serde(default = "default_codex_model")]
     pub default_model: String,
+    /// When set, llmux reports THIS model name to the client (Claude Code) in
+    /// the response instead of the real codex model. Claude Code picks its
+    /// context-window denominator by a hardcoded model-name lookup
+    /// (unknown→200k, known 1M models→1,000,000) and offers no per-model
+    /// window override, so set this to a 1M-window model name (e.g.
+    /// `claude-opus-4-8`) to stop Claude Code cutting codex sessions off at
+    /// ~200k. Pair with the `CLAUDE_CODE_AUTO_COMPACT_WINDOW=272000` env var on
+    /// the Claude Code side to make auto-compaction fire at codex's real limit.
+    /// None (default) = report the real codex model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_model: Option<String>,
     /// "Fast" service tier. When `true`, the Responses request carries
     /// `service_tier: "priority"` — the exact wire value the codex CLI sends
     /// for its fast mode (config stores "fast", wire sends "priority"). When
@@ -135,6 +216,12 @@ pub struct CodexConfig {
     /// the model's default. Display + request only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    /// Append a JSON-line trace of every codex request/response to
+    /// `$XDG_STATE_HOME/llmux/codex-trace.jsonl` (input size breakdown +
+    /// terminal outcome + verbatim upstream usage). Best-effort: write errors
+    /// never affect the request. Default `true` while we diagnose token issues.
+    #[serde(default = "default_true")]
+    pub trace: bool,
 }
 
 impl Default for CodexConfig {
@@ -143,8 +230,10 @@ impl Default for CodexConfig {
             upstream: default_codex_upstream(),
             token_url: default_codex_token_url(),
             default_model: default_codex_model(),
+            client_model: None,
             fast: false,
             reasoning_effort: None,
+            trace: true,
         }
     }
 }
@@ -442,6 +531,19 @@ fn default_usage_max_age_secs() -> u64 {
 
 fn default_refresh_ahead_secs() -> u64 {
     7 * 3600
+}
+
+/// Default raw-io retention window: 90 days (per Feature B).
+fn default_raw_io_retention_days() -> u64 {
+    90
+}
+
+/// Default raw-io per-body capture cap: 8 MiB
+/// ([`crate::proxy::raw_io::RESPONSE_CAP_BYTES`]). Kept in sync with that
+/// constant so a config that omits the field caps exactly where the code's
+/// backstop does.
+fn default_raw_io_max_body_bytes() -> usize {
+    crate::proxy::raw_io::RESPONSE_CAP_BYTES
 }
 
 fn default_routing_group() -> String {

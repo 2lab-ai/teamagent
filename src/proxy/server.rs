@@ -25,7 +25,7 @@ use crate::provider::anthropic::AnthropicPassthrough;
 use crate::scheduler::select::SelectParams;
 use crate::scheduler::usage::UsagePoller;
 use crate::scheduler::{AccountId, AccountPool, PoolSnapshot};
-use crate::tui::{ActivityEvent, EVENT_CHANNEL_CAPACITY};
+use crate::tui::{ActivityEvent, ACTIVITY_CHANNEL_CAP};
 
 /// Periodic scheduler re-evaluation (FR3: selection runs on a tick, never
 /// per-request). Public so the TUI can show a next-evaluation countdown.
@@ -110,6 +110,23 @@ pub struct AppState {
     /// Where refreshed tokens are persisted (read-merge-write). `None`
     /// disables persistence (tests).
     pub config_path: Option<PathBuf>,
+    /// Where finished requests are appended + replayed from on startup
+    /// (req-persist A/C: stats survive restart, activity records kept with no
+    /// retention). `None` disables activity persistence (unit tests; or no
+    /// resolvable state dir). Defaults in [`Self::new`] to the state-dir
+    /// `activity.jsonl`; e2e/integration callers override it to a tempdir so a
+    /// driven request never touches the user's real log — same pattern as
+    /// `config_path`.
+    pub activity_log_path: Option<PathBuf>,
+    /// Where raw request/response payloads are appended (Feature B) + pruned to
+    /// `config.raw_io.retention_days` on startup. DISTINCT from
+    /// [`Self::activity_log_path`] (which holds per-request metadata): this holds
+    /// the actual payload bytes. `None` disables capture (unit tests; or no
+    /// resolvable state dir). Defaults in [`Self::new`] to the state-dir
+    /// `raw-io.jsonl`; e2e/integration callers override it to a tempdir so a
+    /// driven request never touches the user's real log — same pattern as
+    /// `activity_log_path`.
+    pub raw_io_path: Option<PathBuf>,
     /// Activity feed emit side. The proxy / poller / refresher `try_send` and
     /// drop on full — best-effort observability, never backpressure (see
     /// `tui::event`). The matching receiver is folded into [`Self::hub`] by
@@ -151,7 +168,7 @@ impl AppState {
         logger: Option<Arc<RequestLogger>>,
         logs_rx: Option<tokio::sync::mpsc::Receiver<LogLine>>,
     ) -> Result<Self, ProxyError> {
-        let (events_tx, events_rx) = tokio::sync::mpsc::channel(EVENT_CHANNEL_CAPACITY);
+        let (events_tx, events_rx) = tokio::sync::mpsc::channel(ACTIVITY_CHANNEL_CAP);
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .redirect(reqwest::redirect::Policy::none())
@@ -190,6 +207,8 @@ impl AppState {
             refresher: Arc::new(refresher),
             totals: Arc::new(UsageTotals::default()),
             config_path: crate::config::config_path().ok(),
+            activity_log_path: crate::cli::daemon::activity_log_path(),
+            raw_io_path: crate::cli::daemon::raw_io_path(),
             bound_port: Arc::new(AtomicU16::new(config.proxy.port)),
             config,
             events: Some(events_tx),
@@ -206,9 +225,14 @@ impl AppState {
         SelectParams::from(&self.config.scheduler)
     }
 
-    /// Next activity-event correlation id (never leaves this process).
+    /// Next activity-event correlation id (never leaves this process). 1-based
+    /// to match [`RequestLogger::next_request_id`]: the first request is id 1,
+    /// so the codex trace, the request log, and the dashboard feed all show the
+    /// same ascending ids. A bare `fetch_add` would return 0 for the first
+    /// request, which then surfaced as `"id":0` on every trace line in a
+    /// single-request session.
     pub fn next_request_id(&self) -> u64 {
-        self.request_counter.fetch_add(1, Ordering::Relaxed)
+        self.request_counter.fetch_add(1, Ordering::Relaxed) + 1
     }
 
     /// Emit an activity event: `try_send`, dropped on a full channel.
@@ -365,6 +389,29 @@ pub async fn serve(
     ready: Option<tokio::sync::oneshot::Sender<SocketAddr>>,
 ) -> Result<(), ProxyError> {
     let params = state.select_params();
+
+    // Arm activity persistence + resume cumulative model/account stats from the
+    // persisted log (req-persist A/C). Done once here — the single production
+    // serve chokepoint — before the fold task starts appending new finished
+    // requests, so a restarted daemon continues the totals instead of resetting
+    // them. The path comes from `state` (state dir for a real daemon, a tempdir
+    // for e2e), so this never touches the user's real log under test.
+    // Best-effort: a missing log leaves an empty hub; `None` disables it.
+    state.hub.arm_persistence(state.activity_log_path.clone());
+
+    // Prune the raw-io payload log (Feature B) to its retention window, once at
+    // startup, alongside activity persistence. Guarded by config: `enabled =
+    // false` skips it, `retention_days = 0` keeps everything (prune is a no-op).
+    // Best-effort and total — a missing/corrupt log never fails startup (see
+    // `proxy::raw_io::prune`). The path is `None` under unit/e2e callers with no
+    // state dir, which is itself a no-op.
+    if state.config.raw_io.enabled {
+        crate::proxy::raw_io::prune(
+            state.raw_io_path.as_deref(),
+            state.config.raw_io.retention_days,
+            crate::proxy::raw_io::now_ms(),
+        );
+    }
 
     // Dashboard fold: the single consumer of the activity-event channel (and,
     // in TUI mode, the tracing-bridge channel) into the hub. Spawned once —
@@ -1245,6 +1292,22 @@ mod tests {
             seven_day_max: 0.99,
             usage_max_age: Duration::from_secs(600),
         }
+    }
+
+    #[test]
+    fn next_request_id_is_one_based_and_ascending() {
+        let config = Config {
+            accounts: vec![oauth_account("a")],
+            ..Default::default()
+        };
+        let pool = AccountPool::new(&config.accounts);
+        let state = AppState::new(config, pool, None, None).expect("state");
+        // The first request must be id 1, not 0: the codex trace, the request
+        // log, and the dashboard feed all key off this id, and a 0 surfaced as
+        // `"id":0` on every trace line in a single-request session.
+        assert_eq!(state.next_request_id(), 1, "first activity id is 1, not 0");
+        assert_eq!(state.next_request_id(), 2);
+        assert_eq!(state.next_request_id(), 3);
     }
 
     #[test]

@@ -247,6 +247,35 @@ pub fn server_log_path() -> Result<PathBuf, CliError> {
     Ok(dir.join("server.log"))
 }
 
+/// Codex request/response trace: `$XDG_STATE_HOME/llmux/codex-trace.jsonl`,
+/// resolved the same way as [`server_log_path`] (state, not config). One JSON
+/// line per codex request when `codex.trace` is enabled. `None` when no state
+/// directory can be determined — the trace is best-effort and simply skipped.
+pub fn codex_trace_path() -> Option<PathBuf> {
+    Some(state_dir()?.join("codex-trace.jsonl"))
+}
+
+/// Activity persistence log: `$XDG_STATE_HOME/llmux/activity.jsonl`, resolved
+/// the same way as [`codex_trace_path`] (state, not config). One JSON line per
+/// finished request, append-only with no retention limit; replayed on startup
+/// to rebuild the cumulative model/account aggregates and seed the activity
+/// ring. `None` when no state directory can be determined — persistence is
+/// best-effort and simply skipped.
+pub fn activity_log_path() -> Option<PathBuf> {
+    Some(state_dir()?.join("activity.jsonl"))
+}
+
+/// Raw input/output payload log: `$XDG_STATE_HOME/llmux/raw-io.jsonl`, resolved
+/// the same way as [`activity_log_path`] (state, not config). One JSON line per
+/// request — the raw request and response bodies (Feature B) — appended when
+/// `raw_io.enabled` is set, pruned to `raw_io.retention_days` on startup.
+/// DISTINCT from [`activity_log_path`], which holds per-request metadata only.
+/// `None` when no state directory can be determined — capture is best-effort
+/// and simply skipped.
+pub fn raw_io_path() -> Option<PathBuf> {
+    Some(state_dir()?.join("raw-io.jsonl"))
+}
+
 /// `$XDG_STATE_HOME/llmux` when set and non-empty, else
 /// `~/.local/state/llmux`.
 fn state_dir() -> Option<PathBuf> {

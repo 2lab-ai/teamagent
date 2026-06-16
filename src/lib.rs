@@ -9,6 +9,7 @@ pub mod config;
 pub mod dashboard;
 pub mod demo;
 pub mod logging;
+pub mod pricing;
 pub mod provider;
 pub mod proxy;
 pub mod routing;

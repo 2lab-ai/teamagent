@@ -116,6 +116,14 @@ impl Proxy {
         // Persist refreshed tokens into the tempdir config, never the real
         // user config (AppState::new defaulted to the env-resolved path).
         state.config_path = Some(config_path.clone());
+        // Likewise pin the activity-persistence log into the tempdir so a
+        // driven request never reads or appends to the user's real
+        // ~/.local/state/llmux/activity.jsonl (req-persist isolation).
+        state.activity_log_path = Some(tmp.path().join("activity.jsonl"));
+        // Pin the raw-io payload log into the tempdir too (Feature B): `serve`
+        // prunes it on startup and driven requests append to it — neither must
+        // touch the user's real ~/.local/state/llmux/raw-io.jsonl.
+        state.raw_io_path = Some(tmp.path().join("raw-io.jsonl"));
 
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(serve(state, Some(ready_tx)));

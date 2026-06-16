@@ -227,6 +227,48 @@ impl ForwardContext {
         }
     }
 
+    /// The raw-io capture target for this request, or `None` when capture is
+    /// disabled (`config.raw_io.enabled == false`) or no state dir resolved
+    /// (`state.raw_io_path == None`). When `None`, [`capture_raw_io`] is a no-op
+    /// and no record is built — so capture is genuinely off the hot path.
+    fn raw_io_path<'a>(&self, state: &'a AppState) -> Option<&'a std::path::Path> {
+        if state.config.raw_io.enabled {
+            state.raw_io_path.as_deref()
+        } else {
+            None
+        }
+    }
+
+    /// Best-effort raw payload capture (Feature B) for the NON-streaming /
+    /// buffered terminal points (codex aggregate, codex error, the JSON relay
+    /// path). The streaming relays capture inside their `finish` closures with
+    /// the teed bytes instead, because `ctx` is moved into the closure there.
+    /// `response` is the body delivered to the client (or the error body). A
+    /// `None` path makes this a complete no-op.
+    fn capture_raw_io(
+        &self,
+        state: &AppState,
+        account: Option<&AccountId>,
+        status: StatusCode,
+        response: &[u8],
+    ) {
+        let Some(path) = self.raw_io_path(state) else {
+            return;
+        };
+        let (group, model, _effort) = self.finished_meta(state);
+        crate::proxy::raw_io::capture(
+            Some(path),
+            self.activity_id,
+            group,
+            model,
+            account.map(|a| a.0.clone()),
+            Some(status.as_u16()),
+            &self.body,
+            response,
+            state.config.raw_io.max_body_bytes,
+        );
+    }
+
     /// Emit the terminal activity event for this request.
     fn emit_finished(
         &self,
@@ -1199,39 +1241,76 @@ async fn relay(
         let path = ctx.path_query.clone();
         let started = ctx.started;
         let (group, model, effort) = ctx.finished_meta(state);
-        sse::passthrough_body(response, BODY_LOG_LIMIT, move |usage, captured, error| {
-            totals.record(&account, 1, usage.input_tokens, usage.output_tokens);
-            if log_enabled {
-                sections.push(format!(
-                    "=== RESPONSE BODY (streamed, first {} bytes) ===\n{}",
-                    captured.len(),
-                    String::from_utf8_lossy(&captured)
-                ));
-                if let Some(error) = error {
-                    sections.push(format!("=== ERROR ===\nstream aborted: {error}"));
+        // Raw-io capture (Feature B) for the Claude SSE passthrough: the request
+        // body + a tee of the bytes streamed to the client. The relay keeps TWO
+        // observe-only buffers, both filled AFTER each chunk is forwarded (never
+        // blocks/mutates/slows the client stream): `captured` (8 KiB
+        // `BODY_LOG_LIMIT`, the debug log excerpt) and `raw_captured` (capped at
+        // the configurable `max_body_bytes`, the FULL raw-io payload — decoupled
+        // from the 8 KiB debug cap). Owned here so the closure stays `'static`;
+        // `None` path when capture is disabled.
+        let raw_io_path = ctx.raw_io_path(state).map(std::path::Path::to_path_buf);
+        let raw_io_request = raw_io_path
+            .as_ref()
+            .map(|_| ctx.body.clone())
+            .unwrap_or_default();
+        let raw_io_group = group.clone();
+        let raw_io_model = model.clone();
+        let raw_io_max_body = state.config.raw_io.max_body_bytes;
+        sse::passthrough_body(
+            response,
+            BODY_LOG_LIMIT,
+            raw_io_max_body,
+            move |usage, captured, raw_captured, error| {
+                totals.record(&account, 1, usage.input_tokens, usage.output_tokens);
+                // Best-effort: write the raw record from the FULL raw-io tee
+                // (whatever was captured, even on a mid-stream disconnect/error).
+                // `raw_captured` carries the bounded prefix + the total streamed
+                // length, so an over-cap body is marker-truncated accurately.
+                crate::proxy::raw_io::capture_streamed(
+                    raw_io_path.as_deref(),
+                    activity_id,
+                    raw_io_group,
+                    raw_io_model,
+                    Some(account.0.clone()),
+                    Some(status.as_u16()),
+                    &raw_io_request,
+                    raw_captured.bytes(),
+                    raw_captured.total(),
+                    raw_io_max_body,
+                );
+                if log_enabled {
+                    sections.push(format!(
+                        "=== RESPONSE BODY (streamed, first {} bytes) ===\n{}",
+                        captured.len(),
+                        String::from_utf8_lossy(&captured)
+                    ));
+                    if let Some(error) = error {
+                        sections.push(format!("=== ERROR ===\nstream aborted: {error}"));
+                    }
+                    if let Some(logger) = logger {
+                        logger.write(request_id, sections);
+                    }
                 }
-                if let Some(logger) = logger {
-                    logger.write(request_id, sections);
+                if let Some(events) = events {
+                    let _ = events.try_send(ActivityEvent::RequestFinished {
+                        id: activity_id,
+                        method,
+                        path,
+                        account: Some(account.0.clone()),
+                        status: status.as_u16(),
+                        duration: started.elapsed(),
+                        tokens: Some(token_counts(usage)),
+                        group,
+                        model,
+                        effort,
+                    });
                 }
-            }
-            if let Some(events) = events {
-                let _ = events.try_send(ActivityEvent::RequestFinished {
-                    id: activity_id,
-                    method,
-                    path,
-                    account: Some(account.0.clone()),
-                    status: status.as_u16(),
-                    duration: started.elapsed(),
-                    tokens: Some(token_counts(usage)),
-                    group,
-                    model,
-                    effort,
-                });
-            }
-            // The lease (and its in-flight pin) lives exactly as long as
-            // the stream: dropped here, when the relay finishes.
-            drop(lease);
-        })
+                // The lease (and its in-flight pin) lives exactly as long as
+                // the stream: dropped here, when the relay finishes.
+                drop(lease);
+            },
+        )
     } else {
         let bytes = match response.bytes().await {
             Ok(bytes) => bytes,
@@ -1254,6 +1333,9 @@ async fn relay(
             body_excerpt(&bytes)
         ));
         ctx.flush_log(state);
+        // Raw-io capture (Feature B): the full non-streaming body, already
+        // materialized to relay it — no extra read, no hot-path effect.
+        ctx.capture_raw_io(state, Some(&account), status, &bytes);
         ctx.emit_finished(state, Some(&account), status, Some(token_counts(usage)));
         drop(lease);
         axum::body::Body::from(bytes)
@@ -1268,6 +1350,11 @@ async fn relay(
 /// `/v1/messages/count_tokens` on a codex account: no upstream equivalent —
 /// answer locally with a naive chars/4 estimate (good enough for Claude
 /// Code's context-window bookkeeping, and strictly better than an error).
+///
+/// Deliberately NOT codex-traced: it makes no upstream call, so there is no
+/// "hung vs completed" question and no real upstream usage to record — the
+/// trace exists to diagnose the `/v1/messages` relay path. Tracing it would
+/// only add instant, usage-less noise to the file.
 fn codex_count_tokens_response(
     state: &AppState,
     ctx: &mut ForwardContext,
@@ -1310,6 +1397,16 @@ async fn relay_codex(
     client_stream: bool,
 ) -> Response {
     let status = response.status();
+    // Codex trace (best-effort): input breakdown captured now from the inbound
+    // body, terminal outcome written at each return below. `model` is what the
+    // request is served as (codex's configured model).
+    let trace = crate::proxy::codex_trace::CodexTrace::from_request(
+        state.config.codex.trace,
+        ctx.activity_id,
+        &ctx.path_query,
+        Some(state.codex.model()),
+        &ctx.body,
+    );
     ctx.log(format!(
         "=== RESPONSE {status} (codex) ===\n{}",
         format_headers(response.headers())
@@ -1329,6 +1426,13 @@ async fn relay_codex(
         } else {
             (status, "api_error")
         };
+        trace.write_error(
+            &format!("codex upstream {out_status}: {}", body_excerpt(&bytes)),
+            0,
+            ctx.started.elapsed().as_millis(),
+        );
+        // Raw-io capture: request + the upstream error body (already read).
+        ctx.capture_raw_io(state, Some(&account), out_status, &bytes);
         ctx.emit_finished(state, Some(&account), out_status, None);
         drop(lease);
         return error_response(
@@ -1354,12 +1458,60 @@ async fn relay_codex(
         let path = ctx.path_query.clone();
         let started = ctx.started;
         let (group, model, effort) = ctx.finished_meta(state);
+        // Raw-io capture (Feature B) for the codex streaming path: the request
+        // body + a tee of the Anthropic-SSE bytes EMITTED to the client. The
+        // relay keeps TWO observe-only buffers, both filled after each chunk is
+        // forwarded (never blocks/mutates/slows the client stream): `captured`
+        // (8 KiB `BODY_LOG_LIMIT`, debug log excerpt) and `raw_captured`
+        // (`max_body_bytes`, the FULL raw-io payload — decoupled from the 8 KiB
+        // debug cap). Owned for the `'static` closure; `None` when disabled.
+        let raw_io_path = ctx.raw_io_path(state).map(std::path::Path::to_path_buf);
+        let raw_io_request = raw_io_path
+            .as_ref()
+            .map(|_| ctx.body.clone())
+            .unwrap_or_default();
+        let raw_io_group = group.clone();
+        let raw_io_model = model.clone();
+        let raw_io_max_body = state.config.raw_io.max_body_bytes;
         let body = sse::transform_body(
             response,
             converter,
             BODY_LOG_LIMIT,
-            move |usage, captured, error| {
+            raw_io_max_body,
+            move |usage, captured, raw_captured, error, converter, client_gone| {
                 totals.record(&account, 1, usage.input_tokens, usage.output_tokens);
+                // Raw-io capture: request + the FULL emitted-SSE tee (best-effort;
+                // on a client disconnect we still record whatever was delivered).
+                // `raw_captured` carries the bounded prefix + the total emitted
+                // length, so an over-cap body is marker-truncated accurately.
+                crate::proxy::raw_io::capture_streamed(
+                    raw_io_path.as_deref(),
+                    activity_id,
+                    raw_io_group,
+                    raw_io_model,
+                    Some(account.0.clone()),
+                    Some(StatusCode::OK.as_u16()),
+                    &raw_io_request,
+                    raw_captured.bytes(),
+                    raw_captured.total(),
+                    raw_io_max_body,
+                );
+                // Codex trace: terminal outcome of the streamed request. A
+                // client disconnect mid-stream, an upstream stream error, or a
+                // clean completion are distinct outcomes for diagnosis.
+                let duration_ms = started.elapsed().as_millis();
+                let upstream_events = converter.events_seen();
+                if client_gone {
+                    trace.write_client_disconnect(upstream_events, duration_ms);
+                } else if let Some(error) = &error {
+                    trace.write_error(
+                        &format!("stream aborted: {error}"),
+                        upstream_events,
+                        duration_ms,
+                    );
+                } else {
+                    trace.write_completed(converter.raw_usage(), upstream_events, duration_ms);
+                }
                 if log_enabled {
                     sections.push(format!(
                         "=== RESPONSE BODY (codex→anthropic, first {} bytes) ===\n{}",
@@ -1419,6 +1571,11 @@ async fn relay_codex(
                 // Nothing was sent to the client yet — transient.
                 ctx.log(format!("=== ERROR ===\ncodex stream read failed: {err}"));
                 ctx.flush_log(state);
+                trace.write_error(
+                    &format!("codex upstream stream failed: {err}"),
+                    converter.events_seen(),
+                    ctx.started.elapsed().as_millis(),
+                );
                 ctx.emit_finished(state, Some(&account), StatusCode::BAD_GATEWAY, None);
                 drop(lease);
                 return transient_response(&format!("codex upstream stream failed: {err}"));
@@ -1433,19 +1590,37 @@ async fn relay_codex(
     state
         .totals
         .record(&account, 1, usage.input_tokens, usage.output_tokens);
+    // Capture converter-level trace detail BEFORE into_message_json consumes it.
+    let trace_raw_usage = converter.raw_usage().cloned();
+    let trace_events_seen = converter.events_seen();
+    let trace_duration_ms = ctx.started.elapsed().as_millis();
     let error_message = converter.error_message().map(str::to_string);
     let result = match converter.into_message_json() {
         Some(message) => {
             ctx.log(format!(
                 "=== RESPONSE BODY (codex aggregate) ===\n{message}"
             ));
+            trace.write_completed(
+                trace_raw_usage.as_ref(),
+                trace_events_seen,
+                trace_duration_ms,
+            );
+            // Raw-io capture: request + the aggregated Messages JSON the client
+            // receives.
+            let message_bytes = message.to_string();
+            ctx.capture_raw_io(
+                state,
+                Some(&account),
+                StatusCode::OK,
+                message_bytes.as_bytes(),
+            );
             ctx.emit_finished(
                 state,
                 Some(&account),
                 StatusCode::OK,
                 Some(token_counts(usage)),
             );
-            let mut out = Response::new(axum::body::Body::from(message.to_string()));
+            let mut out = Response::new(axum::body::Body::from(message_bytes));
             out.headers_mut().insert(
                 header::CONTENT_TYPE,
                 HeaderValue::from_static("application/json"),
@@ -1456,6 +1631,7 @@ async fn relay_codex(
             let message =
                 error_message.unwrap_or_else(|| "codex upstream produced no response".into());
             ctx.log(format!("=== ERROR ===\n{message}"));
+            trace.write_error(&message, trace_events_seen, trace_duration_ms);
             ctx.emit_finished(state, Some(&account), StatusCode::BAD_GATEWAY, None);
             error_response(StatusCode::BAD_GATEWAY, "api_error", &message)
         }
@@ -1690,6 +1866,12 @@ mod tests {
         OkSse {
             body: &'static str,
         },
+        /// 200 `text/event-stream` with a runtime-built (owned) body — used for
+        /// large bodies that can't be a `&'static str` const (e.g. ~50 KiB of
+        /// SSE for the raw-io full-capture test).
+        OkSseOwned {
+            body: String,
+        },
         Rate {
             retry_after: Option<u64>,
         },
@@ -1757,6 +1939,11 @@ mod tests {
                 .body(axum::body::Body::from(body))
                 .expect("response"),
             Scripted::OkSse { body } => http::Response::builder()
+                .status(200)
+                .header("content-type", "text/event-stream")
+                .body(axum::body::Body::from(body))
+                .expect("response"),
+            Scripted::OkSseOwned { body } => http::Response::builder()
                 .status(200)
                 .header("content-type", "text/event-stream")
                 .body(axum::body::Body::from(body))
@@ -1846,6 +2033,11 @@ mod tests {
         let pool = AccountPool::new(&config.accounts);
         let mut state = AppState::new(config, pool, None, None).expect("state");
         state.config_path = None; // never touch the real user config in tests
+                                  // Never touch the user's real persistence logs in tests (same isolation
+                                  // discipline as `config_path`): a driven request must not append to the
+                                  // real activity / raw-io files under `~/.local/state/llmux`.
+        state.activity_log_path = None;
+        state.raw_io_path = None;
         state
             .pool
             .evaluate(None, &state.select_params(), SystemTime::now());
@@ -1904,6 +2096,285 @@ mod tests {
         assert_eq!(totals.requests, 1);
         assert_eq!(totals.input_tokens, 7);
         assert_eq!(totals.output_tokens, 3);
+    }
+
+    #[tokio::test]
+    async fn raw_io_capture_records_payloads_without_changing_the_client_body() {
+        // Feature B: with capture armed into a tempdir, the body delivered to
+        // the client must be byte-identical (capture is observe-only), AND a
+        // RawIoRecord carrying the request + response bodies must be written.
+        let shared = MockShared::default();
+        shared.script.lock().expect("lock").push_back(Scripted::Ok {
+            body: r#"{"id":"msg_1","usage":{"input_tokens":7,"output_tokens":3}}"#,
+        });
+        let upstream = spawn_mock(shared.clone()).await;
+        let mut state = test_state(&upstream, vec![oauth_account("a", "at-a")]);
+        let dir = std::env::temp_dir().join(format!(
+            "llmux-rawio-fwd-{}-{}",
+            std::process::id(),
+            ulid::Ulid::new()
+        ));
+        std::fs::create_dir_all(&dir).expect("tmp dir");
+        let raw_path = dir.join("raw-io.jsonl");
+        state.raw_io_path = Some(raw_path.clone());
+        assert!(state.config.raw_io.enabled, "capture on by default");
+
+        let response = forward(&state, client_request(r#"{"model":"m","x":"req"}"#)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_body(response).await;
+        assert_eq!(
+            body, br#"{"id":"msg_1","usage":{"input_tokens":7,"output_tokens":3}}"#,
+            "client body must be byte-identical — capture must not mutate it"
+        );
+
+        let contents = std::fs::read_to_string(&raw_path).expect("raw-io written");
+        let record: crate::proxy::raw_io::RawIoRecord =
+            serde_json::from_str(contents.trim()).expect("one parseable record");
+        assert_eq!(record.request_body, r#"{"model":"m","x":"req"}"#);
+        assert_eq!(
+            record.response_body,
+            r#"{"id":"msg_1","usage":{"input_tokens":7,"output_tokens":3}}"#
+        );
+        assert_eq!(record.status, Some(200));
+        assert_eq!(record.account.as_deref(), Some("a"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn raw_io_disabled_writes_nothing() {
+        // enabled = false ⇒ no record, and the request still succeeds.
+        let shared = MockShared::default();
+        shared.script.lock().expect("lock").push_back(Scripted::Ok {
+            body: r#"{"ok":1}"#,
+        });
+        let upstream = spawn_mock(shared.clone()).await;
+        let mut state = test_state(&upstream, vec![oauth_account("a", "at-a")]);
+        let dir = std::env::temp_dir().join(format!(
+            "llmux-rawio-off-{}-{}",
+            std::process::id(),
+            ulid::Ulid::new()
+        ));
+        std::fs::create_dir_all(&dir).expect("tmp dir");
+        let raw_path = dir.join("raw-io.jsonl");
+        state.raw_io_path = Some(raw_path.clone());
+        state.config.raw_io.enabled = false;
+
+        let response = forward(&state, client_request("{}")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            !raw_path.exists(),
+            "disabled capture must not create the log"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn raw_io_captures_sse_passthrough_without_changing_bytes() {
+        // The Claude SSE passthrough path: client receives byte-identical SSE,
+        // and the teed bytes are recorded as the response_body.
+        const SSE_BODY: &str = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":25,\"output_tokens\":1}}}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":42}}\n\n";
+        let shared = MockShared::default();
+        shared
+            .script
+            .lock()
+            .expect("lock")
+            .push_back(Scripted::OkSse { body: SSE_BODY });
+        let upstream = spawn_mock(shared.clone()).await;
+        let mut state = test_state(&upstream, vec![oauth_account("a", "at-a")]);
+        let dir = std::env::temp_dir().join(format!(
+            "llmux-rawio-sse-{}-{}",
+            std::process::id(),
+            ulid::Ulid::new()
+        ));
+        std::fs::create_dir_all(&dir).expect("tmp dir");
+        let raw_path = dir.join("raw-io.jsonl");
+        state.raw_io_path = Some(raw_path.clone());
+
+        let response = forward(&state, client_request(r#"{"stream":true}"#)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_body(response).await;
+        assert_eq!(body, SSE_BODY.as_bytes(), "SSE passthrough byte-identical");
+
+        // The record is flushed in the finish closure after the stream ends.
+        let mut contents = String::new();
+        for _ in 0..50 {
+            if let Ok(c) = std::fs::read_to_string(&raw_path) {
+                if !c.trim().is_empty() {
+                    contents = c;
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let record: crate::proxy::raw_io::RawIoRecord =
+            serde_json::from_str(contents.trim()).expect("one parseable record");
+        assert_eq!(record.request_body, r#"{"stream":true}"#);
+        assert!(
+            record.response_body.contains("message_start")
+                && record.response_body.contains("message_delta"),
+            "teed SSE bytes captured as response_body, got: {}",
+            record.response_body
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Build a streamed SSE body of roughly `target_bytes` total: a
+    /// `message_start`, one fat `content_block_delta` whose text payload pads the
+    /// body out past `target_bytes`, then a `message_delta`. The middle padding
+    /// is a marker run we can assert survived capture in full.
+    fn big_sse_body(target_bytes: usize, marker: char) -> String {
+        let start = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":25,\"output_tokens\":1}}}\n\n";
+        let delta = "event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":42}}\n\n";
+        let pad = marker.to_string().repeat(target_bytes);
+        let block = format!(
+            "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"delta\":{{\"type\":\"text_delta\",\"text\":\"{pad}\"}}}}\n\n"
+        );
+        format!("{start}{block}{delta}")
+    }
+
+    #[tokio::test]
+    async fn raw_io_captures_full_streamed_response_beyond_8kib_debug_limit() {
+        // The decoupling proof (Feature B): a streamed response LARGER than the
+        // 8 KiB debug BODY_LOG_LIMIT but under max_body_bytes is captured IN FULL
+        // — not truncated at 8 KiB. We tee ~50 KiB of SSE and assert the
+        // recorded response_body holds every streamed byte, while the client
+        // still receives a byte-identical stream.
+        let sse_body = big_sse_body(50_000, 'Q');
+        assert!(
+            sse_body.len() > BODY_LOG_LIMIT,
+            "test body must exceed the 8 KiB debug cap to be meaningful (got {})",
+            sse_body.len()
+        );
+        let shared = MockShared::default();
+        shared
+            .script
+            .lock()
+            .expect("lock")
+            .push_back(Scripted::OkSseOwned {
+                body: sse_body.clone(),
+            });
+        let upstream = spawn_mock(shared.clone()).await;
+        let mut state = test_state(&upstream, vec![oauth_account("a", "at-a")]);
+        // Default max_body_bytes (8 MiB) easily holds the ~50 KiB body.
+        assert_eq!(
+            state.config.raw_io.max_body_bytes,
+            crate::proxy::raw_io::RESPONSE_CAP_BYTES
+        );
+        let dir = std::env::temp_dir().join(format!(
+            "llmux-rawio-full-{}-{}",
+            std::process::id(),
+            ulid::Ulid::new()
+        ));
+        std::fs::create_dir_all(&dir).expect("tmp dir");
+        let raw_path = dir.join("raw-io.jsonl");
+        state.raw_io_path = Some(raw_path.clone());
+
+        let response = forward(&state, client_request(r#"{"stream":true}"#)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_body(response).await;
+        // Capture must not change what the client receives.
+        assert_eq!(
+            body,
+            sse_body.as_bytes(),
+            "client receives the full streamed body byte-identical"
+        );
+
+        let mut contents = String::new();
+        for _ in 0..100 {
+            if let Ok(c) = std::fs::read_to_string(&raw_path) {
+                if !c.trim().is_empty() {
+                    contents = c;
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let record: crate::proxy::raw_io::RawIoRecord =
+            serde_json::from_str(contents.trim()).expect("one parseable record");
+        // The whole streamed body is retained — NOT clipped at 8 KiB, and no
+        // truncation marker (it is well under the 8 MiB cap).
+        assert!(
+            !record.response_body.contains("…[truncated"),
+            "a ~50 KiB body under the cap is NOT truncated"
+        );
+        assert_eq!(
+            record.response_body.len(),
+            sse_body.len(),
+            "captured response_body holds every streamed byte (full retention, \
+             decoupled from the 8 KiB debug limit)"
+        );
+        assert_eq!(
+            record.response_body, sse_body,
+            "captured bytes are exactly the streamed bytes"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn raw_io_streamed_response_over_cap_is_truncated_with_marker() {
+        // A streamed response OVER max_body_bytes is truncated at the cap with
+        // the marker; the client still receives the full byte-identical stream
+        // (the cap bounds only the stored copy, never the relay).
+        let sse_body = big_sse_body(20_000, 'W');
+        let cap = 4096usize; // well under the body, and under the 8 KiB debug cap
+        let shared = MockShared::default();
+        shared
+            .script
+            .lock()
+            .expect("lock")
+            .push_back(Scripted::OkSseOwned {
+                body: sse_body.clone(),
+            });
+        let upstream = spawn_mock(shared.clone()).await;
+        let mut state = test_state(&upstream, vec![oauth_account("a", "at-a")]);
+        state.config.raw_io.max_body_bytes = cap; // override the cap
+        let dir = std::env::temp_dir().join(format!(
+            "llmux-rawio-cap-{}-{}",
+            std::process::id(),
+            ulid::Ulid::new()
+        ));
+        std::fs::create_dir_all(&dir).expect("tmp dir");
+        let raw_path = dir.join("raw-io.jsonl");
+        state.raw_io_path = Some(raw_path.clone());
+
+        let response = forward(&state, client_request(r#"{"stream":true}"#)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_body(response).await;
+        assert_eq!(
+            body,
+            sse_body.as_bytes(),
+            "client still receives the full body byte-identical despite the cap"
+        );
+
+        let mut contents = String::new();
+        for _ in 0..100 {
+            if let Ok(c) = std::fs::read_to_string(&raw_path) {
+                if !c.trim().is_empty() {
+                    contents = c;
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let record: crate::proxy::raw_io::RawIoRecord =
+            serde_json::from_str(contents.trim()).expect("one parseable record");
+        assert!(
+            record.response_body.contains("…[truncated"),
+            "a body over max_body_bytes is truncated with the marker, got len {}",
+            record.response_body.len()
+        );
+        // The kept prefix (before the marker) is bounded by the override cap.
+        let kept = record
+            .response_body
+            .split("…[truncated")
+            .next()
+            .expect("prefix");
+        assert!(
+            kept.len() <= cap,
+            "kept prefix ({}) is within the override cap ({cap})",
+            kept.len()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
