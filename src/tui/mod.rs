@@ -37,10 +37,18 @@ mod view;
 
 pub use event::{ActivityEvent, TokenCounts};
 
-/// Recommended bound for the proxy→dashboard activity channel (`try_send` +
+/// Bound for the proxy→dashboard activity channel (`try_send` +
 /// drop-on-full on the sender side, so a stalled dashboard never
 /// backpressures the request path).
-pub const EVENT_CHANNEL_CAPACITY: usize = 256;
+///
+/// Activity events are tiny (a few enum fields). The previous bound of 256 was
+/// small enough that a burst of concurrent codex requests could fill it between
+/// dashboard folds, and a *dropped* `RequestFinished` leaks its in-flight row
+/// forever (BUG: zombie 25,000s+ rows while the daemon reports `in_flight=0`).
+/// 4096 removes drops under realistic codex load; the stale-sweep in
+/// [`activity::ActivityLog::prune_stale_in_flight`] is the backstop that
+/// guarantees a dropped finish can never leak.
+pub const ACTIVITY_CHANNEL_CAP: usize = 4096;
 
 use std::time::{Duration, Instant, SystemTime};
 
@@ -619,8 +627,13 @@ impl App {
     fn set_codex(&mut self, new: CodexSettingsDoc) {
         match &mut self.backend {
             Backend::Local(state) => {
+                // Carry the live `client_model` override forward: it is a
+                // config-only opt-in the TUI settings panel doesn't manage, so
+                // a model/fast/effort change here must not silently clear it.
+                let client_model = state.codex.shape().client_model;
                 state.codex.set_shape(crate::provider::codex::CodexShape {
                     model: new.model.clone(),
+                    client_model,
                     fast: new.fast,
                     effort: new.effort.clone(),
                 });

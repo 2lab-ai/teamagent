@@ -9,7 +9,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 pub use schema::{
-    AccountConfig, AccountCredential, CodexConfig, Config, ProxyConfig, RoutingConfig,
+    AccountConfig, AccountCredential, CodexConfig, Config, ProxyConfig, RawIoConfig, RoutingConfig,
     SchedulerConfig, Upsert, DEFAULT_CODEX_TOKEN_URL, DEFAULT_UPSTREAM,
 };
 
@@ -524,6 +524,59 @@ mod tests {
             serde_json::from_str(&serde_json::to_string(&config).expect("serialize"))
                 .expect("re-parse");
         assert_eq!(reparsed.routing, config.routing);
+    }
+
+    #[test]
+    fn raw_io_config_is_additive_with_a_configurable_max_body_bytes() {
+        // A config written before `max_body_bytes` existed (no key, or no
+        // `raw_io` block at all) loads with the 8 MiB default — decoupled from
+        // the 8 KiB debug body-log cap, so full streamed responses are retained.
+        let config: Config =
+            serde_json::from_str(r#"{ "version": 1 }"#).expect("old config parses");
+        assert!(config.raw_io.enabled, "capture defaults on");
+        assert_eq!(config.raw_io.retention_days, 90);
+        assert_eq!(
+            config.raw_io.max_body_bytes,
+            crate::proxy::raw_io::RESPONSE_CAP_BYTES,
+            "max_body_bytes defaults to RESPONSE_CAP_BYTES (8 MiB), not the 8 KiB debug cap"
+        );
+
+        // An explicit max_body_bytes override is respected and round-trips.
+        let raw = r#"{
+            "version": 1,
+            "raw_io": { "enabled": true, "retention_days": 30, "max_body_bytes": 1048576 }
+        }"#;
+        let config: Config = serde_json::from_str(raw).expect("raw_io config parses");
+        assert_eq!(config.raw_io.max_body_bytes, 1_048_576);
+        assert_eq!(config.raw_io.retention_days, 30);
+        let reparsed: Config =
+            serde_json::from_str(&serde_json::to_string(&config).expect("serialize"))
+                .expect("re-parse");
+        assert_eq!(reparsed.raw_io, config.raw_io);
+    }
+
+    #[test]
+    fn pricing_overrides_are_additive_and_parse_per_model() {
+        // A config written before Feature D (no `pricing` key) loads with an
+        // empty override map — the built-in default rate table is used.
+        let config: Config =
+            serde_json::from_str(r#"{ "version": 1 }"#).expect("old config parses");
+        assert!(config.pricing.is_empty());
+
+        // An explicit pricing block round-trips and is keyed by model slug.
+        let raw = r#"{
+            "version": 1,
+            "pricing": {
+                "gpt-5.5": { "input": 9.99, "output": 0.0, "cache_read": 0.0, "cache_creation": 0.0 }
+            }
+        }"#;
+        let config: Config = serde_json::from_str(raw).expect("pricing config parses");
+        let price = config.pricing.get("gpt-5.5").expect("override present");
+        assert_eq!(price.input, 9.99);
+        let reparsed: Config =
+            serde_json::from_str(&serde_json::to_string(&config).expect("serialize"))
+                .expect("re-parse");
+        assert_eq!(reparsed.pricing, config.pricing);
     }
 
     #[test]

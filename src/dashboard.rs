@@ -53,16 +53,27 @@ struct HubState {
     last_switch: Option<LastSwitch>,
     poll_health: HashMap<String, PollHealth>,
     console: LogConsole,
+    /// Where finished requests are appended (req-persist A/C). `None` until the
+    /// daemon arms persistence in [`DashboardHub::load_from_state_dir`]; left
+    /// `None` in unit tests (which build the hub via `default()` and never call
+    /// `serve`), so folding events through the hub never touches the real state
+    /// dir during tests.
+    persist_path: Option<std::path::PathBuf>,
 }
 
 impl Default for DashboardHub {
     fn default() -> Self {
+        // Pure construction — NO filesystem IO. Tests build the hub via
+        // `default()` and must start from an empty log; the persisted-log
+        // replay is an explicit, daemon-only step ([`Self::load_from_state_dir`])
+        // run once at serve startup, never on construction.
         Self {
             inner: Mutex::new(HubState {
                 log: ActivityLog::new(crate::tui::activity::LOG_CAPACITY),
                 last_switch: None,
                 poll_health: HashMap::new(),
                 console: LogConsole::new(crate::tui::logs::LOG_CONSOLE_CAPACITY),
+                persist_path: None,
             }),
         }
     }
@@ -73,6 +84,25 @@ impl DashboardHub {
         self.inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Arm persistence at `path` and resume from it (req-persist A/C): record
+    /// the append target so subsequent `apply_event`s persist finished requests,
+    /// then replay the existing log to resume cumulative model/account stats + a
+    /// seeded activity ring. Replay folds each persisted request through the SAME
+    /// `apply` as the live path, so the restored aggregates are identical (no
+    /// double-counting).
+    ///
+    /// `path` is `state.activity_log_path`: the state-dir `activity.jsonl` for a
+    /// real daemon, a tempdir for e2e, `None` to disable. Best-effort: a missing
+    /// file leaves the log empty; `None` leaves persistence off. Called once
+    /// from `serve` — never from `Default`, so unit tests that build the hub via
+    /// `default()` and fold events stay isolated (their `persist_path` is
+    /// `None`).
+    pub fn arm_persistence(&self, path: Option<std::path::PathBuf>) {
+        let mut state = self.lock();
+        state.log.load_persisted(path.as_deref());
+        state.persist_path = path;
     }
 
     /// Fold one proxy/scheduler event: last-switch + poller-health pane
@@ -110,6 +140,15 @@ impl DashboardHub {
             }
             _ => {}
         }
+        // Persist finished requests before folding (req-persist A/C). Borrow,
+        // not move: `apply` still consumes the event below. The append target
+        // is `None` until the daemon armed persistence in `load_from_state_dir`,
+        // so this is a no-op in unit tests. Best-effort — a persistence failure
+        // must never break the fold (and a non-finished event is a no-op inside
+        // `persist_request`).
+        if let Some(path) = state.persist_path.clone() {
+            crate::tui::activity::persist_request(Some(&path), &event, now);
+        }
         state.log.apply(event, now);
     }
 
@@ -125,7 +164,11 @@ impl DashboardHub {
 
     /// Point-in-time clone of everything the dashboard document needs.
     pub(crate) fn view(&self, now: SystemTime) -> HubView {
-        let state = self.lock();
+        let mut state = self.lock();
+        // Sweep leaked in-flight rows on every read so the dashboard reflects
+        // the daemon's real `in_flight` even when a `RequestFinished` event was
+        // dropped on a full activity channel (BUG: zombie 25,000s+ rows).
+        state.log.prune_stale_in_flight(now);
         HubView {
             last_switch: state.last_switch.clone(),
             poll_health: state.poll_health.clone(),
@@ -230,12 +273,23 @@ fn trace_event(event: &ActivityEvent) {
             model,
             effort,
         } => {
+            // API-equivalent USD cost for this request (Feature D). The fold
+            // task has no config handle, so the log line uses the built-in
+            // default rate table (empty overrides). 0.0 unless group, model,
+            // and token usage are all known.
+            let cost = match (group, model, tokens) {
+                (Some(g), Some(m), Some(t)) => {
+                    crate::pricing::cost_usd(g, m, t, &std::collections::HashMap::new())
+                }
+                _ => 0.0,
+            };
             tracing::info!(
                 id, %method, %path,
                 account = account.as_deref().unwrap_or("-"),
                 status,
                 duration_ms = duration.as_millis() as u64,
                 tokens = tokens.map(TokenCounts::total).unwrap_or(0),
+                cost = format!("{cost:.4}"),
                 group = group.as_deref().unwrap_or("-"),
                 model = model.as_deref().unwrap_or("-"),
                 effort = effort.as_deref().unwrap_or("-"),
@@ -456,6 +510,13 @@ pub struct GlobalTotalsDoc {
     pub tokens_out: u64,
     pub rpm_5m: f64,
     pub in_flight: u32,
+    /// API-equivalent USD cost (Feature D), defined as the **sum of the
+    /// per-model-row costs** ([`ModelUsageDoc::cost_usd`]). Summing per row is
+    /// the only correct aggregation because the global `tokens_in`/`tokens_out`
+    /// mix models with different rates; a row already knows its own model's
+    /// price. Additive: absent in docs written before Feature D → `0.0`.
+    #[serde(default)]
+    pub cost_usd: f64,
 }
 
 /// One model-usage row in the document (req1-20). Cache counters are omitted
@@ -543,6 +604,12 @@ pub enum CompletedDoc {
         status: u16,
         duration_ms: u64,
         tokens: Option<TokensDoc>,
+        /// API-equivalent USD cost (Feature D) for this single request, from
+        /// its `(group, model)` + `tokens` via [`crate::pricing::cost_usd`].
+        /// `0.0` when group/model/tokens are not all known, or the model is
+        /// unknown/zero-rate. Additive: absent in pre-Feature-D docs → `0.0`.
+        #[serde(default)]
+        cost_usd: f64,
         /// Backend group / served model / reasoning effort (additive: absent
         /// in docs written before these fields existed).
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -583,6 +650,11 @@ pub struct DocMeta {
     pub refresh_ahead_secs: u64,
     pub evaluate_tick_secs: u64,
     pub codex: CodexSettingsDoc,
+    /// API-equivalent pricing overrides from `[pricing]` in the live config
+    /// (Feature D). Empty = use the built-in default rate table. Threaded here
+    /// (rather than into the pure `dashboard_doc` signature) because `DocMeta`
+    /// already carries the config-derived display fields the builder needs.
+    pub pricing_overrides: HashMap<String, crate::pricing::ModelPrice>,
 }
 
 pub(crate) fn epoch_ms(at: SystemTime) -> u64 {
@@ -646,7 +718,36 @@ fn window_doc(
 /// the hub, with in-flight requests overlaid per model (req11). A model seen
 /// only in-flight (no completed request yet) still gets a row so a long active
 /// request is visible before it finishes.
-fn model_usage_docs(hub: &HubView, now: SystemTime) -> Vec<ModelUsageDoc> {
+/// Build the model-usage rows AND the total API-equivalent USD cost across all
+/// completed model rows (Feature D). The total is the **sum of each completed
+/// row's per-model cost** — the only correct aggregation, since each model
+/// carries its own rate. In-flight-only rows have no completed tokens and
+/// contribute `0`. The per-model cost is computed here but NOT stored on
+/// [`ModelUsageDoc`]: the TUI's `ui.rs` constructs that struct with an
+/// exhaustive literal and is frozen for a parallel rewrite, so adding a field
+/// to it is impossible from here. Per-model cost is recoverable by the client
+/// from the row's tokens + the same pricing table; the global total and the
+/// per-request `CompletedDoc::Request::cost_usd` carry the cost end to end.
+fn model_usage_docs(
+    hub: &HubView,
+    now: SystemTime,
+    pricing_overrides: &HashMap<String, crate::pricing::ModelPrice>,
+) -> (Vec<ModelUsageDoc>, f64) {
+    let total_cost: f64 = hub
+        .model_usage
+        .iter()
+        .map(|m| {
+            crate::pricing::cost_from_parts(
+                &m.group,
+                &m.model,
+                m.tokens_in,
+                m.tokens_out,
+                m.cache_read,
+                m.cache_creation,
+                pricing_overrides,
+            )
+        })
+        .sum();
     let row = |m: &ModelUsage| ModelUsageDoc {
         group: m.group.clone(),
         model: m.model.clone(),
@@ -724,7 +825,7 @@ fn model_usage_docs(hub: &HubView, now: SystemTime) -> Vec<ModelUsageDoc> {
             endpoints: Vec::new(),
         });
     }
-    docs
+    (docs, total_cost)
 }
 
 /// Build the dashboard document — pure over snapshot/hub/totals/params so
@@ -858,6 +959,14 @@ pub(crate) fn dashboard_doc(
                         input: t.input,
                         output: t.output,
                     }),
+                    // Per-request API-equivalent cost: 0.0 unless group, model,
+                    // and the upstream token usage are ALL known (Feature D).
+                    cost_usd: match (group, model, tokens) {
+                        (Some(g), Some(m), Some(t)) => {
+                            crate::pricing::cost_usd(g, m, t, &meta.pricing_overrides)
+                        }
+                        _ => 0.0,
+                    },
                     group: group.clone(),
                     model: model.clone(),
                     effort: effort.clone(),
@@ -870,6 +979,10 @@ pub(crate) fn dashboard_doc(
             })
             .collect(),
     };
+
+    // Build model rows once; the builder also returns the global cost as the
+    // sum of each completed row's per-model cost (Feature D).
+    let (model_usage, total_cost_usd) = model_usage_docs(hub, now, &meta.pricing_overrides);
 
     DashboardDoc {
         version: crate::build_info::version_string(),
@@ -898,8 +1011,9 @@ pub(crate) fn dashboard_doc(
             tokens_out: hub.global_totals.tokens_out,
             rpm_5m: hub.rpm_5m,
             in_flight: in_flight_total,
+            cost_usd: total_cost_usd,
         },
-        model_usage: model_usage_docs(hub, now),
+        model_usage,
         activity,
         logs: hub
             .logs
@@ -937,6 +1051,9 @@ pub(crate) fn build_doc(state: &AppState, now: SystemTime) -> DashboardDoc {
             model: codex_shape.model,
             effort: codex_shape.effort,
         },
+        // Pricing overrides from the live config's `[pricing]` section
+        // (Feature D); empty → built-in default rate table.
+        pricing_overrides: state.config.pricing.clone(),
     };
     dashboard_doc(&snapshot, &hub, &state.totals, &params, now, &meta)
 }
@@ -977,6 +1094,7 @@ mod tests {
                 model: "gpt-5.5".into(),
                 effort: None,
             },
+            pricing_overrides: HashMap::new(),
         }
     }
 
@@ -1296,6 +1414,125 @@ mod tests {
         assert_eq!(row["cache_read"], 120);
         // None → skipped entirely, so the client renders "unavailable" not 0.
         assert!(row.get("cache_creation").is_none());
+    }
+
+    /// Same seed as [`seeded_doc`] but with a caller-supplied [`DocMeta`] so a
+    /// test can inject pricing overrides (Feature D).
+    fn seeded_doc_with_meta(meta: &DocMeta) -> DashboardDoc {
+        let pool = AccountPool::new(&[oauth_account("a"), oauth_account("b")]);
+        pool.evaluate(None, &params(), now());
+        let totals = UsageTotals::default();
+        totals.record(&AccountId("a".into()), 1, 700, 300);
+        let hub = seeded_hub();
+        dashboard_doc(
+            &pool.snapshot(),
+            &hub.view(now()),
+            &totals,
+            &params(),
+            now(),
+            meta,
+        )
+    }
+
+    #[test]
+    fn doc_carries_api_equivalent_cost_with_default_pricing() {
+        // The single completed request is codex/gpt-5.5 with input=700,
+        // output=300, cache_read=120. Under the built-in gpt-5.5 rates
+        // {5.0, 30.0, 0.5, 0.0} per 1e6: 0.0035 + 0.009 + 0.00006 = 0.01256.
+        let tokens = TokenCounts {
+            input: 700,
+            output: 300,
+            cache_read: Some(120),
+            cache_creation: None,
+        };
+        let expected = crate::pricing::cost_usd("codex", "gpt-5.5", &tokens, &HashMap::new());
+
+        let doc = seeded_doc();
+        // Global total = sum of per-model row costs (here, the one codex row).
+        assert!(
+            (doc.totals.cost_usd - expected).abs() < 1e-9,
+            "global cost {} != {expected}",
+            doc.totals.cost_usd
+        );
+        assert!(
+            (expected - 0.012_56).abs() < 1e-9,
+            "sanity: expected gpt-5.5 cost is 0.01256, got {expected}"
+        );
+
+        // Per-request activity line carries the same cost.
+        match &doc.activity.completed[0] {
+            CompletedDoc::Request { cost_usd, .. } => {
+                assert!(
+                    (*cost_usd - expected).abs() < 1e-9,
+                    "per-request cost {cost_usd} != {expected}"
+                );
+            }
+            other => panic!("expected request, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn doc_global_cost_reflects_config_pricing_override() {
+        // Override gpt-5.5 input to 9.99/1e6, everything else 0 → cost is
+        // purely 700 * 9.99 / 1e6 = 0.006993 for the one request.
+        let mut overrides = HashMap::new();
+        overrides.insert(
+            "gpt-5.5".to_string(),
+            crate::pricing::ModelPrice {
+                input: 9.99,
+                output: 0.0,
+                cache_read: 0.0,
+                cache_creation: 0.0,
+            },
+        );
+        let mut m = meta();
+        m.pricing_overrides = overrides.clone();
+
+        let doc = seeded_doc_with_meta(&m);
+        let expected = 700.0 * 9.99 / 1_000_000.0;
+        assert!(
+            (doc.totals.cost_usd - expected).abs() < 1e-9,
+            "override global cost {} != {expected}",
+            doc.totals.cost_usd
+        );
+        // And the default (no override) gives a different number, proving the
+        // override actually took effect.
+        let default_doc = seeded_doc();
+        assert!(
+            (default_doc.totals.cost_usd - doc.totals.cost_usd).abs() > 1e-6,
+            "override must change the cost from the default"
+        );
+    }
+
+    #[test]
+    fn doc_cost_round_trips_through_json() {
+        let doc = seeded_doc();
+        let value: serde_json::Value = serde_json::to_value(&doc).expect("serialize");
+        // Global cost is a plain f64 field on totals.
+        assert!(value["totals"]["cost_usd"].is_number());
+        // Per-request cost is serialized on the completed request entry.
+        let completed = value["activity"]["completed"]
+            .as_array()
+            .expect("completed array");
+        let req = completed
+            .iter()
+            .find(|e| e["kind"] == "request")
+            .expect("a request entry");
+        assert!(req["cost_usd"].is_number());
+
+        let parsed: DashboardDoc = serde_json::from_value(value).expect("parse");
+        assert!((parsed.totals.cost_usd - doc.totals.cost_usd).abs() < 1e-12);
+    }
+
+    #[test]
+    fn doc_without_cost_field_parses_to_zero() {
+        // A pre-Feature-D document omits cost_usd; the additive serde default
+        // keeps it parseable (0.0) so an upgraded client can still attach.
+        let doc = seeded_doc();
+        let mut value = serde_json::to_value(&doc).expect("serialize");
+        value["totals"].as_object_mut().unwrap().remove("cost_usd");
+        let parsed: DashboardDoc = serde_json::from_value(value).expect("parse");
+        assert_eq!(parsed.totals.cost_usd, 0.0);
     }
 
     #[test]

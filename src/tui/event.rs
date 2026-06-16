@@ -13,7 +13,7 @@ use std::time::Duration;
 /// and completion counts; the optional cache counters feed the model-usage
 /// rows and are `None` when the upstream did not report them (distinct from an
 /// explicit `Some(0)`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct TokenCounts {
     pub input: u64,
     pub output: u64,
@@ -22,9 +22,19 @@ pub struct TokenCounts {
 }
 
 impl TokenCounts {
-    /// Combined fresh in/out count for single-number displays.
+    /// Full context size for the single-number activity display: fresh input +
+    /// cache reads + cache writes + output. Including the cached portion is
+    /// essential — `input` is the FRESH (non-cached) prompt only, so when codex
+    /// caching kicks in the cached tokens move out of `input` into `cache_read`.
+    /// Summing only `input + output` therefore makes the displayed number DROP
+    /// between turns even though the conversation GREW (e.g. 182,905 → 156,795
+    /// when 26,624 tokens got cached). Cached tokens are real context that still
+    /// fills the window, so the displayed size must count them.
     pub fn total(self) -> u64 {
-        self.input.saturating_add(self.output)
+        self.input
+            .saturating_add(self.output)
+            .saturating_add(self.cache_read.unwrap_or(0))
+            .saturating_add(self.cache_creation.unwrap_or(0))
     }
 }
 
@@ -111,4 +121,37 @@ pub enum ActivityEvent {
         context: Option<String>,
         message: String,
     },
+}
+
+#[cfg(test)]
+mod token_total_tests {
+    use super::TokenCounts;
+    #[test]
+    fn total_counts_the_cached_context_so_it_does_not_drop_when_caching_kicks_in() {
+        // Turn N: nothing cached yet — fresh 182586 + out 319.
+        let a = TokenCounts {
+            input: 182_586,
+            output: 319,
+            cache_read: Some(0),
+            cache_creation: None,
+        };
+        // Turn N+1: conversation GREW, 26624 of the prompt got cached → fresh drops,
+        // but cache_read holds it. Real context = 183231 + 188 = 183419.
+        let b = TokenCounts {
+            input: 183_231 - 26_624,
+            output: 188,
+            cache_read: Some(26_624),
+            cache_creation: None,
+        };
+        assert_eq!(a.total(), 182_905);
+        assert_eq!(
+            b.total(),
+            183_419,
+            "must include cached context, not drop to 156795"
+        );
+        assert!(
+            b.total() > a.total(),
+            "displayed size must grow with the conversation, not shrink on a cache hit"
+        );
+    }
 }
