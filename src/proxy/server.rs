@@ -206,9 +206,14 @@ impl AppState {
         SelectParams::from(&self.config.scheduler)
     }
 
-    /// Next activity-event correlation id (never leaves this process).
+    /// Next activity-event correlation id (never leaves this process). 1-based
+    /// to match [`RequestLogger::next_request_id`]: the first request is id 1,
+    /// so the codex trace, the request log, and the dashboard feed all show the
+    /// same ascending ids. A bare `fetch_add` would return 0 for the first
+    /// request, which then surfaced as `"id":0` on every trace line in a
+    /// single-request session.
     pub fn next_request_id(&self) -> u64 {
-        self.request_counter.fetch_add(1, Ordering::Relaxed)
+        self.request_counter.fetch_add(1, Ordering::Relaxed) + 1
     }
 
     /// Emit an activity event: `try_send`, dropped on a full channel.
@@ -1245,6 +1250,22 @@ mod tests {
             seven_day_max: 0.99,
             usage_max_age: Duration::from_secs(600),
         }
+    }
+
+    #[test]
+    fn next_request_id_is_one_based_and_ascending() {
+        let config = Config {
+            accounts: vec![oauth_account("a")],
+            ..Default::default()
+        };
+        let pool = AccountPool::new(&config.accounts);
+        let state = AppState::new(config, pool, None, None).expect("state");
+        // The first request must be id 1, not 0: the codex trace, the request
+        // log, and the dashboard feed all key off this id, and a 0 surfaced as
+        // `"id":0` on every trace line in a single-request session.
+        assert_eq!(state.next_request_id(), 1, "first activity id is 1, not 0");
+        assert_eq!(state.next_request_id(), 2);
+        assert_eq!(state.next_request_id(), 3);
     }
 
     #[test]

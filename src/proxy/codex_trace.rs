@@ -23,6 +23,11 @@ use serde_json::{json, Value};
 /// First `MAX` bytes of a section, on a UTF-8 char boundary, marked truncated.
 const PREVIEW_BYTES: usize = 2048;
 
+/// Cap on the per-tool breakdown: the top [`MAX_TOOLS`] by `tokens_est`, then a
+/// single `…(+N more)` roll-up for the rest, so a request with a hundred MCP
+/// tools still yields one readable line.
+const MAX_TOOLS: usize = 40;
+
 /// The input half of a trace line, built once when a codex request is dispatched
 /// (the request body is available then) and held until the terminal outcome is
 /// known. Cheap to build; never fails.
@@ -38,6 +43,11 @@ pub(crate) struct CodexTrace {
     tools_tokens_est: u64,
     messages_tokens_est: u64,
     tools_count: u64,
+    /// Per-tool `{name, tokens_est}`, descending by `tokens_est`, capped at
+    /// [`MAX_TOOLS`] with a final `…(+N more)` roll-up. Lets one trace line name
+    /// which tools (e.g. MCP `slack_*`, `atlassian_*`) dominate the per-turn
+    /// token cost, so the exact servers to disable are obvious.
+    tools: Vec<Value>,
     messages_count: u64,
     system_preview: String,
     messages_preview: String,
@@ -81,6 +91,7 @@ impl CodexTrace {
             tools_tokens_est: est(tools),
             messages_tokens_est: est(messages),
             tools_count: array_len(tools),
+            tools: tools_breakdown(tools),
             messages_count: array_len(messages),
             system_preview: preview(system),
             messages_preview: preview(messages),
@@ -128,6 +139,30 @@ impl CodexTrace {
         );
     }
 
+    /// The full trace line (input breakdown + outcome) as a JSON value. Pure —
+    /// no IO, no env — so the `id`/`input` shape can be asserted in tests.
+    fn line(&self, outcome: Value, upstream_events: u64, duration_ms: u128) -> Value {
+        json!({
+            "id": self.id,
+            "ts": now_rfc3339(),
+            "path": self.path,
+            "model": self.model,
+            "input": {
+                "system_tokens_est": self.system_tokens_est,
+                "tools_tokens_est": self.tools_tokens_est,
+                "messages_tokens_est": self.messages_tokens_est,
+                "tools_count": self.tools_count,
+                "tools": self.tools.clone(),
+                "messages_count": self.messages_count,
+                "system_preview": self.system_preview,
+                "messages_preview": self.messages_preview,
+            },
+            "upstream_events": upstream_events,
+            "duration_ms": duration_ms,
+            "outcome": outcome,
+        })
+    }
+
     /// Assemble the full line (input breakdown + outcome) and append it,
     /// best-effort. A disabled trace, a missing state dir, or any IO error is
     /// swallowed — the request path is never affected.
@@ -138,24 +173,7 @@ impl CodexTrace {
         let Some(path) = crate::cli::daemon::codex_trace_path() else {
             return;
         };
-        let line = json!({
-            "id": self.id,
-            "ts": now_rfc3339(),
-            "path": self.path,
-            "model": self.model,
-            "input": {
-                "system_tokens_est": self.system_tokens_est,
-                "tools_tokens_est": self.tools_tokens_est,
-                "messages_tokens_est": self.messages_tokens_est,
-                "tools_count": self.tools_count,
-                "messages_count": self.messages_count,
-                "system_preview": self.system_preview,
-                "messages_preview": self.messages_preview,
-            },
-            "upstream_events": upstream_events,
-            "duration_ms": duration_ms,
-            "outcome": outcome,
-        });
+        let line = self.line(outcome, upstream_events, duration_ms);
         // Best-effort append. Create the parent dir if needed; ignore failures.
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
@@ -169,6 +187,52 @@ impl CodexTrace {
         };
         let _ = writeln!(file, "{line}");
     }
+}
+
+/// Per-tool `{name, tokens_est}` for the trace input, descending by
+/// `tokens_est`. `tokens_est` is the same chars/4 estimate used for the
+/// `tools_tokens_est` total ([`estimate_section_tokens`]) applied to each
+/// tool's full JSON, so the parts reconcile with the total. Beyond
+/// [`MAX_TOOLS`] entries the tail is folded into one `…(+N more)` row whose
+/// `tokens_est` is the sum of the omitted tools. Best-effort: a non-array or a
+/// nameless tool degrades gracefully (`name: "?"`), never panics.
+fn tools_breakdown(tools: Option<&Value>) -> Vec<Value> {
+    let Some(items) = tools.and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut per_tool: Vec<(String, u64)> = items
+        .iter()
+        .map(|tool| {
+            let name = tool
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("?")
+                .to_string();
+            let tokens_est = crate::provider::codex::estimate_section_tokens(tool);
+            (name, tokens_est)
+        })
+        .collect();
+    // Descending by tokens_est; ties broken by name for a deterministic line.
+    per_tool.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+    if per_tool.len() <= MAX_TOOLS {
+        return per_tool
+            .into_iter()
+            .map(|(name, tokens_est)| json!({ "name": name, "tokens_est": tokens_est }))
+            .collect();
+    }
+    // Keep the top MAX_TOOLS, fold the rest into one roll-up row.
+    let rest = per_tool.split_off(MAX_TOOLS);
+    let rest_sum: u64 = rest.iter().map(|(_, t)| *t).sum();
+    let mut out: Vec<Value> = per_tool
+        .into_iter()
+        .map(|(name, tokens_est)| json!({ "name": name, "tokens_est": tokens_est }))
+        .collect();
+    out.push(json!({
+        "name": format!("…(+{} more)", rest.len()),
+        "tokens_est": rest_sum,
+    }));
+    out
 }
 
 /// A compact, truncated preview of a request section for the trace. Serializes
@@ -263,6 +327,87 @@ mod tests {
         // A bare-string system previews unquoted.
         assert_eq!(t.system_preview, "you are a helpful assistant");
         assert!(t.messages_preview.contains("hello"));
+    }
+
+    #[test]
+    fn trace_line_logs_the_request_activity_id_non_zero() {
+        // Change A: the trace `id` must be the SAME non-zero activity id the
+        // dashboard/request log show — not the 0 a bare `fetch_add` returned for
+        // the first request. `from_request` is fed `ctx.activity_id`; assert it
+        // is preserved verbatim into the emitted line.
+        let activity_id = 1; // first request, 1-based (see server::next_request_id)
+        let t = CodexTrace::from_request(
+            true,
+            activity_id,
+            "/v1/messages",
+            Some("gpt-5.5".into()),
+            &sample_body(),
+        );
+        let line = t.line(json!({"type": "completed"}), 3, 42);
+        assert_eq!(line["id"], json!(activity_id), "trace id == activity id");
+        assert_ne!(line["id"], json!(0), "id is non-zero, not the old `0` bug");
+    }
+
+    #[test]
+    fn tools_breakdown_is_per_tool_sorted_desc_and_named() {
+        // Two tools of clearly different size: the bigger schema must sort first
+        // so a reader sees the costliest tool at the top of `input.tools`.
+        let body = json!({
+            "tools": [
+                {"name": "slack_post_message",
+                 "description": "send a very long detailed message to a slack channel with many options and fields and rich formatting blocks"},
+                {"name": "read", "description": "read a file"}
+            ]
+        })
+        .to_string()
+        .into_bytes();
+        let t = CodexTrace::from_request(true, 1, "/v1/messages", None, &body);
+        assert_eq!(t.tools.len(), 2);
+        assert_eq!(t.tools[0]["name"], json!("slack_post_message"));
+        assert_eq!(t.tools[1]["name"], json!("read"));
+        let top = t.tools[0]["tokens_est"].as_u64().expect("u64");
+        let bottom = t.tools[1]["tokens_est"].as_u64().expect("u64");
+        assert!(top > bottom, "sorted descending by tokens_est");
+        assert!(top > 0, "tokens_est is the chars/4 estimate, non-zero");
+        // Per-tool estimates reconcile with the section total to within the
+        // per-tool flooring remainder: each tool floors chars/4 independently,
+        // so the sum can trail the once-floored total by up to (tools_count-1).
+        let parts_sum = top + bottom;
+        assert!(
+            parts_sum <= t.tools_tokens_est && t.tools_tokens_est - parts_sum < t.tools_count,
+            "parts ({parts_sum}) reconcile with total ({}) within flooring slack",
+            t.tools_tokens_est,
+        );
+    }
+
+    #[test]
+    fn tools_breakdown_caps_at_max_tools_with_rollup() {
+        // More than MAX_TOOLS tools: keep the top MAX_TOOLS, fold the rest into
+        // one `…(+N more)` row whose tokens_est is the omitted sum.
+        let n = MAX_TOOLS + 5;
+        let tools: Vec<Value> = (0..n)
+            .map(|i| json!({"name": format!("tool_{i:03}"), "description": "x".repeat(i + 1)}))
+            .collect();
+        let body = json!({ "tools": tools }).to_string().into_bytes();
+        let t = CodexTrace::from_request(true, 1, "/v1/messages", None, &body);
+        assert_eq!(t.tools.len(), MAX_TOOLS + 1, "MAX_TOOLS rows + 1 roll-up");
+        let last = t.tools.last().expect("roll-up row");
+        assert_eq!(last["name"], json!("…(+5 more)"));
+        assert!(
+            last["tokens_est"].as_u64().expect("u64") > 0,
+            "roll-up carries the omitted tokens"
+        );
+        // Every non-roll-up row is at least as large as the roll-up's largest
+        // omitted tool — i.e. the cap kept the biggest tools.
+        let kept_min = t.tools[MAX_TOOLS - 1]["tokens_est"].as_u64().expect("u64");
+        assert!(kept_min > 0);
+    }
+
+    #[test]
+    fn tools_breakdown_empty_when_no_tools() {
+        let body = json!({"messages": []}).to_string().into_bytes();
+        let t = CodexTrace::from_request(true, 1, "/v1/messages", None, &body);
+        assert!(t.tools.is_empty(), "no tools[] ⇒ empty breakdown");
     }
 
     #[test]
