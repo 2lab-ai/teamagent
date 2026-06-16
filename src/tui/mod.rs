@@ -52,7 +52,10 @@ pub const ACTIVITY_CHANNEL_CAP: usize = 4096;
 
 use std::time::{Duration, Instant, SystemTime};
 
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+    MouseButton, MouseEventKind,
+};
 use tokio::sync::mpsc;
 
 use crate::config::AccountConfig;
@@ -239,6 +242,11 @@ pub(crate) struct Chrome {
     /// Activity-log scroll offset: number of newest completed entries skipped
     /// (0 = live tail). Lets the panel page through the full history (req6).
     pub activity_scroll: usize,
+    /// The activity entry (if any) currently click-expanded to show its detail
+    /// lines (Feature B). Keyed by a STABLE identity (`ActivityKey` = at_ms +
+    /// method + path + status) so it survives new rows prepending — never a
+    /// list index.
+    pub expanded_activity: Option<activity::ActivityKey>,
     /// Cursor row in the Stats overlay's model table.
     pub model_cursor: usize,
     /// `Some` in attach mode.
@@ -323,6 +331,13 @@ struct App {
     overlay: Overlay,
     /// Activity-log scroll offset (newest entries skipped; 0 = live tail).
     activity_scroll: usize,
+    /// The click-expanded activity entry (Feature B), keyed by stable identity
+    /// so it survives new rows prepending. `None` = nothing expanded.
+    expanded_activity: Option<activity::ActivityKey>,
+    /// The activity panel's hit-test layout from the LAST rendered frame: the
+    /// panel rect + the clickable request rows. Recorded by the event loop after
+    /// each `draw`, read by the mouse handler to map a click to an entry.
+    activity_chrome: ui::ActivityChrome,
     /// Cursor row in the Stats overlay's model table.
     model_cursor: usize,
     /// API-key buffer for `Mode::AddKey`. Held outside `Mode` so the enum
@@ -348,6 +363,8 @@ impl App {
             status: None,
             overlay: Overlay::None,
             activity_scroll: 0,
+            expanded_activity: None,
+            activity_chrome: ui::ActivityChrome::default(),
             model_cursor: 0,
             add_input: String::new(),
             pending_login: None,
@@ -378,6 +395,7 @@ impl App {
             mode: self.mode,
             overlay: self.overlay,
             activity_scroll: self.activity_scroll,
+            expanded_activity: self.expanded_activity.clone(),
             model_cursor: self.model_cursor,
             add_input_len: self.add_input.chars().count(),
             status_line: self.status_line().map(str::to_string),
@@ -448,6 +466,57 @@ impl App {
             Overlay::Accounts => self.on_key_accounts(key.code, view),
             Overlay::Stats => self.on_key_stats(key.code, view),
             Overlay::Logs => self.on_key_logs(key.code),
+        }
+    }
+
+    /// Handle a mouse event (Feature B). Mouse input is ADDITIVE — keyboard nav
+    /// is untouched. It is ignored entirely unless MAIN owns the screen (no
+    /// overlay, `Mode::Normal`); an overlay or a pending interaction keeps the
+    /// activity panel out of reach, so a stray click can't toggle a hidden row.
+    /// A left-click inside the activity list toggles the clicked entry's expand
+    /// state; the wheel scrolls the activity history. Returns whether the event
+    /// changed anything (→ redraw).
+    fn on_mouse(
+        &mut self,
+        mouse: crossterm::event::MouseEvent,
+        view: Option<&DashboardView>,
+    ) -> bool {
+        // Only MAIN (no overlay, no pending mode interaction) gets the mouse.
+        if self.overlay != Overlay::None || self.mode != Mode::Normal {
+            return false;
+        }
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                match ui::hit_test_activity(&self.activity_chrome, mouse.column, mouse.row) {
+                    Some(key) => {
+                        self.toggle_expand(key);
+                        true
+                    }
+                    None => false,
+                }
+            }
+            // Wheel up = into history, down = toward the live tail — same
+            // direction as the ↑/↓ keys (a nice-to-have bonus).
+            MouseEventKind::ScrollUp => {
+                self.scroll_activity(1, view);
+                true
+            }
+            MouseEventKind::ScrollDown => {
+                self.scroll_activity(-1, view);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Toggle the click-expanded activity entry by its stable key: clicking the
+    /// expanded row again collapses it, clicking a different row moves the
+    /// expansion there.
+    fn toggle_expand(&mut self, key: activity::ActivityKey) {
+        if self.expanded_activity.as_ref() == Some(&key) {
+            self.expanded_activity = None;
+        } else {
+            self.expanded_activity = Some(key);
         }
     }
 
@@ -1152,16 +1221,47 @@ impl App {
     }
 }
 
+/// Initialize the terminal for the dashboard: `ratatui::try_init` (raw mode +
+/// alternate screen + a panic hook that restores them) PLUS native mouse
+/// capture (Feature B), which `try_init` does NOT enable. Because the panic
+/// hook installed by `try_init` only undoes raw-mode/alt-screen, we chain our
+/// own hook BEFORE it that also disables mouse capture, so a panic on any path
+/// leaves the terminal fully restored. Every call site uses this helper (and
+/// [`restore_terminal`]) so the enable/disable always pair up — including the
+/// login suspend/resume path that re-inits the terminal mid-session.
+fn init_terminal() -> std::io::Result<ratatui::DefaultTerminal> {
+    // Chain a mouse-disable into the panic hook BEFORE `try_init` installs its
+    // own restore hook. `try_init`'s hook runs `restore()` then calls the
+    // previous hook (this one), so on panic the order is: leave alt-screen +
+    // raw mode, then disable mouse capture. Idempotent if it runs twice.
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+        prev(info);
+    }));
+    let terminal = ratatui::try_init()?;
+    crossterm::execute!(std::io::stdout(), EnableMouseCapture)?;
+    Ok(terminal)
+}
+
+/// Tear down the terminal: disable mouse capture FIRST, then `ratatui::restore`
+/// (leave alternate screen + disable raw mode). The inverse of
+/// [`init_terminal`]; runs on every normal exit path.
+fn restore_terminal() {
+    let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+    ratatui::restore();
+}
+
 /// Run the in-process dashboard over live server state until quit.
 ///
-/// Terminal lifecycle: `ratatui::try_init` enables raw mode + the alternate
-/// screen AND installs a panic hook that restores the terminal before
-/// unwinding; `ratatui::restore` runs on every exit path.
+/// Terminal lifecycle via [`init_terminal`] / [`restore_terminal`]: raw mode +
+/// alternate screen + mouse capture, all undone on every exit path (and the
+/// panic hook).
 pub async fn run_local(state: crate::proxy::server::AppState) -> std::io::Result<()> {
-    let mut terminal = ratatui::try_init()?;
+    let mut terminal = init_terminal()?;
     let mut app = App::new(Backend::Local(Box::new(state)));
     let result = event_loop(&mut terminal, &mut app, None).await;
-    ratatui::restore();
+    restore_terminal();
     result
 }
 
@@ -1182,7 +1282,7 @@ pub async fn run_remote(opts: RemoteOptions) -> std::io::Result<()> {
         opts.api_key.clone(),
         tx,
     ));
-    let mut terminal = ratatui::try_init()?;
+    let mut terminal = init_terminal()?;
     let mut app = App::new(Backend::Remote(Box::new(Remote {
         client,
         base_url: opts.base_url,
@@ -1196,7 +1296,7 @@ pub async fn run_remote(opts: RemoteOptions) -> std::io::Result<()> {
         pending_remove: None,
     })));
     let result = event_loop(&mut terminal, &mut app, Some(rx)).await;
-    ratatui::restore();
+    restore_terminal();
     fetcher.abort();
     result
 }
@@ -1290,9 +1390,9 @@ async fn event_loop(
         // run the flow, then re-init and force a full redraw. The fetch poller
         // (remote mode) keeps running in the background meanwhile.
         if let Some(kind) = app.take_pending_login() {
-            ratatui::restore();
+            restore_terminal();
             app.perform_login(kind).await;
-            *terminal = ratatui::try_init()?;
+            *terminal = init_terminal()?;
             let _ = terminal.clear();
             redraw = true;
         }
@@ -1302,7 +1402,11 @@ async fn event_loop(
         if redraw {
             let view = app.view(SystemTime::now());
             let chrome = app.chrome();
-            terminal.draw(|frame| ui::draw(frame, view.as_ref(), &chrome))?;
+            // Capture the activity panel's hit-test layout from this frame so a
+            // left-click in the next input drain maps to the right entry.
+            let mut hits = None;
+            terminal.draw(|frame| ui::draw(frame, view.as_ref(), &chrome, &mut hits))?;
+            app.activity_chrome = hits.unwrap_or_default();
         }
     }
 }
@@ -1320,6 +1424,12 @@ fn drain_input(app: &mut App) -> std::io::Result<bool> {
                 let view = view.get_or_insert_with(|| app.view(SystemTime::now()));
                 app.on_key(key, view.as_ref());
                 dirty = true;
+            }
+            Event::Mouse(mouse) => {
+                let view = view.get_or_insert_with(|| app.view(SystemTime::now()));
+                if app.on_mouse(mouse, view.as_ref()) {
+                    dirty = true;
+                }
             }
             Event::Resize(_, _) => dirty = true,
             _ => {}
@@ -1523,6 +1633,97 @@ mod tests {
 
     fn press(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    // --- Feature B: mouse click-to-expand ----------------------------------
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> crossterm::event::MouseEvent {
+        crossterm::event::MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    /// Seed `app.activity_chrome` with one clickable request row spanning the
+    /// given screen rows, returning its key.
+    fn seed_one_hit(app: &mut App) -> activity::ActivityKey {
+        let key = activity::ActivityKey {
+            at_ms: 42,
+            method: "POST".into(),
+            path: "/v1/messages".into(),
+            status: 200,
+        };
+        app.activity_chrome = ui::ActivityChrome {
+            area: ratatui::layout::Rect {
+                x: 0,
+                y: 5,
+                width: 80,
+                height: 10,
+            },
+            hits: vec![ui::ActivityHit {
+                key: key.clone(),
+                y_start: 6,
+                height: 1,
+            }],
+        };
+        key
+    }
+
+    #[test]
+    fn left_click_toggles_activity_expand() {
+        let mut app = remote_app();
+        let key = seed_one_hit(&mut app);
+        // Click the row → expands.
+        let changed = app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 5, 6), None);
+        assert!(changed, "a click on a hit row warrants a redraw");
+        assert_eq!(app.expanded_activity.as_ref(), Some(&key));
+        // Click it again → collapses (re-click toggles).
+        app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 5, 6), None);
+        assert_eq!(app.expanded_activity, None);
+    }
+
+    #[test]
+    fn click_off_a_row_does_nothing() {
+        let mut app = remote_app();
+        seed_one_hit(&mut app);
+        // Row 9 has no hit target; expansion is untouched and no redraw.
+        let changed = app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 5, 9), None);
+        assert!(!changed);
+        assert_eq!(app.expanded_activity, None);
+    }
+
+    #[test]
+    fn mouse_is_ignored_while_an_overlay_owns_the_screen() {
+        let mut app = remote_app();
+        seed_one_hit(&mut app);
+        app.overlay = Overlay::Stats;
+        let changed = app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 5, 6), None);
+        assert!(!changed, "overlay swallows the mouse");
+        assert_eq!(app.expanded_activity, None, "no hidden row toggled");
+    }
+
+    #[test]
+    fn wheel_scrolls_the_activity_history() {
+        let mut app = remote_app();
+        seed_one_hit(&mut app);
+        let mut view = empty_view();
+        // Give the view a few completed entries so the scroll offset can move.
+        view.completed = (0..5)
+            .map(|i| activity::Completed {
+                at: SystemTime::UNIX_EPOCH + Duration::from_secs(i),
+                body: activity::CompletedBody::Note {
+                    text: format!("n{i}"),
+                    error: false,
+                },
+            })
+            .collect();
+        assert_eq!(app.activity_scroll, 0);
+        app.on_mouse(mouse(MouseEventKind::ScrollUp, 5, 6), Some(&view));
+        assert_eq!(app.activity_scroll, 1, "wheel up scrolls into history");
+        app.on_mouse(mouse(MouseEventKind::ScrollDown, 5, 6), Some(&view));
+        assert_eq!(app.activity_scroll, 0, "wheel down returns to the tail");
     }
 
     fn stats_view() -> DashboardView {

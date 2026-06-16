@@ -66,6 +66,46 @@ pub(crate) struct Completed {
     pub body: CompletedBody,
 }
 
+/// A STABLE identity for a completed *request* entry, used by the TUI to track
+/// which activity row is click-expanded across redraws (Feature B). The
+/// completed-entry body carries no request `id` (it is dropped at finish), so
+/// the key is the tuple that survives new rows prepending: completion time
+/// (epoch ms) + method + path + status. A list index would NOT survive (new
+/// rows shift everything down), so we never key on position. `Note` entries are
+/// not expandable and have no key.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct ActivityKey {
+    pub at_ms: u64,
+    pub method: String,
+    pub path: String,
+    pub status: u16,
+}
+
+impl Completed {
+    /// Stable expand-identity for this entry, or `None` when it is a `Note`
+    /// (notes are never expandable — they carry no request detail).
+    pub(crate) fn activity_key(&self) -> Option<ActivityKey> {
+        match &self.body {
+            CompletedBody::Request {
+                method,
+                path,
+                status,
+                ..
+            } => Some(ActivityKey {
+                at_ms: self
+                    .at
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+                    .unwrap_or(0),
+                method: method.clone(),
+                path: path.clone(),
+                status: *status,
+            }),
+            CompletedBody::Note { .. } => None,
+        }
+    }
+}
+
 /// Per-account lifetime counters for the table's totals columns and the
 /// global totals pane (ok/error split + in/out token split).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

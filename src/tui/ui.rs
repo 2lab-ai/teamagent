@@ -20,7 +20,7 @@ use crate::scheduler::select::IneligibleReason;
 use crate::scheduler::window::QuotaWindow;
 use crate::scheduler::{select, AccountSnapshot};
 
-use super::activity::{Completed, CompletedBody};
+use super::activity::{ActivityKey, Completed, CompletedBody};
 use super::format::{self, GaugeLevel};
 use super::view::DashboardView;
 use super::{anim, Chrome, Mode, Overlay};
@@ -50,6 +50,19 @@ fn level_color(level: GaugeLevel) -> Color {
     }
 }
 
+/// Format an API-equivalent USD cost (Feature D) for display: `≥$1` keeps two
+/// decimals (`$3.78`), a sub-dollar amount keeps four (`$0.0123`) so small
+/// per-request costs are still legible, and exactly zero renders `$0.0000`.
+fn format_cost(usd: f64) -> String {
+    if usd == 0.0 {
+        "$0.0000".to_string()
+    } else if usd >= 1.0 {
+        format!("${usd:.2}")
+    } else {
+        format!("${usd:.4}")
+    }
+}
+
 /// Everything a row/pane needs that is derived once per frame.
 struct FrameCtx {
     now: SystemTime,
@@ -65,7 +78,15 @@ struct FrameCtx {
 /// Top-level draw entry. `view` is `None` only in attach mode before the
 /// first document arrives — then we paint a connecting screen + the footer,
 /// never a half-rendered table.
-pub(crate) fn draw(frame: &mut Frame, view: Option<&DashboardView>, chrome: &Chrome) {
+pub(crate) fn draw(
+    frame: &mut Frame,
+    view: Option<&DashboardView>,
+    chrome: &Chrome,
+    hits: &mut Option<ActivityChrome>,
+) {
+    // No activity panel hit-targets until MAIN draws one this frame (cleared so
+    // a stale layout from a previous frame can never mis-map a click).
+    *hits = None;
     let Some(view) = view else {
         draw_connecting(frame, chrome);
         return;
@@ -83,7 +104,7 @@ pub(crate) fn draw(frame: &mut Frame, view: Option<&DashboardView>, chrome: &Chr
     // MAIN is the wall-clock view: ALWAYS drawn first, every frame, so it keeps
     // updating underneath any overlay (issue #5). Local and attach render from
     // the same `DashboardView`, so this path is never forked.
-    draw_main(frame, view, &ctx, chrome, now);
+    draw_main(frame, view, &ctx, chrome, now, hits);
 
     // A summoned overlay (if any) is then drawn OVER MAIN. Each overlay clears
     // its own rect with `Clear` so MAIN shows through only outside it; because
@@ -119,6 +140,7 @@ fn draw_main(
     ctx: &FrameCtx,
     chrome: &Chrome,
     now: SystemTime,
+    hits: &mut Option<ActivityChrome>,
 ) {
     let snapshot = &view.snapshot;
     let table_height = (snapshot.accounts.len().max(1) as u16).saturating_add(2);
@@ -148,7 +170,7 @@ fn draw_main(
     if strip_height > 0 {
         draw_models_strip(frame, strip_area, view, now);
     }
-    draw_activity(frame, activity_area, view, chrome, now);
+    *hits = Some(draw_activity(frame, activity_area, view, chrome, now));
     // Footer slot reserved in the layout; the real footer is drawn by `draw`
     // last (over any overlay). Keep MAIN's bottom row clear here.
     let _ = footer_area;
@@ -1063,13 +1085,53 @@ fn window_detail_line(
     ])
 }
 
+/// One click-target inside the activity panel: a completed *request* entry, its
+/// stable [`ActivityKey`], and the absolute screen rows it occupies this frame
+/// (`y_start..y_start+height`). Recorded during [`draw_activity`] so the mouse
+/// handler can map a click to the entry without re-deriving the layout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ActivityHit {
+    pub key: ActivityKey,
+    pub y_start: u16,
+    pub height: u16,
+}
+
+/// The activity panel's rendered layout for one frame: the panel rect plus the
+/// ordered hit-targets (request rows only — notes/in-flight are not clickable).
+/// Threaded back to the runtime so a left-click can be mapped to an entry.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ActivityChrome {
+    pub area: Rect,
+    pub hits: Vec<ActivityHit>,
+}
+
+/// Pure hit-test (unit-tested): which activity entry, if any, does the click at
+/// absolute `(col, row)` land on? `None` when the click is outside the panel,
+/// on the title border, or on a non-request line. Used by the mouse handler.
+pub(crate) fn hit_test_activity(
+    chrome: &ActivityChrome,
+    col: u16,
+    row: u16,
+) -> Option<ActivityKey> {
+    let area = chrome.area;
+    // Outside the panel rect → not ours.
+    if col < area.x || col >= area.right() || row < area.y || row >= area.bottom() {
+        return None;
+    }
+    chrome
+        .hits
+        .iter()
+        .find(|hit| row >= hit.y_start && row < hit.y_start.saturating_add(hit.height))
+        .map(|hit| hit.key.clone())
+}
+
 fn draw_activity(
     frame: &mut Frame,
     area: Rect,
     view: &DashboardView,
     chrome: &Chrome,
     now: SystemTime,
-) {
+) -> ActivityChrome {
     let in_flight = &view.in_flight;
     let capacity = area.height.saturating_sub(1) as usize; // top border
 
@@ -1115,15 +1177,47 @@ fn draw_activity(
     }
     // Completed entries, newest first, windowed by the scroll offset (req6:
     // the whole history is reachable, not just the rows that happen to fit).
+    // Each request row may expand into several detail lines when clicked; the
+    // hit list records the absolute screen rows each entry owns so the click
+    // handler maps a (col,row) back to its stable key. Paragraph renders line 0
+    // at `area.y + 1` (the title takes the top border row).
     let total = view.completed.len();
-    let completed_rows = capacity.saturating_sub(lines.len());
     let scroll = chrome.activity_scroll.min(total.saturating_sub(1));
-    for entry in view.completed.iter().skip(scroll).take(completed_rows) {
-        lines.push(completed_line(entry));
+    let body_top = area.y.saturating_add(1);
+    let mut hits: Vec<ActivityHit> = Vec::new();
+    for entry in view.completed.iter().skip(scroll) {
+        if lines.len() >= capacity {
+            break;
+        }
+        let expanded = entry
+            .activity_key()
+            .is_some_and(|k| chrome.expanded_activity.as_ref() == Some(&k));
+        let row_y = body_top.saturating_add(lines.len() as u16);
+        lines.push(completed_line(entry, expanded));
+        let mut height = 1u16;
+        if expanded {
+            for detail in completed_detail_lines(entry) {
+                if lines.len() >= capacity {
+                    break;
+                }
+                lines.push(detail);
+                height = height.saturating_add(1);
+            }
+        }
+        // Only request rows are clickable (notes have no key).
+        if let Some(key) = entry.activity_key() {
+            hits.push(ActivityHit {
+                key,
+                y_start: row_y,
+                height,
+            });
+        }
     }
 
-    // Title carries the scroll position so it's obvious you're in history.
-    let shown_last = (scroll + completed_rows).min(total);
+    // Title carries the scroll position so it's obvious you're in history. The
+    // shown-range end is approximate when rows expanded, so report the count
+    // windowed by the live-tail capacity.
+    let shown_last = (scroll + capacity).min(total);
     let title = if scroll > 0 {
         format!(
             " activity — {}–{} of {total} (↑ history) ",
@@ -1137,10 +1231,12 @@ fn draw_activity(
     };
     let block = Block::new().borders(Borders::TOP).title(title);
     frame.render_widget(Paragraph::new(lines).block(block), area);
+    ActivityChrome { area, hits }
 }
 
-fn completed_line(entry: &Completed) -> Line<'static> {
-    let stamp = Span::styled(format!("   {}  ", format::clock_hms_utc(entry.at)), dim());
+/// The one-line activity row. For request entries a leading marker shows the
+/// expand state (`▸` collapsed / `▾` expanded); notes keep the plain indent.
+fn completed_line(entry: &Completed, expanded: bool) -> Line<'static> {
     match &entry.body {
         CompletedBody::Request {
             method,
@@ -1153,6 +1249,11 @@ fn completed_line(entry: &Completed) -> Line<'static> {
             model,
             effort,
         } => {
+            let marker = if expanded { '▾' } else { '▸' };
+            let stamp = Span::styled(
+                format!(" {marker} {}  ", format::clock_hms_utc(entry.at)),
+                dim(),
+            );
             let account = account.as_deref().unwrap_or("?");
             let status_style = if *status < 400 {
                 Style::new().fg(Color::Green)
@@ -1162,6 +1263,22 @@ fn completed_line(entry: &Completed) -> Line<'static> {
             let mut detail = format::elapsed_secs(*duration);
             if let Some(tokens) = tokens {
                 detail.push_str(&format!(", {} tok", format::human_count(tokens.total())));
+                // Always show the API-equivalent cost ($) inline (item #4). The
+                // render path holds no config overrides, so pass an empty map =
+                // the built-in default rate table. Cost is shown only when this
+                // request's (group, model) is known; an unknown/zero-rate model
+                // yields $0.0000. NOTE: the view-model's per-entry tokens carry
+                // only input+output (cache detail rides the model rows), so this
+                // is the input+output cost — consistent with the tok count above.
+                if let (Some(group), Some(model)) = (group, model) {
+                    let cost = crate::pricing::cost_usd(
+                        group,
+                        model,
+                        tokens,
+                        &std::collections::HashMap::new(),
+                    );
+                    detail.push_str(&format!(", {}", format_cost(cost)));
+                }
             }
             let mut spans = vec![stamp, Span::raw(format!("{method} {path}"))];
             // [group model·effort] badge, when known (req7).
@@ -1176,6 +1293,7 @@ fn completed_line(entry: &Completed) -> Line<'static> {
             Line::from(spans)
         }
         CompletedBody::Note { text, error } => {
+            let stamp = Span::styled(format!("   {}  ", format::clock_hms_utc(entry.at)), dim());
             let style = if *error {
                 Style::new().fg(Color::Red)
             } else {
@@ -1184,6 +1302,105 @@ fn completed_line(entry: &Completed) -> Line<'static> {
             Line::from(vec![stamp, Span::styled(text.clone(), style)])
         }
     }
+}
+
+/// Indented detail lines for an expanded request row (Feature B): full
+/// method+path, account, status, duration, group/model/effort, the token
+/// breakdown, and the per-component + total API-equivalent cost via
+/// [`crate::pricing`]. Empty for notes (never expandable).
+fn completed_detail_lines(entry: &Completed) -> Vec<Line<'static>> {
+    let CompletedBody::Request {
+        method,
+        path,
+        account,
+        status,
+        duration,
+        tokens,
+        group,
+        model,
+        effort,
+    } = &entry.body
+    else {
+        return Vec::new();
+    };
+    let indent = |label: &str, value: String| {
+        Line::from(vec![
+            Span::styled(format!("       {label:<8}"), dim()),
+            Span::raw(value),
+        ])
+    };
+    let mut lines = Vec::new();
+    lines.push(indent("request", format!("{method} {path}")));
+    lines.push(indent(
+        "account",
+        account.clone().unwrap_or_else(|| "?".to_string()),
+    ));
+    let status_color = if *status < 400 {
+        Color::Green
+    } else {
+        Color::Red
+    };
+    lines.push(Line::from(vec![
+        Span::styled("       status  ", dim()),
+        Span::styled(status.to_string(), Style::new().fg(status_color)),
+        Span::styled(
+            format!("  ·  {} elapsed", format::elapsed_secs(*duration)),
+            dim(),
+        ),
+    ]));
+    let model_label = match (group.as_deref(), model.as_deref()) {
+        (Some(g), Some(m)) => format!("{g} {m}"),
+        (Some(g), None) => g.to_string(),
+        (None, Some(m)) => m.to_string(),
+        (None, None) => "—".to_string(),
+    };
+    let effort_label = effort
+        .as_deref()
+        .map(|e| format!(" · effort {e}"))
+        .unwrap_or_default();
+    lines.push(indent("model", format!("{model_label}{effort_label}")));
+    match tokens {
+        Some(t) => {
+            lines.push(indent(
+                "tokens",
+                format!(
+                    "in {} · out {} · cache_read {} · cache_creation {} · total {}",
+                    format::human_count(t.input),
+                    format::human_count(t.output),
+                    opt_count(t.cache_read),
+                    opt_count(t.cache_creation),
+                    format::human_count(t.total()),
+                ),
+            ));
+            // Per-component + total API-equivalent cost (item #4). Empty
+            // overrides = built-in default rate table. Each component is priced
+            // in isolation via `cost_from_parts`, so the four add up to total.
+            let empty = std::collections::HashMap::new();
+            let (g, m) = (
+                group.as_deref().unwrap_or(""),
+                model.as_deref().unwrap_or(""),
+            );
+            let cost_in = crate::pricing::cost_from_parts(g, m, t.input, 0, None, None, &empty);
+            let cost_out = crate::pricing::cost_from_parts(g, m, 0, t.output, None, None, &empty);
+            let cost_cr = crate::pricing::cost_from_parts(g, m, 0, 0, t.cache_read, None, &empty);
+            let cost_cc =
+                crate::pricing::cost_from_parts(g, m, 0, 0, None, t.cache_creation, &empty);
+            let cost_total = cost_in + cost_out + cost_cr + cost_cc;
+            lines.push(Line::from(vec![
+                Span::styled("       cost    ", dim()),
+                Span::raw(format!(
+                    "in {} · out {} · cache_read {} · cache_creation {} · ",
+                    format_cost(cost_in),
+                    format_cost(cost_out),
+                    format_cost(cost_cr),
+                    format_cost(cost_cc),
+                )),
+                Span::styled(format_cost(cost_total), Style::new().fg(Color::Green)),
+            ]));
+        }
+        None => lines.push(indent("tokens", "—".to_string())),
+    }
+    lines
 }
 
 /// The credential's auth TYPE (oauth/api), orthogonal to its model group.
@@ -1296,6 +1513,23 @@ fn model_total(m: &ModelUsageDoc) -> u64 {
     m.tokens_in.saturating_add(m.tokens_out)
 }
 
+/// API-equivalent USD cost for one model row (item #4), computed inline at
+/// render time from the row's accumulated token parts (input/output + the
+/// optional cache split) via [`crate::pricing`]. The render path holds no
+/// config overrides, so an empty map = the built-in default rate table. An
+/// unknown/zero-rate `(group, model)` yields `0.0`.
+fn model_cost(m: &ModelUsageDoc) -> f64 {
+    crate::pricing::cost_from_parts(
+        &m.group,
+        &m.model,
+        m.tokens_in,
+        m.tokens_out,
+        m.cache_read,
+        m.cache_creation,
+        &std::collections::HashMap::new(),
+    )
+}
+
 /// "—" when unavailable (the upstream never reported it), else a human count —
 /// so the UI never implies a precise zero it does not have (req9).
 fn opt_count(v: Option<u64>) -> String {
@@ -1390,6 +1624,11 @@ fn draw_models_strip(frame: &mut Frame, area: Rect, view: &DashboardView, now: S
         }
         cells.push(Cell::from(format::human_count(m.requests)));
         cells.push(Cell::from(format::human_count(model_total(m))));
+        // API-equivalent cost ($) cell, right after tok (item #4).
+        cells.push(Cell::from(Span::styled(
+            format_cost(model_cost(m)),
+            Style::new().fg(Color::Green),
+        )));
         let mut last = model_age_compact(m.last_used_ms, now);
         if m.in_flight > 0 {
             last = format!("{} in-flight", m.in_flight);
@@ -1400,7 +1639,7 @@ fn draw_models_strip(frame: &mut Frame, area: Rect, view: &DashboardView, now: S
 
     let (header, constraints): (Vec<&'static str>, Vec<Constraint>) = if wide {
         (
-            vec!["", "group", "model", "share", "req", "tok", "last"],
+            vec!["", "group", "model", "share", "req", "tok", "$", "last"],
             vec![
                 Constraint::Length(2),
                 Constraint::Length(7),
@@ -1408,18 +1647,20 @@ fn draw_models_strip(frame: &mut Frame, area: Rect, view: &DashboardView, now: S
                 Constraint::Length(MODEL_BAR_WIDTH as u16 + 1),
                 Constraint::Length(7),
                 Constraint::Length(8),
+                Constraint::Length(9),
                 Constraint::Length(12),
             ],
         )
     } else {
         (
-            vec!["", "group", "model", "req", "tok", "last"],
+            vec!["", "group", "model", "req", "tok", "$", "last"],
             vec![
                 Constraint::Length(2),
                 Constraint::Length(7),
                 Constraint::Fill(1),
                 Constraint::Length(7),
                 Constraint::Length(8),
+                Constraint::Length(9),
                 Constraint::Length(12),
             ],
         )
@@ -1511,6 +1752,11 @@ fn draw_models_table(
                 Cell::from(ok_err),
                 Cell::from(format::human_count(m.tokens_in)),
                 Cell::from(format::human_count(m.tokens_out)),
+                // API-equivalent cost ($) column, after out (item #4).
+                Cell::from(Span::styled(
+                    format_cost(model_cost(m)),
+                    Style::new().fg(Color::Green),
+                )),
             ];
             if wide {
                 cells.push(Cell::from(Span::styled(opt_count(m.cache_read), dim())));
@@ -1531,7 +1777,7 @@ fn draw_models_table(
     let (header, constraints): (Vec<&'static str>, Vec<Constraint>) = if wide {
         (
             vec![
-                "", "group", "model", "req", "ok/err", "in", "out", "cache", "last", "if",
+                "", "group", "model", "req", "ok/err", "in", "out", "$", "cache", "last", "if",
             ],
             vec![
                 Constraint::Length(2),
@@ -1541,6 +1787,7 @@ fn draw_models_table(
                 Constraint::Length(9),
                 Constraint::Length(8),
                 Constraint::Length(8),
+                Constraint::Length(9),
                 Constraint::Length(8),
                 Constraint::Length(8),
                 Constraint::Length(3),
@@ -1548,7 +1795,9 @@ fn draw_models_table(
         )
     } else {
         (
-            vec!["", "group", "model", "req", "ok/err", "in", "out", "if"],
+            vec![
+                "", "group", "model", "req", "ok/err", "in", "out", "$", "if",
+            ],
             vec![
                 Constraint::Length(2),
                 Constraint::Length(7),
@@ -1557,6 +1806,7 @@ fn draw_models_table(
                 Constraint::Length(9),
                 Constraint::Length(8),
                 Constraint::Length(8),
+                Constraint::Length(9),
                 Constraint::Length(3),
             ],
         )
@@ -1907,6 +2157,7 @@ mod tests {
             overlay,
             status_line: None,
             activity_scroll: 0,
+            expanded_activity: None,
             model_cursor: 0,
             add_input_len: 0,
             attach: None,
@@ -1915,8 +2166,9 @@ mod tests {
 
     fn render(view: &DashboardView, chrome: &Chrome, w: u16, h: u16) -> String {
         let mut terminal = Terminal::new(TestBackend::new(w, h)).expect("terminal");
+        let mut hits = None;
         terminal
-            .draw(|f| draw(f, Some(view), chrome))
+            .draw(|f| draw(f, Some(view), chrome, &mut hits))
             .expect("draw");
         terminal
             .backend()
@@ -2061,6 +2313,216 @@ mod tests {
         assert!(
             !text.contains("claude-opus-4-8"),
             "model label is abbreviated, not the raw claude- id (2b)"
+        );
+    }
+
+    // --- Feature A: cost display -------------------------------------------
+
+    #[test]
+    fn format_cost_decimal_scheme() {
+        // Exactly zero → fixed 4-decimal sentinel.
+        assert_eq!(format_cost(0.0), "$0.0000");
+        // Sub-dollar → 4 decimals so small per-request costs stay legible.
+        assert_eq!(format_cost(0.0123), "$0.0123");
+        assert_eq!(format_cost(0.999_94), "$0.9999");
+        // ≥ $1 → 2 decimals.
+        assert_eq!(format_cost(1.0), "$1.00");
+        assert_eq!(format_cost(3.775), "$3.77"); // round-half-to-even (banker's)
+        assert_eq!(format_cost(12.5), "$12.50");
+    }
+
+    #[test]
+    fn model_cost_matches_pricing_table() {
+        // opus: 5/25/0.5/6.25 per 1e6 → 200k in (1.0) + 100k out (2.5)
+        //   + 40k cache_read (0.02) = 3.52.
+        let mut m = model_row("claude", "claude-opus-4-8", 200_000, 100_000);
+        m.cache_read = Some(40_000);
+        m.cache_creation = None;
+        let cost = model_cost(&m);
+        assert!((cost - (1.0 + 2.5 + 0.02)).abs() < 1e-9, "got {cost}");
+        assert_eq!(format_cost(cost), "$3.52");
+    }
+
+    fn completed_request(
+        at_ms: u64,
+        group: Option<&str>,
+        model: Option<&str>,
+        input: u64,
+        output: u64,
+        status: u16,
+    ) -> Completed {
+        Completed {
+            at: UNIX_EPOCH + Duration::from_millis(at_ms),
+            body: CompletedBody::Request {
+                method: "POST".into(),
+                path: "/v1/messages".into(),
+                account: Some("a@x.com".into()),
+                status,
+                duration: Duration::from_millis(1_400),
+                tokens: Some(crate::tui::TokenCounts {
+                    input,
+                    output,
+                    ..Default::default()
+                }),
+                group: group.map(str::to_string),
+                model: model.map(str::to_string),
+                effort: None,
+            },
+        }
+    }
+
+    #[test]
+    fn activity_row_shows_cost() {
+        let mut view = view_with(Vec::new());
+        // opus: 1M input = $5.00; rendered inline after the tok count.
+        view.completed = vec![completed_request(
+            1_000,
+            Some("claude"),
+            Some("claude-opus-4-8"),
+            1_000_000,
+            0,
+            200,
+        )];
+        let text = render(&view, &chrome_overlay(Overlay::None), 200, 40);
+        assert!(text.contains("$5.00"), "activity row shows the $ cost");
+    }
+
+    #[test]
+    fn models_strip_and_table_show_cost_column() {
+        // No cache tokens so the cost is exactly the input rate (gpt-5.5: $5/1M).
+        let mut row = model_row("codex", "gpt-5.5", 1_000_000, 0);
+        row.cache_read = None;
+        let view = view_with(vec![row]);
+        // gpt-5.5 input = $5.00, in the MAIN compact strip.
+        let main = render(&view, &chrome_overlay(Overlay::None), 200, 40);
+        assert!(main.contains("$5.00"), "compact strip shows the $ cost");
+        // And in the full table (Stats overlay).
+        let stats = render(&view, &chrome_overlay(Overlay::Stats), 200, 40);
+        assert!(
+            stats.contains("$5.00"),
+            "full models table shows the $ cost"
+        );
+    }
+
+    // --- Feature B: hit-testing + expand -----------------------------------
+
+    fn key_of(entry: &Completed) -> ActivityKey {
+        entry.activity_key().expect("request entry has a key")
+    }
+
+    #[test]
+    fn hit_test_activity_maps_row_to_entry_and_ignores_outside() {
+        let area = Rect {
+            x: 0,
+            y: 10,
+            width: 80,
+            height: 10,
+        };
+        let k1 = ActivityKey {
+            at_ms: 1,
+            method: "POST".into(),
+            path: "/a".into(),
+            status: 200,
+        };
+        let k2 = ActivityKey {
+            at_ms: 2,
+            method: "POST".into(),
+            path: "/b".into(),
+            status: 200,
+        };
+        // Entry 1 occupies rows 11..14 (expanded: 3 rows), entry 2 is row 14.
+        let chrome = ActivityChrome {
+            area,
+            hits: vec![
+                ActivityHit {
+                    key: k1.clone(),
+                    y_start: 11,
+                    height: 3,
+                },
+                ActivityHit {
+                    key: k2.clone(),
+                    y_start: 14,
+                    height: 1,
+                },
+            ],
+        };
+        // Clicks within entry 1's row span (any of 11,12,13) map to k1.
+        assert_eq!(hit_test_activity(&chrome, 5, 11), Some(k1.clone()));
+        assert_eq!(hit_test_activity(&chrome, 5, 13), Some(k1));
+        // Row 14 → entry 2.
+        assert_eq!(hit_test_activity(&chrome, 5, 14), Some(k2));
+        // The title/border row (y=10) and below the last entry map to nothing.
+        assert_eq!(hit_test_activity(&chrome, 5, 10), None);
+        assert_eq!(hit_test_activity(&chrome, 5, 15), None);
+        // Outside the panel horizontally / vertically → None.
+        assert_eq!(hit_test_activity(&chrome, 99, 12), None);
+        assert_eq!(hit_test_activity(&chrome, 5, 0), None);
+    }
+
+    #[test]
+    fn click_expand_recorded_layout_round_trips_to_detail() {
+        // Render once to capture the hit layout, find the row a click lands on,
+        // set that key expanded, and re-render: the detail lines appear.
+        let entry = completed_request(
+            7_000,
+            Some("claude"),
+            Some("claude-opus-4-8"),
+            200_000,
+            100_000,
+            200,
+        );
+        let key = key_of(&entry);
+        let mut view = view_with(Vec::new());
+        view.completed = vec![entry];
+
+        // Capture layout (collapsed).
+        let mut hits = None;
+        let mut terminal = Terminal::new(TestBackend::new(200, 40)).expect("terminal");
+        let chrome = chrome_overlay(Overlay::None);
+        terminal
+            .draw(|f| draw(f, Some(&view), &chrome, &mut hits))
+            .expect("draw");
+        let layout = hits.expect("activity layout recorded");
+        assert!(!layout.hits.is_empty(), "the request row is a hit target");
+        let hit = &layout.hits[0];
+        // A click on the row's first line maps back to the same key.
+        assert_eq!(
+            hit_test_activity(&layout, layout.area.x + 1, hit.y_start),
+            Some(key.clone())
+        );
+
+        // Now render expanded and confirm the detail lines show.
+        let mut expanded_chrome = chrome_overlay(Overlay::None);
+        expanded_chrome.expanded_activity = Some(key);
+        let text = render(&view, &expanded_chrome, 200, 40);
+        assert!(text.contains("cache_read"), "expanded detail shows tokens");
+        assert!(
+            text.contains("$"),
+            "expanded detail shows per-component cost"
+        );
+        assert!(text.contains('▾'), "expanded row shows the open marker");
+    }
+
+    #[test]
+    fn notes_are_not_expandable_hit_targets() {
+        let mut view = view_with(Vec::new());
+        view.completed = vec![Completed {
+            at: UNIX_EPOCH + Duration::from_millis(1),
+            body: CompletedBody::Note {
+                text: "switch a → b".into(),
+                error: false,
+            },
+        }];
+        let mut hits = None;
+        let mut terminal = Terminal::new(TestBackend::new(120, 20)).expect("terminal");
+        let chrome = chrome_overlay(Overlay::None);
+        terminal
+            .draw(|f| draw(f, Some(&view), &chrome, &mut hits))
+            .expect("draw");
+        let layout = hits.expect("layout");
+        assert!(
+            layout.hits.is_empty(),
+            "a note line is not a clickable hit target"
         );
     }
 }
