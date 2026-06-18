@@ -1,6 +1,6 @@
 [package]
 name = "llmux"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 license = "MIT"
 description = "Multi-account, multi-provider LLM proxy for Claude Code with quota-maximizing scheduling"
