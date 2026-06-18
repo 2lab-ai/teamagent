@@ -504,14 +504,25 @@ async fn exhausted_pool_returns_429_with_soonest_reset_retry_after() {
 
 /// A 429 WITHOUT `retry-after` is a transient, server-side limit (Anthropic
 /// "Server is temporarily limiting requests (not your usage limit)"), NOT the
-/// account's quota. Each account gets only a SHORT self-healing park, so when
-/// every account momentarily 429s the client is told to retry in seconds — not
-/// the 60-minute heuristic that used to strand fully-usable accounts.
+/// account's quota. Each account gets only a SHORT self-healing park.
+///
+/// Regression for the heuristic-cooldown LOCKOUT: a retry-after-less 429 burst
+/// briefly parks every account, but the request must NOT hard-refuse for the
+/// full park. Heuristic-degraded selection drops the heuristic-cooldown gate
+/// once the whole pool is parked that way and serves the soonest-freed account.
+/// So after both accounts momentarily 429, the SAME request recovers onto the
+/// soonest-freed account (here the mock's default 200) instead of returning a
+/// 429 lockout.
+///
+/// (Before the fix this test asserted a hard `429` after two attempts — that
+/// encoded the bug: one over-budget request parked the whole pool for 30s and
+/// every later request got a local `429, 0.0s` refuse until the park expired.)
 #[tokio::test]
-async fn no_retry_after_429_parks_briefly_not_an_hour() {
+async fn no_retry_after_429_recovers_via_degraded_mode_not_a_lockout() {
     let mock = MockUpstream::spawn().await;
     mock.push(ScriptedResponse::RateLimited { retry_after: None });
     mock.push(ScriptedResponse::RateLimited { retry_after: None });
+    // Third attempt falls through to the mock's DEFAULT_OK 200.
     let proxy = Proxy::spawn(
         &mock.base_url(),
         vec![oauth_account("a", "at-a"), oauth_account("b", "at-b")],
@@ -520,23 +531,27 @@ async fn no_retry_after_429_parks_briefly_not_an_hour() {
 
     let client = reqwest::Client::new();
     let response = post_messages(&client, &proxy, "{}").await;
-    assert_eq!(response.status(), 429);
-    let retry_after: u64 = response
-        .headers()
-        .get("retry-after")
-        .expect("retry-after header")
-        .to_str()
-        .expect("ascii")
-        .parse()
-        .expect("seconds");
-    assert!(
-        retry_after <= 30,
-        "transient 429 → short park, got {retry_after}s (was 3600 before the fix)"
-    );
     assert_eq!(
-        mock.seen_bearers(),
-        vec!["Bearer at-a".to_string(), "Bearer at-b".to_string()],
-        "both accounts were tried before giving up"
+        response.status(),
+        200,
+        "the transient burst recovers on a degraded-mode lease, not a hard 429 lockout"
+    );
+    // a 429s, b 429s, then — instead of a hard pool refuse — degraded mode
+    // re-leases a heuristic-parked account and the request is served. (Which of
+    // the two it lands on depends on sub-second park ordering / stickiness; the
+    // load-bearing fact is that a THIRD attempt happened at all.)
+    let bearers = mock.seen_bearers();
+    assert_eq!(
+        bearers.len(),
+        3,
+        "both parked, then degraded selection retried a freed account (no lockout): {bearers:?}"
+    );
+    assert_eq!(bearers[0], "Bearer at-a");
+    assert_eq!(bearers[1], "Bearer at-b");
+    assert!(
+        bearers[2] == "Bearer at-a" || bearers[2] == "Bearer at-b",
+        "the third attempt re-leases a parked account, got {:?}",
+        bearers[2]
     );
 }
 

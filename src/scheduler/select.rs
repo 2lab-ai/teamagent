@@ -7,7 +7,7 @@
 use std::cmp::Ordering;
 use std::time::{Duration, SystemTime};
 
-use super::{AccountId, AccountSnapshot, PoolSnapshot};
+use super::{AccountId, AccountSnapshot, CooldownSource, PoolSnapshot};
 use crate::config::SchedulerConfig;
 use crate::routing::BackendGroup;
 
@@ -70,10 +70,36 @@ pub fn eligibility(
     now: SystemTime,
     headers_only: bool,
 ) -> Option<IneligibleReason> {
+    gate(account, params, now, headers_only, false)
+}
+
+/// The full eligibility gate, parameterized by both degraded modes:
+/// `headers_only` drops the staleness gate (all-stale fallback), and
+/// `heuristic_degraded` drops the cooldown gate for accounts parked SOLELY by
+/// a [`CooldownSource::Heuristic`] cooldown (retry-after-less 429 lockout
+/// fallback). RetryAfter parks, auth failure, and the 5h/7d quota ceilings
+/// STILL gate in either mode — only the transient heuristic guess is bypassed.
+///
+/// `eligibility` is the public, non-degraded-cooldown form (`heuristic_degraded
+/// = false`) used everywhere display/status care about the real cooldown; the
+/// selection path ([`pick`], `commit_switch`, `lease_for`) calls this directly
+/// with the degraded flag when [`heuristic_degraded_mode`] holds.
+pub fn gate(
+    account: &AccountSnapshot,
+    params: &SelectParams,
+    now: SystemTime,
+    headers_only: bool,
+    heuristic_degraded: bool,
+) -> Option<IneligibleReason> {
     if !account.healthy {
         return Some(IneligibleReason::AuthUnhealthy);
     }
-    if account.cooldown_until.is_some_and(|until| until > now) {
+    // A cooldown gates UNLESS we are in heuristic-degraded mode and this park
+    // is a Heuristic one — a RetryAfter park is an explicit upstream
+    // instruction and always gates.
+    if account.cooldown_until.is_some_and(|until| until > now)
+        && !(heuristic_degraded && account.cooldown_source == Some(CooldownSource::Heuristic))
+    {
         return Some(IneligibleReason::CoolingDown);
     }
     let five = account
@@ -156,6 +182,54 @@ pub fn headers_only_mode(
     !any_eligible && any_stale_only
 }
 
+/// Heuristic-degraded mode (transient-429 lockout fallback): active when, in
+/// the group scope, NO account passes the full gate AND at least one account is
+/// blocked SOLELY by a [`CooldownSource::Heuristic`] cooldown — i.e. it would
+/// be eligible if that one heuristic park were dropped (healthy, not
+/// RetryAfter-parked, 5h/7d under threshold, not stale).
+///
+/// A retry-after-less upstream 429 is a transient server-side blip, not the
+/// account's quota; the heuristic park exists only to rotate off a momentarily
+/// limited account. When a burst parks the WHOLE group that way, refusing all
+/// service for the full park is worse than retrying the soonest-freed account
+/// (upstream will 429 again if it is still limited, which the forward loop
+/// surfaces as a prompt transient 502 rather than a hard pool lockout). So in
+/// this mode the heuristic cooldown gate is dropped. RetryAfter parks,
+/// AuthUnhealthy, and real-quota (5h/7d over threshold) STILL gate.
+///
+/// `group` scopes the decision exactly like [`headers_only_mode`]: a heuristic
+/// lockout in one backend group must not flip another group into degraded mode.
+pub fn heuristic_degraded_mode(
+    snapshot: &PoolSnapshot,
+    params: &SelectParams,
+    group: Option<BackendGroup>,
+    now: SystemTime,
+) -> bool {
+    let headers_only = headers_only_mode(snapshot, params, group, now);
+    let mut any_eligible = false;
+    let mut any_heuristic_only = false;
+    for account in &snapshot.accounts {
+        if !in_group(account, group) {
+            continue;
+        }
+        if eligibility(account, params, now, headers_only).is_none() {
+            any_eligible = true;
+            continue;
+        }
+        // Blocked solely by a Heuristic cooldown? It must currently gate ONLY
+        // on CoolingDown with a Heuristic source, and pass every other gate
+        // once that cooldown is dropped (heuristic_degraded = true).
+        let blocks_on_heuristic_cooldown = account.cooldown_source
+            == Some(CooldownSource::Heuristic)
+            && account.cooldown_until.is_some_and(|until| until > now)
+            && gate(account, params, now, headers_only, true).is_none();
+        if blocks_on_heuristic_cooldown {
+            any_heuristic_only = true;
+        }
+    }
+    !any_eligible && any_heuristic_only
+}
+
 /// Whether an account is in the selection scope: every account when `group`
 /// is `None` (routing off), only same-group accounts when `Some`.
 fn in_group(account: &AccountSnapshot, group: Option<BackendGroup>) -> bool {
@@ -183,17 +257,21 @@ pub fn pick(
     now: SystemTime,
 ) -> Decision {
     let headers_only = headers_only_mode(snapshot, params, group, now);
+    let heuristic_degraded = heuristic_degraded_mode(snapshot, params, group, now);
     let eligible: Vec<&AccountSnapshot> = snapshot
         .accounts
         .iter()
         .filter(|a| in_group(a, group))
-        .filter(|a| eligibility(a, params, now, headers_only).is_none())
+        .filter(|a| gate(a, params, now, headers_only, heuristic_degraded).is_none())
         .collect();
 
+    // In heuristic-degraded mode every candidate is heuristic-parked: rank by
+    // soonest `cooldown_until` so the next request lands on the soonest-freed
+    // account. Otherwise use the normal perishability comparator.
     let best = eligible
         .iter()
         .copied()
-        .min_by(|a, b| rank(a, b, params, group, now));
+        .min_by(|a, b| ranked(a, b, params, group, now, heuristic_degraded));
 
     // Stickiness with a perishability override: stay on an eligible current
     // unless some account is worth CLEARLY more right now — its score exceeds
@@ -202,17 +280,23 @@ pub fn pick(
     // margin (plus the 60s evaluation cadence) damps cache-thrashing hand-offs
     // between near-equal accounts. A switch off an *ineligible* current is
     // handled below (current is not in `eligible`, so this block is skipped).
-    if let Some(current_id) = group_current(snapshot, group) {
-        if let Some(current) = eligible.iter().copied().find(|a| &a.id == current_id) {
-            let clearly_better = match best {
-                Some(best) if &best.id != current_id => {
-                    account_score(best, params, now)
-                        > account_score(current, params, now) * (1.0 + SWITCH_MARGIN)
+    // Stickiness does not apply in heuristic-degraded mode: every candidate is
+    // parked, so `account_score` carries no usable-burst signal — honor the
+    // soonest-`cooldown_until` choice instead of camping the (also-parked)
+    // current.
+    if !heuristic_degraded {
+        if let Some(current_id) = group_current(snapshot, group) {
+            if let Some(current) = eligible.iter().copied().find(|a| &a.id == current_id) {
+                let clearly_better = match best {
+                    Some(best) if &best.id != current_id => {
+                        account_score(best, params, now)
+                            > account_score(current, params, now) * (1.0 + SWITCH_MARGIN)
+                    }
+                    _ => false,
+                };
+                if !clearly_better {
+                    return Decision::Stay;
                 }
-                _ => false,
-            };
-            if !clearly_better {
-                return Decision::Stay;
             }
         }
     }
@@ -335,6 +419,31 @@ pub fn account_score(account: &AccountSnapshot, params: &SelectParams, now: Syst
 /// rule is a NO-OP: every candidate is already in the same group, so there is
 /// no cross-group overflow to demote. It is kept for the `None` (legacy) path
 /// where codex is the cross-group overflow tier.
+/// Ranking comparator selector: in heuristic-degraded mode every candidate is
+/// parked, so rank by soonest `cooldown_until` (the soonest-freed account is
+/// served first, per the lockout-recovery contract), tiebreaking on stable id.
+/// Otherwise defer to the normal [`rank`] perishability comparator.
+fn ranked(
+    a: &AccountSnapshot,
+    b: &AccountSnapshot,
+    params: &SelectParams,
+    group: Option<BackendGroup>,
+    now: SystemTime,
+    heuristic_degraded: bool,
+) -> Ordering {
+    if heuristic_degraded {
+        // `None` cooldown_until sorts last (an account with no park should not
+        // be picked over a soon-to-free one, though in practice degraded mode
+        // implies every candidate is parked).
+        let key = |x: &AccountSnapshot| {
+            x.cooldown_until
+                .unwrap_or(SystemTime::UNIX_EPOCH + Duration::from_secs(u64::MAX / 2))
+        };
+        return key(a).cmp(&key(b)).then_with(|| a.id.cmp(&b.id));
+    }
+    rank(a, b, params, group, now)
+}
+
 fn rank(
     a: &AccountSnapshot,
     b: &AccountSnapshot,
@@ -1167,6 +1276,140 @@ mod tests {
         b.five_hour = Some(window_fetched(0.05, HOUR, NOW_SECS - 5000));
         let decision = pick(&pool(vec![a, b], Some("a")), &params(), None, now());
         assert_eq!(decision, Decision::Stay);
+    }
+
+    // ---- heuristic-degraded mode (retry-after-less 429 lockout recovery) ----
+
+    /// Account parked by a cooldown of `source`, freeing `free_in` secs out.
+    fn parked(id_: &str, source: CooldownSource, free_in: u64) -> AccountSnapshot {
+        let mut a = account(id_);
+        a.cooldown_until = Some(at(NOW_SECS + free_in));
+        a.cooldown_source = Some(source);
+        a
+    }
+
+    #[test]
+    fn all_heuristic_parked_enables_degraded_mode_and_picks_soonest_freed() {
+        // Whole pool parked by retry-after-less 429s (Heuristic). No account
+        // passes the full gate, so degraded mode activates and the SOONEST-freed
+        // account is chosen — not a hard exhaust.
+        let a = parked("a", CooldownSource::Heuristic, 8);
+        let b = parked("b", CooldownSource::Heuristic, 3); // frees soonest
+        let snapshot = pool(vec![a, b], None);
+        assert!(heuristic_degraded_mode(&snapshot, &params(), None, now()));
+        assert_eq!(
+            pick(&snapshot, &params(), None, now()),
+            Decision::Switch { to: id("b") },
+            "degraded mode serves the soonest-freed heuristic-parked account"
+        );
+    }
+
+    #[test]
+    fn one_eligible_account_disables_degraded_mode() {
+        // A is heuristic-parked but B is fresh and usable: no lockout, so
+        // degraded mode stays OFF and the normal selector picks the live B.
+        let a = parked("a", CooldownSource::Heuristic, 8);
+        let b = account("b");
+        let snapshot = pool(vec![a, b], None);
+        assert!(!heuristic_degraded_mode(&snapshot, &params(), None, now()));
+        assert_eq!(
+            pick(&snapshot, &params(), None, now()),
+            Decision::Switch { to: id("b") }
+        );
+    }
+
+    #[test]
+    fn retry_after_park_is_not_bypassed_by_degraded_mode() {
+        // A RetryAfter park is a real quota signal: even when it is the only
+        // blocker, degraded mode must NOT activate and the pool exhausts.
+        let a = parked("a", CooldownSource::RetryAfter, 120);
+        let b = parked("b", CooldownSource::RetryAfter, 120);
+        let snapshot = pool(vec![a, b], None);
+        assert!(!heuristic_degraded_mode(&snapshot, &params(), None, now()));
+        assert!(
+            matches!(
+                pick(&snapshot, &params(), None, now()),
+                Decision::Exhausted { .. }
+            ),
+            "retry-after parks stay gated — no degraded bypass"
+        );
+    }
+
+    #[test]
+    fn auth_unhealthy_is_not_bypassed_by_degraded_mode() {
+        // One account heuristic-parked, the other auth-failed. The auth-failed
+        // one must STAY gated; only the heuristic-parked one can be degraded to.
+        let a = parked("a", CooldownSource::Heuristic, 5);
+        let mut dead = account("b");
+        dead.healthy = false;
+        let snapshot = pool(vec![a, dead], None);
+        assert!(heuristic_degraded_mode(&snapshot, &params(), None, now()));
+        assert_eq!(
+            pick(&snapshot, &params(), None, now()),
+            Decision::Switch { to: id("a") },
+            "degrades onto the heuristic-parked account, never the auth-failed one"
+        );
+    }
+
+    #[test]
+    fn five_hour_over_threshold_is_not_bypassed_by_degraded_mode() {
+        // A heuristic-parked account that is ALSO over its 5h quota would still
+        // gate on the quota after the cooldown is dropped — so it does not make
+        // the pool degradable. With it the only blocker besides nothing, the
+        // pool exhausts (real quota, not a transient blip).
+        let mut over = parked("a", CooldownSource::Heuristic, 5);
+        over.five_hour = Some(window(0.95, HOUR)); // over 0.90 even if unparked
+        let snapshot = pool(vec![over], None);
+        assert!(
+            !heuristic_degraded_mode(&snapshot, &params(), None, now()),
+            "a real-quota-over account is not merely heuristic-blocked"
+        );
+        assert!(matches!(
+            pick(&snapshot, &params(), None, now()),
+            Decision::Exhausted { .. }
+        ));
+    }
+
+    #[test]
+    fn degraded_mode_prefers_heuristic_freed_over_a_separate_retry_after_park() {
+        // a: heuristic-parked, frees in 8s. b: RetryAfter-parked, frees in 2s.
+        // The RetryAfter park is NOT bypassable, so degraded mode picks a (the
+        // soonest-freed account AMONG the heuristic-eligible ones), not b.
+        let a = parked("a", CooldownSource::Heuristic, 8);
+        let b = parked("b", CooldownSource::RetryAfter, 2);
+        let snapshot = pool(vec![a, b], None);
+        assert!(heuristic_degraded_mode(&snapshot, &params(), None, now()));
+        assert_eq!(
+            pick(&snapshot, &params(), None, now()),
+            Decision::Switch { to: id("a") }
+        );
+    }
+
+    #[test]
+    fn degraded_mode_is_scoped_per_group() {
+        // Claude group fully heuristic-parked; a usable codex account exists.
+        // The claude group degrades onto its own parked account — it must not
+        // be flipped off degraded mode by the codex account, nor pick it.
+        let claude = parked("claude", CooldownSource::Heuristic, 5);
+        let codex = codex_account("codex");
+        let snapshot = pool_groups(vec![claude, codex], &[]);
+        assert!(heuristic_degraded_mode(
+            &snapshot,
+            &params(),
+            Some(BackendGroup::Claude),
+            now()
+        ));
+        assert_eq!(
+            pick(&snapshot, &params(), Some(BackendGroup::Claude), now()),
+            Decision::Switch { to: id("claude") }
+        );
+        // The codex group is not in degraded mode (its account is usable).
+        assert!(!heuristic_degraded_mode(
+            &snapshot,
+            &params(),
+            Some(BackendGroup::Codex),
+            now()
+        ));
     }
 
     // ---- exhaustion + soonest reset ----

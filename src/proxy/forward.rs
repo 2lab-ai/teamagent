@@ -924,14 +924,15 @@ fn acquire_lease(
     group: Option<BackendGroup>,
     params: &crate::scheduler::select::SelectParams,
 ) -> Result<crate::scheduler::AccountLease, Option<Duration>> {
-    if let Ok(lease) = state.pool.lease_for(group) {
+    if let Ok(lease) = state.pool.lease_for(group, params) {
         return Ok(lease);
     }
     match state.pool.evaluate(group, params, SystemTime::now()) {
         Decision::Exhausted { retry_after } => Err(retry_after),
-        Decision::Stay | Decision::Switch { .. } => {
-            state.pool.lease_for(group).map_err(|err| err.retry_after)
-        }
+        Decision::Stay | Decision::Switch { .. } => state
+            .pool
+            .lease_for(group, params)
+            .map_err(|err| err.retry_after),
     }
 }
 
@@ -2595,6 +2596,49 @@ mod tests {
         let body = response_body(response).await;
         let value: serde_json::Value = serde_json::from_slice(&body).expect("json");
         assert_eq!(value["error"]["type"], "rate_limit_error");
+    }
+
+    #[test]
+    fn heuristic_429_lockout_still_leases_an_account_not_a_hard_refuse() {
+        // The bug: a retry-after-less (Heuristic) 429 burst parks the WHOLE
+        // pool, after which every request used to get a hard local 429 for the
+        // full park (the lockout). With degraded-mode selection the next
+        // request must still acquire a lease — the soonest-freed account.
+        let upstream = "http://127.0.0.1:9"; // never reached by acquire_lease
+        let state = test_state(
+            upstream,
+            vec![oauth_account("a", "at-a"), oauth_account("b", "at-b")],
+        );
+        let params = state.select_params();
+        let now = SystemTime::now();
+        // Both accounts parked by retry-after-LESS 429s (Heuristic cooldowns).
+        state.pool.record_429(&AccountId("a".into()), None, now);
+        state.pool.record_429(&AccountId("b".into()), None, now);
+
+        // Degraded mode: a lease is still granted (no hard pool refuse).
+        let lease = acquire_lease(&state, None, &params)
+            .expect("degraded mode must still lease an account");
+        // It is one of the two parked accounts (the soonest-freed; here both
+        // were parked at the same instant so the stable id tiebreak picks "a").
+        assert_eq!(lease.account_id(), &AccountId("a".into()));
+        drop(lease);
+
+        // Contrast: a retry-after (RetryAfter) park on BOTH is a real quota
+        // signal — it must STILL hard-refuse, not degrade.
+        let state2 = test_state(
+            upstream,
+            vec![oauth_account("a", "at-a"), oauth_account("b", "at-b")],
+        );
+        state2
+            .pool
+            .record_429(&AccountId("a".into()), Some(Duration::from_secs(120)), now);
+        state2
+            .pool
+            .record_429(&AccountId("b".into()), Some(Duration::from_secs(120)), now);
+        assert!(
+            acquire_lease(&state2, None, &state2.select_params()).is_err(),
+            "RetryAfter parks are a real quota signal and must NOT be bypassed"
+        );
     }
 
     #[tokio::test]

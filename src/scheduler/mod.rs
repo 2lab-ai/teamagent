@@ -36,7 +36,13 @@ const LEGACY_GROUP: BackendGroup = BackendGroup::Claude;
 /// is SHORT (recover fast, let the client retry) and self-heals early on fresh
 /// data showing capacity. A 60-minute park here would strand a fully-usable
 /// account (≈2% utilized) for an hour on a momentary blip.
-pub const DEFAULT_HEURISTIC_COOLDOWN: Duration = Duration::from_secs(30);
+///
+/// 8s, not 30s: a retry-after-less 429 is a per-minute-window blip, so 30s
+/// over-parks. Paired with heuristic-degraded selection
+/// (`select::heuristic_degraded_mode`), which serves the soonest-freed account
+/// when an in-flight burst parks the whole group this way — so even this short
+/// park no longer hard-locks the pool.
+pub const DEFAULT_HEURISTIC_COOLDOWN: Duration = Duration::from_secs(8);
 
 /// Stable account identifier — the config `name`. Newtype so ids don't get
 /// mixed up with credentials or display strings.
@@ -333,7 +339,18 @@ impl PoolState {
             .find(|a| &a.id == target)
             .ok_or_else(|| SwitchError::UnknownAccount(target.clone()))?;
         let headers_only = select::headers_only_mode(&snapshot, params, group, now);
-        if let Some(reason) = select::eligibility(target_snapshot, params, now, headers_only) {
+        let heuristic_degraded = select::heuristic_degraded_mode(&snapshot, params, group, now);
+        // The selector may legitimately pick a Heuristic-parked account in
+        // heuristic-degraded mode (transient-429 lockout recovery); the commit
+        // re-validation must use the SAME gate so it does not reject what
+        // `pick` just chose.
+        if let Some(reason) = select::gate(
+            target_snapshot,
+            params,
+            now,
+            headers_only,
+            heuristic_degraded,
+        ) {
             return Err(SwitchError::TargetIneligible {
                 account: target.clone(),
                 reason,
@@ -488,9 +505,16 @@ impl AccountPool {
     /// account is selected for the group or the current one is hard-down
     /// (auth failure / active cooldown); threshold drift is left to the
     /// evaluation tick, per session stickiness.
+    ///
+    /// `params` lets the usability check honor heuristic-degraded mode: when
+    /// the WHOLE group is parked by retry-after-less (Heuristic) 429s the
+    /// selector picks the soonest-freed account, and this lease must accept it
+    /// rather than re-reject it on the raw `cooldown_until`. RetryAfter parks
+    /// and auth failure still refuse the lease.
     pub fn lease_for(
         &self,
         group: Option<BackendGroup>,
+        params: &select::SelectParams,
     ) -> Result<AccountLease, NoAccountAvailable> {
         let slot = group.unwrap_or(LEGACY_GROUP);
         let now = SystemTime::now();
@@ -501,11 +525,22 @@ impl AccountPool {
         let Some(current) = state.current.get(&slot).cloned() else {
             return Err(no_account(&state));
         };
-        let unusable = match state.accounts.iter().find(|a| a.id == current) {
-            Some(acct) => {
-                acct.health != AccountHealth::Healthy
-                    || acct.cooldown_until.is_some_and(|until| until > now)
-            }
+        let snapshot = state.snapshot();
+        let headers_only = select::headers_only_mode(&snapshot, params, group, now);
+        let heuristic_degraded = select::heuristic_degraded_mode(&snapshot, params, group, now);
+        let unusable = match snapshot.accounts.iter().find(|a| a.id == current) {
+            // Reuse the pure gate so the lease agrees with what the selector
+            // chose. Auth failure and a RetryAfter cooldown always refuse; a
+            // Heuristic cooldown refuses UNLESS the group is in degraded mode.
+            // 5h/7d/staleness gates are evaluation-tick concerns, not a reason
+            // to refuse a request already routed to the sticky current — so
+            // ignore those reasons here, matching the prior behavior (which
+            // refused only on health + active cooldown).
+            Some(acct) => matches!(
+                select::gate(acct, params, now, headers_only, heuristic_degraded),
+                Some(select::IneligibleReason::AuthUnhealthy)
+                    | Some(select::IneligibleReason::CoolingDown)
+            ),
             None => true,
         };
         if unusable {
@@ -837,6 +872,10 @@ mod tests {
 
     #[test]
     fn record_429_without_retry_after_uses_heuristic_default() {
+        // The transient (retry-after-less) park is SHORT: 8s, not the old 30s —
+        // a retry-after-less 429 is a per-minute-window blip, and degraded-mode
+        // selection serves the soonest-freed account meanwhile.
+        assert_eq!(DEFAULT_HEURISTIC_COOLDOWN, Duration::from_secs(8));
         let mut state = PoolState::from_accounts(&[oauth_account("a")]);
         state.record_429(&id("a"), None, now());
         let acct = &state.accounts[0];
@@ -1036,7 +1075,7 @@ mod tests {
             }
         );
         assert!(snap_legacy(&pool).is_none());
-        assert!(pool.lease_for(None).is_err());
+        assert!(pool.lease_for(None, &params()).is_err());
         // After the park expires the account is selectable again.
         assert_eq!(
             pool.evaluate(None, &params(), at(NOW_SECS + 3)),
@@ -1075,7 +1114,7 @@ mod tests {
     fn switch_to_does_not_cancel_in_flight_leases() {
         let pool = AccountPool::new(&[oauth_account("a"), oauth_account("b")]);
         pool.evaluate(None, &params(), now());
-        let lease = pool.lease_for(None).unwrap();
+        let lease = pool.lease_for(None, &params()).unwrap();
         assert_eq!(lease.account_id(), &id("a"));
 
         pool.switch_to(&id("b"), &params(), now()).unwrap();
@@ -1093,7 +1132,7 @@ mod tests {
     fn lease_pins_credential_across_switch_and_refresh() {
         let pool = AccountPool::new(&[oauth_account("a"), oauth_account("b")]);
         pool.evaluate(None, &params(), now());
-        let lease = pool.lease_for(None).unwrap();
+        let lease = pool.lease_for(None, &params()).unwrap();
         assert_eq!(lease.account_id(), &id("a"));
         assert_eq!(pool.snapshot().accounts[0].in_flight, 1);
 
@@ -1131,7 +1170,7 @@ mod tests {
     fn lease_for_without_selection_reports_soonest_reset() {
         let pool = AccountPool::new(&[oauth_account("a")]);
         pool.record_429(&id("a"), Some(Duration::from_secs(3600)), SystemTime::now());
-        let err = pool.lease_for(None).unwrap_err();
+        let err = pool.lease_for(None, &params()).unwrap_err();
         assert!(err.retry_after.is_some());
     }
 
@@ -1141,7 +1180,7 @@ mod tests {
         pool.evaluate(None, &params(), now());
         // Park far in the future relative to the real clock used by lease_for.
         pool.record_429(&id("a"), Some(Duration::from_secs(3600)), SystemTime::now());
-        assert!(pool.lease_for(None).is_err());
+        assert!(pool.lease_for(None, &params()).is_err());
     }
 
     #[test]
@@ -1213,7 +1252,9 @@ mod tests {
             Decision::Switch { to: id("cx") }
         );
         // Lease for the codex group returns the codex account.
-        let lease = pool.lease_for(Some(BackendGroup::Codex)).unwrap();
+        let lease = pool
+            .lease_for(Some(BackendGroup::Codex), &params())
+            .unwrap();
         assert_eq!(lease.account_id(), &id("cx"));
     }
 
@@ -1225,7 +1266,9 @@ mod tests {
             pool.evaluate(Some(BackendGroup::Codex), &params(), now()),
             Decision::Exhausted { retry_after: None }
         );
-        assert!(pool.lease_for(Some(BackendGroup::Codex)).is_err());
+        assert!(pool
+            .lease_for(Some(BackendGroup::Codex), &params())
+            .is_err());
         // The claude group is unaffected.
         assert_eq!(
             pool.evaluate(Some(BackendGroup::Claude), &params(), now()),
