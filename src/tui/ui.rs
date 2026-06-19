@@ -17,7 +17,7 @@ use crate::dashboard::ModelUsageDoc;
 use crate::logging::LogLine;
 use crate::routing::BackendGroup;
 use crate::scheduler::select::IneligibleReason;
-use crate::scheduler::window::QuotaWindow;
+use crate::scheduler::window::{classify_window_display, QuotaWindow, WindowDisplayState};
 use crate::scheduler::{select, AccountSnapshot};
 
 use super::activity::{ActivityKey, Completed, CompletedBody};
@@ -446,6 +446,15 @@ fn account_row<'a>(
         Span::raw(account.id.to_string())
     };
     let parked = matches!(gate, Some(IneligibleReason::CoolingDown));
+    // Poller-health overlay (issue #33): a failing usage poll makes every
+    // window's value suspect, so it surfaces as a distinct display state rather
+    // than collapsing to a plain percent/—. Codex has no usage poller, so it
+    // never reads as poll-degraded.
+    let consecutive_failures = view
+        .poll_health
+        .get(&account.id.0)
+        .map_or(0, |h| h.consecutive_failures);
+    let max_age = params.usage_max_age;
     let (five_gauge, five_reset) = window_cells(
         &account.five_hour,
         params.five_hour_max,
@@ -453,6 +462,8 @@ fn account_row<'a>(
         now,
         ctx.tz_offset,
         wide,
+        max_age,
+        consecutive_failures,
     );
     let (seven_gauge, seven_reset) = window_cells(
         &account.seven_day,
@@ -461,6 +472,8 @@ fn account_row<'a>(
         now,
         ctx.tz_offset,
         wide,
+        max_age,
+        consecutive_failures,
     );
     let totals = view.totals_for(&account.id.0);
 
@@ -608,6 +621,11 @@ fn in_flight_span(in_flight: u32) -> Span<'static> {
 /// threshold, which put a duration where a percent belongs and duplicated the
 /// reset column — confusing). Over-threshold is already signaled by the red
 /// color and a `!` marker; the countdown lives only in the reset column.
+///
+/// Issue #33: the gauge cell also carries the [`WindowDisplayState`] so a
+/// never-used (`cold`), stale, or poll-degraded window is visibly distinct from
+/// an honest `0%` — render-only, derived from already-recorded state.
+#[allow(clippy::too_many_arguments)]
 fn window_cells(
     window: &Option<QuotaWindow>,
     threshold: f64,
@@ -615,10 +633,18 @@ fn window_cells(
     now: SystemTime,
     tz_offset: i64,
     wide: bool,
+    max_age: Duration,
+    consecutive_failures: u32,
 ) -> (Cell<'static>, Cell<'static>) {
+    let display = classify_window_display(window, now, max_age, consecutive_failures);
     let Some(window) = window else {
+        // Cold (or poll-degraded with no window yet): show the state, not a bare
+        // — that reads the same as "0% used".
         return (
-            Cell::from(Span::styled("—", dim())),
+            Cell::from(Span::styled(
+                format!("{} {}", display.glyph(), display.label()),
+                dim(),
+            )),
             Cell::from(Span::styled("—", dim())),
         );
     };
@@ -632,14 +658,21 @@ fn window_cells(
     } else {
         format::percent(utilization)
     };
-    let gauge = Cell::from(Line::from(vec![
+    let mut spans = vec![
         Span::styled(
             format::gauge_bar(utilization, GAUGE_BAR_WIDTH),
             Style::new().fg(color),
         ),
         Span::raw(" "),
         Span::styled(label, Style::new().fg(color)),
-    ]));
+    ];
+    // Stale / poll-degraded windows still carry a real value, but it is no
+    // longer trustworthy — flag it with the state glyph so it reads distinctly
+    // from a fresh populated window (issue #33). Populated needs no marker.
+    if !matches!(display, WindowDisplayState::Populated) {
+        spans.push(Span::styled(format!(" {}", display.glyph()), dim()));
+    }
+    let gauge = Cell::from(Line::from(spans));
     let reset_cell = Cell::from(match reset_label(window, now, tz_offset, wide) {
         Some(label) => Span::raw(label),
         None => Span::styled("—", dim()),
@@ -952,8 +985,25 @@ fn draw_detail(
         ctx.tz_offset,
     ));
     lines.push(Line::from(token_line));
-    lines.push(window_detail_line("5h", &account.five_hour, ctx));
-    lines.push(window_detail_line("7d", &account.seven_day, ctx));
+    let consecutive_failures = view
+        .poll_health
+        .get(&account.id.0)
+        .map_or(0, |h| h.consecutive_failures);
+    let max_age = params.usage_max_age;
+    lines.push(window_detail_line(
+        "5h",
+        &account.five_hour,
+        ctx,
+        max_age,
+        consecutive_failures,
+    ));
+    lines.push(window_detail_line(
+        "7d",
+        &account.seven_day,
+        ctx,
+        max_age,
+        consecutive_failures,
+    ));
     let totals = view.totals_for(&account.id.0);
     lines.push(Line::from(vec![
         Span::styled(" life  ", dim()),
@@ -1060,12 +1110,19 @@ fn window_detail_line(
     name: &'static str,
     window: &Option<QuotaWindow>,
     ctx: &FrameCtx,
+    max_age: Duration,
+    consecutive_failures: u32,
 ) -> Line<'static> {
     let label = Span::styled(format!(" {name:<5} "), dim());
-    let Some(window) = window else {
-        return Line::from(vec![label, Span::styled("no data (cold)", dim())]);
-    };
     let now = ctx.now;
+    // Issue #33: surface the distinct display state in the detail pane too.
+    let display = classify_window_display(window, now, max_age, consecutive_failures);
+    let Some(window) = window else {
+        return Line::from(vec![
+            label,
+            Span::styled(format!("no data ({})", display.label()), dim()),
+        ]);
+    };
     let utilization = window.effective_utilization(now);
     let color = level_color(format::gauge_level(utilization));
     let reset = reset_label(window, now, ctx.tz_offset, true).unwrap_or_else(|| "expired".into());
@@ -1077,12 +1134,16 @@ fn window_detail_line(
         .duration_since(window.fetched_at)
         .map(select::compact_duration)
         .unwrap_or_else(|_| "0s".into());
-    Line::from(vec![
+    let mut spans = vec![
         label,
         Span::styled(format::percent(utilization), Style::new().fg(color)),
         Span::raw(format!(" · resets {reset}")),
         Span::styled(format!(" · {source} {age} ago"), dim()),
-    ])
+    ];
+    if !matches!(display, WindowDisplayState::Populated) {
+        spans.push(Span::styled(format!(" · {}", display.label()), dim()));
+    }
+    Line::from(spans)
 }
 
 /// One click-target inside the activity panel: a completed *request* entry, its

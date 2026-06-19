@@ -56,6 +56,88 @@ impl QuotaWindow {
     }
 }
 
+/// How one usage window should be *displayed*, distinct from the silent
+/// `—`/`0%` collapse the dashboard used to show for every non-populated case
+/// (issue #33). This is a pure, render-only classification: it spends no
+/// tokens, makes no upstream call, and never feeds back into scheduling — it
+/// only makes already-recorded state legible.
+///
+/// Precedence, strongest "trust this less" signal first:
+/// 1. [`Self::PollDegraded`] — the usage poller has `consecutive_failures > 0`,
+///    so whatever the window says may already be diverging from reality.
+/// 2. [`Self::Cold`] — no live window has ever been seen (window `None`, or an
+///    expired observation that carries no constraint). This is the never-used
+///    account the issue calls out: previously indistinguishable from "0% used".
+/// 3. [`Self::Stale`] — a live window exists but its observation is older than
+///    `max_age`; the value is real but no longer trustworthy for scheduling.
+/// 4. [`Self::Populated`] — a fresh, live window value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowDisplayState {
+    /// A fresh, live window value exists.
+    Populated,
+    /// No live window has ever been seen (cold / unknown account).
+    Cold,
+    /// A live window exists but is older than `max_age`.
+    Stale,
+    /// The usage poller is failing (`consecutive_failures > 0`); the window
+    /// value, if any, may be diverging from upstream.
+    PollDegraded,
+}
+
+impl WindowDisplayState {
+    /// A short, stable label for rendering and serialization.
+    pub fn label(self) -> &'static str {
+        match self {
+            WindowDisplayState::Populated => "populated",
+            WindowDisplayState::Cold => "cold",
+            WindowDisplayState::Stale => "stale",
+            WindowDisplayState::PollDegraded => "poll-degraded",
+        }
+    }
+
+    /// A single-glyph marker for the dense table cells.
+    pub fn glyph(self) -> char {
+        match self {
+            WindowDisplayState::Populated => '●',
+            WindowDisplayState::Cold => '○',
+            WindowDisplayState::Stale => '◑',
+            WindowDisplayState::PollDegraded => '!',
+        }
+    }
+}
+
+/// Classify one window observation for display (issue #33), render-only.
+///
+/// Mirrors the scheduler's own notion of "cold vs stale" ([`is_stale`] /
+/// `select::usage_is_stale`): an *expired* observation carries no constraint
+/// and degrades to [`WindowDisplayState::Cold`] rather than reading as stale,
+/// so a long-idle account that has reset shows as cold, not falsely stale.
+///
+/// Pure over its inputs — `now`, `max_age`, and the poller's
+/// `consecutive_failures` are all passed in, so this stays unit-testable and
+/// free of clocks/IO.
+pub fn classify_window_display(
+    window: &Option<QuotaWindow>,
+    now: SystemTime,
+    max_age: Duration,
+    consecutive_failures: u32,
+) -> WindowDisplayState {
+    if consecutive_failures > 0 {
+        return WindowDisplayState::PollDegraded;
+    }
+    match window {
+        // An expired observation no longer constrains; treat as never-seen.
+        Some(w) if !w.is_expired(now) => {
+            if w.is_stale(now, max_age) {
+                WindowDisplayState::Stale
+            } else {
+                WindowDisplayState::Populated
+            }
+        }
+        _ => WindowDisplayState::Cold,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -112,5 +194,92 @@ mod tests {
     fn future_fetched_at_is_not_stale() {
         let w = window(0.5, 10_000, 5000);
         assert!(!w.is_stale(at(1000), Duration::from_secs(1)));
+    }
+
+    // ---- WindowDisplayState (issue #33: distinct render states) ----
+
+    const MAX_AGE: Duration = Duration::from_secs(600);
+
+    #[test]
+    fn display_state_cold_when_window_never_seen() {
+        // The never-used account: window None. Previously collapsed to —/0%.
+        assert_eq!(
+            classify_window_display(&None, at(1000), MAX_AGE, 0),
+            WindowDisplayState::Cold,
+        );
+    }
+
+    #[test]
+    fn display_state_populated_when_fresh_and_live() {
+        let w = Some(window(0.42, 10_000, 1000));
+        assert_eq!(
+            classify_window_display(&w, at(1200), MAX_AGE, 0),
+            WindowDisplayState::Populated,
+        );
+    }
+
+    #[test]
+    fn display_state_stale_when_live_but_past_max_age() {
+        // Live (resets far in the future) but fetched > max_age ago.
+        let w = Some(window(0.42, 100_000, 1000));
+        assert_eq!(
+            classify_window_display(&w, at(1000 + 601), MAX_AGE, 0),
+            WindowDisplayState::Stale,
+        );
+    }
+
+    #[test]
+    fn display_state_expired_window_reads_cold_not_stale() {
+        // Old observation whose window has already reset carries no constraint:
+        // it degrades to cold (mirrors select::usage_is_stale), not stale.
+        let w = Some(window(0.42, 2000, 1000));
+        assert_eq!(
+            classify_window_display(&w, at(5000), MAX_AGE, 0),
+            WindowDisplayState::Cold,
+        );
+    }
+
+    #[test]
+    fn display_state_poll_degraded_overrides_window_value() {
+        // Even a fresh, populated window reads as poll-degraded when the poller
+        // is failing — the strongest "trust this less" signal.
+        let w = Some(window(0.42, 10_000, 1000));
+        assert_eq!(
+            classify_window_display(&w, at(1200), MAX_AGE, 1),
+            WindowDisplayState::PollDegraded,
+        );
+        // And it applies to a cold window too.
+        assert_eq!(
+            classify_window_display(&None, at(1200), MAX_AGE, 3),
+            WindowDisplayState::PollDegraded,
+        );
+    }
+
+    #[test]
+    fn display_states_are_distinct_across_the_four_cases() {
+        // The acceptance: empty / stale / poll-degraded / populated must NOT
+        // all collapse into one variant.
+        let fresh = Some(window(0.42, 10_000, 1000));
+        let stale = Some(window(0.42, 100_000, 1000));
+        let states = [
+            classify_window_display(&fresh, at(1200), MAX_AGE, 0),
+            classify_window_display(&None, at(1200), MAX_AGE, 0),
+            classify_window_display(&stale, at(1000 + 601), MAX_AGE, 0),
+            classify_window_display(&fresh, at(1200), MAX_AGE, 2),
+        ];
+        assert_eq!(
+            states,
+            [
+                WindowDisplayState::Populated,
+                WindowDisplayState::Cold,
+                WindowDisplayState::Stale,
+                WindowDisplayState::PollDegraded,
+            ],
+        );
+        // Labels/glyphs are distinct too, so the render is legible.
+        let labels: std::collections::HashSet<_> = states.iter().map(|s| s.label()).collect();
+        assert_eq!(labels.len(), 4, "all four labels must be distinct");
+        let glyphs: std::collections::HashSet<_> = states.iter().map(|s| s.glyph()).collect();
+        assert_eq!(glyphs.len(), 4, "all four glyphs must be distinct");
     }
 }
