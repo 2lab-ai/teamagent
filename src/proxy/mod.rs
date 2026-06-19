@@ -4,6 +4,7 @@
 pub mod codex_trace;
 pub mod forward;
 pub mod logging;
+pub mod raw_io;
 pub mod server;
 pub mod sse;
 

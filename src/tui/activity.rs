@@ -3,7 +3,11 @@
 //! Pure state — rendering lives in `ui`, timestamps are passed in.
 
 use std::collections::{HashMap, VecDeque};
-use std::time::{Duration, SystemTime};
+use std::io::Write as _;
+use std::path::Path;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
 
 use super::event::{ActivityEvent, TokenCounts};
 
@@ -190,6 +194,134 @@ fn sorted_counts(map: &HashMap<String, u64>) -> Vec<ModelCount> {
     counts
 }
 
+// ---------------------------------------------------------------------------
+// Persistence (req-persist): append-only JSONL of finished requests.
+//
+// Two user requirements satisfied by ONE store: (A) model/account stats survive
+// restart and continue cumulatively, and (C) activity request/response records
+// are persisted with no retention limit. The single source of truth is one
+// JSON line per `RequestFinished`, replayed on startup through the SAME `apply`
+// fold so the rebuilt aggregates are bit-for-bit identical to the live ones —
+// no double-counting. Mirrors `proxy::codex_trace`: best-effort append, every
+// IO/serde error swallowed, the request path is NEVER affected.
+// ---------------------------------------------------------------------------
+
+/// On-disk schema version for [`PersistedRequest`]. Bumped only on a
+/// breaking layout change; older/garbage lines are skipped on load, never
+/// fatal.
+const PERSIST_VERSION: u8 = 1;
+
+/// One finished request, serialized as a single JSON line. Carries exactly the
+/// fields of an [`ActivityEvent::RequestFinished`] needed to reconstruct it for
+/// replay (`Duration` flattened to `duration_ms`, `SystemTime` to `ts_ms` since
+/// the Unix epoch). Field-named JSON so adding a field stays backward-readable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PersistedRequest {
+    /// Schema version (`= PERSIST_VERSION`). Lines with an unknown version are
+    /// skipped on load.
+    pub v: u8,
+    /// Completion timestamp, millis since the Unix epoch.
+    pub ts_ms: u64,
+    pub id: u64,
+    pub method: String,
+    pub path: String,
+    pub account: Option<String>,
+    pub status: u16,
+    pub duration_ms: u64,
+    pub tokens: Option<TokenCounts>,
+    pub group: Option<String>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+}
+
+impl PersistedRequest {
+    /// Build a record from a `RequestFinished` event's fields + the `now` it was
+    /// folded at. Returns `None` for any other event variant (only finished
+    /// requests are persisted — notes/switches/polls are runtime-only).
+    pub(crate) fn from_event(event: &ActivityEvent, now: SystemTime) -> Option<Self> {
+        let ActivityEvent::RequestFinished {
+            id,
+            method,
+            path,
+            account,
+            status,
+            duration,
+            tokens,
+            group,
+            model,
+            effort,
+        } = event
+        else {
+            return None;
+        };
+        let ts_ms = now
+            .duration_since(UNIX_EPOCH)
+            .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+            .unwrap_or(0);
+        Some(Self {
+            v: PERSIST_VERSION,
+            ts_ms,
+            id: *id,
+            method: method.clone(),
+            path: path.clone(),
+            account: account.clone(),
+            status: *status,
+            duration_ms: u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
+            tokens: *tokens,
+            group: group.clone(),
+            model: model.clone(),
+            effort: effort.clone(),
+        })
+    }
+
+    /// Reconstruct the `(event, ts)` pair this record was built from, so replay
+    /// can fold it through `ActivityLog::apply` exactly as the live event was.
+    fn into_event(self) -> (ActivityEvent, SystemTime) {
+        let ts = UNIX_EPOCH + Duration::from_millis(self.ts_ms);
+        let event = ActivityEvent::RequestFinished {
+            id: self.id,
+            method: self.method,
+            path: self.path,
+            account: self.account,
+            status: self.status,
+            duration: Duration::from_millis(self.duration_ms),
+            tokens: self.tokens,
+            group: self.group,
+            model: self.model,
+            effort: self.effort,
+        };
+        (event, ts)
+    }
+}
+
+/// Append one finished-request record to `path` as a single JSON line,
+/// best-effort. A `None` path (no state dir), a non-`RequestFinished` event, or
+/// any IO/serde error is swallowed — exactly like [`crate::proxy::codex_trace`]
+/// — so persistence can never break or slow the request path. The parent dir is
+/// created if missing; the file is opened `create(true).append(true)`.
+pub(crate) fn persist_request(path: Option<&Path>, event: &ActivityEvent, now: SystemTime) {
+    let Some(path) = path else {
+        return;
+    };
+    let Some(record) = PersistedRequest::from_event(event, now) else {
+        return;
+    };
+    let Ok(line) = serde_json::to_string(&record) else {
+        return;
+    };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    else {
+        return;
+    };
+    let _ = writeln!(file, "{line}");
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct ActivityLog {
     capacity: usize,
@@ -210,6 +342,43 @@ impl ActivityLog {
         Self {
             capacity,
             ..Self::default()
+        }
+    }
+
+    /// Replay a persisted activity log (req-persist A/C): read `path`
+    /// line-by-line and fold every parseable [`PersistedRequest`] back through
+    /// [`Self::apply`] at its original timestamp, rebuilding the cumulative
+    /// model/account aggregates and seeding the activity ring. Same fold as the
+    /// live path → the restored math is identical, no double-counting.
+    ///
+    /// Best-effort and total: a `None` path or missing file is a no-op; a line
+    /// that is not valid JSON, or whose `v` is not the current
+    /// [`PERSIST_VERSION`], is skipped (tolerating corruption and old formats);
+    /// nothing here panics. The ring's capacity still bounds the in-memory
+    /// `completed` view — replaying a huge log keeps the totals but only the
+    /// newest `capacity` request lines stay visible (req C keeps the FILE
+    /// complete; the ring is the display window).
+    pub(crate) fn load_persisted(&mut self, path: Option<&Path>) {
+        let Some(path) = path else {
+            return;
+        };
+        let Ok(contents) = std::fs::read_to_string(path) else {
+            // Missing file (or unreadable) = nothing to resume from.
+            return;
+        };
+        for line in contents.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let Ok(record) = serde_json::from_str::<PersistedRequest>(line) else {
+                continue; // corrupt / not a PersistedRequest line
+            };
+            if record.v != PERSIST_VERSION {
+                continue; // older/newer schema — skip rather than misread
+            }
+            let (event, ts) = record.into_event();
+            self.apply(event, ts);
         }
     }
 
@@ -1022,5 +1191,393 @@ mod tests {
         log.apply(finished_status(1, None, None, 400), at(1));
         assert!(log.model_usage().is_empty());
         assert_eq!(log.totals_global().requests, 1);
+    }
+
+    // ---- persistence (req-persist A/C) ----
+
+    use std::path::{Path, PathBuf};
+
+    /// Self-cleaning unique temp dir (no tempfile dev-dependency), mirroring
+    /// the pattern in `config::tests` / `server::tests`.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "llmux-activity-test-{}-{}",
+                std::process::id(),
+                ulid::Ulid::new()
+            ));
+            std::fs::create_dir_all(&dir).expect("create temp dir");
+            Self(dir)
+        }
+        fn file(&self) -> PathBuf {
+            self.0.join("activity.jsonl")
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A finished, fully-attributed request for the persistence round-trip:
+    /// exercises account totals AND a `(group, model)` model row + cache split.
+    #[allow(clippy::too_many_arguments)]
+    fn finished_full(
+        id: u64,
+        account: &str,
+        group: &str,
+        model: &str,
+        effort: Option<&str>,
+        status: u16,
+        input: u64,
+        output: u64,
+        cache_read: Option<u64>,
+        path: &str,
+    ) -> ActivityEvent {
+        ActivityEvent::RequestFinished {
+            id,
+            method: "POST".into(),
+            path: path.into(),
+            account: Some(account.to_string()),
+            status,
+            duration: Duration::from_millis(1_234),
+            tokens: Some(TokenCounts {
+                input,
+                output,
+                cache_read,
+                cache_creation: None,
+            }),
+            group: Some(group.into()),
+            model: Some(model.into()),
+            effort: effort.map(str::to_string),
+        }
+    }
+
+    /// Apply the same events to a fresh log without persisting — the oracle the
+    /// restored log must match exactly.
+    fn live_log(events: &[(ActivityEvent, SystemTime)]) -> ActivityLog {
+        let mut log = ActivityLog::new(LOG_CAPACITY);
+        for (event, ts) in events {
+            log.apply(event.clone(), *ts);
+        }
+        log
+    }
+
+    /// Persist each event to `path`, then load a FRESH log from it.
+    fn persisted_then_loaded(path: &Path, events: &[(ActivityEvent, SystemTime)]) -> ActivityLog {
+        for (event, ts) in events {
+            persist_request(Some(path), event, *ts);
+        }
+        let mut log = ActivityLog::new(LOG_CAPACITY);
+        log.load_persisted(Some(path));
+        log
+    }
+
+    /// Compare two logs on every persisted-aggregate surface: model_usage,
+    /// global totals, and per-account totals. (model_usage carries last_used,
+    /// cache split, accounts, efforts, endpoints — so equality here is strong.)
+    fn assert_same_aggregates(a: &ActivityLog, b: &ActivityLog, accounts: &[&str]) {
+        assert_eq!(
+            a.model_usage(),
+            b.model_usage(),
+            "model_usage must match after restore"
+        );
+        assert_eq!(
+            a.totals_global(),
+            b.totals_global(),
+            "global totals must match after restore"
+        );
+        for acct in accounts {
+            assert_eq!(
+                a.totals_for(acct),
+                b.totals_for(acct),
+                "per-account totals for {acct} must match after restore"
+            );
+        }
+    }
+
+    #[test]
+    fn persisted_round_trip_rebuilds_identical_aggregates() {
+        let tmp = TempDir::new();
+        let path = tmp.file();
+        let events = vec![
+            (
+                finished_full(
+                    1,
+                    "a",
+                    "claude",
+                    "claude-sonnet-4-5[1m]",
+                    Some("16k"),
+                    200,
+                    700,
+                    300,
+                    Some(900),
+                    "/v1/messages",
+                ),
+                at(10),
+            ),
+            (
+                finished_full(
+                    2,
+                    "b",
+                    "codex",
+                    "gpt-5.5",
+                    Some("high"),
+                    200,
+                    50,
+                    20,
+                    None,
+                    "/v1/messages",
+                ),
+                at(20),
+            ),
+            (
+                finished_full(
+                    3,
+                    "a",
+                    "claude",
+                    "claude-sonnet-4-5",
+                    None,
+                    529,
+                    0,
+                    0,
+                    None,
+                    "/v1/messages/count_tokens",
+                ),
+                at(30),
+            ),
+        ];
+
+        let live = live_log(&events);
+        let restored = persisted_then_loaded(&path, &events);
+
+        assert_same_aggregates(&live, &restored, &["a", "b", "ghost"]);
+        // Sanity: the restore is non-trivial (two model rows, three requests).
+        assert_eq!(restored.model_usage().len(), 2);
+        assert_eq!(restored.totals_global().requests, 3);
+    }
+
+    #[test]
+    fn stats_continue_cumulatively_across_a_restart() {
+        let tmp = TempDir::new();
+        let path = tmp.file();
+
+        // Session 1: N events, persisted as they fold.
+        let session1 = vec![
+            (
+                finished_full(
+                    1,
+                    "a",
+                    "claude",
+                    "sonnet",
+                    Some("16k"),
+                    200,
+                    100,
+                    40,
+                    Some(10),
+                    "/v1/messages",
+                ),
+                at(10),
+            ),
+            (
+                finished_full(
+                    2,
+                    "a",
+                    "claude",
+                    "sonnet",
+                    None,
+                    200,
+                    200,
+                    60,
+                    None,
+                    "/v1/messages",
+                ),
+                at(20),
+            ),
+        ];
+        {
+            let mut log1 = ActivityLog::new(LOG_CAPACITY);
+            for (event, ts) in &session1 {
+                persist_request(Some(&path), event, *ts);
+                log1.apply(event.clone(), *ts);
+            }
+            // log1 dropped here — simulates daemon restart.
+        }
+
+        // Session 2: load the persisted log (resume), then M more events.
+        let mut log2 = ActivityLog::new(LOG_CAPACITY);
+        log2.load_persisted(Some(&path));
+        let session2 = vec![
+            (
+                finished_full(
+                    3,
+                    "a",
+                    "claude",
+                    "sonnet",
+                    None,
+                    200,
+                    300,
+                    90,
+                    None,
+                    "/v1/messages",
+                ),
+                at(30),
+            ),
+            (
+                finished_full(
+                    4,
+                    "b",
+                    "codex",
+                    "gpt-5.5",
+                    None,
+                    200,
+                    5,
+                    5,
+                    None,
+                    "/v1/messages",
+                ),
+                at(40),
+            ),
+        ];
+        for (event, ts) in &session2 {
+            log2.apply(event.clone(), *ts);
+        }
+
+        // Totals must equal ALL N+M events, not reset to just session 2.
+        let mut all = session1.clone();
+        all.extend(session2.clone());
+        let oracle = live_log(&all);
+        assert_same_aggregates(&oracle, &log2, &["a", "b"]);
+        assert_eq!(
+            log2.totals_global().requests,
+            4,
+            "stats continue, not reset"
+        );
+        // Account a: 3 requests, 600 in / 190 out across both sessions.
+        assert_eq!(log2.totals_for("a").requests, 3);
+        assert_eq!(log2.totals_for("a").tokens_in, 600);
+        assert_eq!(log2.totals_for("a").tokens_out, 190);
+    }
+
+    #[test]
+    fn corrupt_and_old_lines_are_tolerated() {
+        let tmp = TempDir::new();
+        let path = tmp.file();
+
+        // A valid line (write it through the real persist path).
+        persist_request(
+            Some(&path),
+            &finished_full(
+                1,
+                "a",
+                "claude",
+                "sonnet",
+                None,
+                200,
+                10,
+                5,
+                None,
+                "/v1/messages",
+            ),
+            at(10),
+        );
+        // Append garbage + a blank line + a wrong-version line by hand.
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .expect("reopen");
+            writeln!(f, "this is not json {{").expect("write garbage");
+            writeln!(f).expect("write blank");
+            // Structurally valid JSON but a future/unknown schema version.
+            writeln!(
+                f,
+                r#"{{"v":99,"ts_ms":1,"id":7,"method":"POST","path":"/x","account":null,"status":200,"duration_ms":1,"tokens":null,"group":null,"model":null,"effort":null}}"#
+            )
+            .expect("write old-version");
+        }
+        // Another valid line after the junk.
+        persist_request(
+            Some(&path),
+            &finished_full(
+                2,
+                "b",
+                "codex",
+                "gpt-5.5",
+                None,
+                200,
+                20,
+                8,
+                None,
+                "/v1/messages",
+            ),
+            at(20),
+        );
+
+        let mut log = ActivityLog::new(LOG_CAPACITY);
+        log.load_persisted(Some(&path)); // must not panic
+                                         // Only the two valid lines loaded; garbage + v99 skipped.
+        assert_eq!(log.totals_global().requests, 2);
+        assert_eq!(log.totals_for("a").requests, 1);
+        assert_eq!(log.totals_for("b").requests, 1);
+        assert!(
+            !log.model_usage().iter().any(|m| m.requests == 0),
+            "no phantom row from the skipped v99 line"
+        );
+    }
+
+    #[test]
+    fn persistence_is_best_effort_none_and_unwritable_paths_never_panic() {
+        // None path: persist + load are silent no-ops, fold still works.
+        let mut log = ActivityLog::new(LOG_CAPACITY);
+        let event = finished_full(
+            1,
+            "a",
+            "claude",
+            "sonnet",
+            None,
+            200,
+            10,
+            5,
+            None,
+            "/v1/messages",
+        );
+        persist_request(None, &event, at(10)); // no panic, nothing written
+        log.load_persisted(None); // no panic, no-op
+        log.apply(event, at(10)); // in-memory fold unaffected
+        assert_eq!(log.totals_global().requests, 1);
+
+        // Unwritable path: the parent is a *file*, so create_dir_all + open
+        // both fail — swallowed, no panic, in-memory state untouched.
+        let tmp = TempDir::new();
+        let blocker = tmp.0.join("not-a-dir");
+        std::fs::write(&blocker, b"x").expect("seed blocker file");
+        let bad = blocker.join("activity.jsonl"); // parent is a file
+        let mut log2 = ActivityLog::new(LOG_CAPACITY);
+        persist_request(
+            Some(&bad),
+            &finished_full(
+                2,
+                "a",
+                "claude",
+                "sonnet",
+                None,
+                200,
+                1,
+                1,
+                None,
+                "/v1/messages",
+            ),
+            at(20),
+        );
+        log2.load_persisted(Some(&bad)); // read fails → no-op, no panic
+        assert_eq!(
+            log2.totals_global().requests,
+            0,
+            "unwritable path wrote nothing"
+        );
     }
 }

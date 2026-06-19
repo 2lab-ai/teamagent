@@ -13,7 +13,7 @@ use std::time::Duration;
 /// and completion counts; the optional cache counters feed the model-usage
 /// rows and are `None` when the upstream did not report them (distinct from an
 /// explicit `Some(0)`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct TokenCounts {
     pub input: u64,
     pub output: u64,

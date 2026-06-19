@@ -155,13 +155,26 @@ pub trait SseTransform: Send {
 /// transform, and the transform's OUTPUT bytes are what the client receives
 /// (this is the codex path; the byte-identity path is
 /// [`passthrough_body`]). Backpressure/disconnect semantics are identical to
-/// the passthrough pump. `finish` receives the transform's usage, the first
-/// `capture_limit` EMITTED bytes, and the upstream error if one aborted the
-/// stream; callers move the account lease into it (never switch mid-stream).
+/// the passthrough pump.
+///
+/// `finish` receives the transform's usage, TWO independent observe-only
+/// buffers of the EMITTED Anthropic-SSE bytes, the upstream error if one
+/// aborted the stream, the finished transform, and whether the client
+/// disconnected:
+/// - `captured` — the first `capture_limit` emitted bytes (short debug log
+///   excerpt).
+/// - `raw_captured` — the first `raw_capture_limit` emitted bytes (raw-io
+///   full-payload tee).
+///
+/// Both are filled from the same emitted output, capped independently. Each
+/// emitted chunk is `tx.send`'d to the client FIRST; the copies are a side
+/// effect. Callers move the account lease into `finish` (never switch
+/// mid-stream).
 pub fn transform_body<T, F>(
     upstream: reqwest::Response,
     mut transform: T,
     capture_limit: usize,
+    raw_capture_limit: usize,
     finish: F,
 ) -> axum::body::Body
 where
@@ -169,12 +182,13 @@ where
     // `finish` also receives the finished transform (for converter-level detail
     // like the codex trace's raw usage / event count) and whether the relay
     // ended because the CLIENT disconnected (vs. upstream completing).
-    F: FnOnce(StreamUsage, Vec<u8>, Option<String>, &T, bool) + Send + 'static,
+    F: FnOnce(StreamUsage, Vec<u8>, RawCapture, Option<String>, &T, bool) + Send + 'static,
 {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(16);
     tokio::spawn(async move {
         let mut events = EventBuffer::new();
         let mut captured: Vec<u8> = Vec::new();
+        let mut raw_captured = RawCapture::new(raw_capture_limit);
         let mut error: Option<String> = None;
         let mut stream = Box::pin(upstream.bytes_stream());
         let mut client_gone = false;
@@ -186,11 +200,13 @@ where
                         if out.is_empty() {
                             continue;
                         }
-                        capture(&mut captured, &out, capture_limit);
-                        if tx.send(Ok(Bytes::from(out))).await.is_err() {
+                        // Send FIRST, then observe both buffers.
+                        if tx.send(Ok(Bytes::from(out.clone()))).await.is_err() {
                             client_gone = true;
                             break 'pump;
                         }
+                        capture(&mut captured, &out, capture_limit);
+                        raw_captured.push(&out);
                     }
                 }
                 Err(err) => {
@@ -202,23 +218,33 @@ where
         if let Some(rest) = events.take_remainder() {
             let out = transform.on_event(&rest);
             if !out.is_empty() && !client_gone {
-                capture(&mut captured, &out, capture_limit);
-                if tx.send(Ok(Bytes::from(out))).await.is_err() {
+                if tx.send(Ok(Bytes::from(out.clone()))).await.is_err() {
                     client_gone = true;
+                } else {
+                    capture(&mut captured, &out, capture_limit);
+                    raw_captured.push(&out);
                 }
             }
         }
         let tail = transform.on_end();
-        if !tail.is_empty() && !client_gone {
+        if !tail.is_empty() && !client_gone && tx.send(Ok(Bytes::from(tail.clone()))).await.is_ok()
+        {
             capture(&mut captured, &tail, capture_limit);
-            let _ = tx.send(Ok(Bytes::from(tail))).await;
+            raw_captured.push(&tail);
         }
         if let Some(err) = &error {
             if !client_gone {
                 let _ = tx.send(Err(std::io::Error::other(err.clone()))).await;
             }
         }
-        finish(transform.usage(), captured, error, &transform, client_gone);
+        finish(
+            transform.usage(),
+            captured,
+            raw_captured,
+            error,
+            &transform,
+            client_gone,
+        );
     });
     axum::body::Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx))
 }
@@ -230,49 +256,100 @@ fn capture(captured: &mut Vec<u8>, chunk: &[u8], limit: usize) {
     }
 }
 
+/// Observe-only accumulator for the raw-io full-payload tee: keeps at most
+/// `limit` bytes (memory bound) while counting the TOTAL bytes seen, so a body
+/// that overflows the cap can still be truncation-marked with the exact dropped
+/// count — unlike a bare `Vec` cap, which loses the overflow size. Filled AFTER
+/// each chunk is forwarded to the client; it never feeds back into the stream.
+#[derive(Debug, Default)]
+pub struct RawCapture {
+    bytes: Vec<u8>,
+    total: usize,
+    limit: usize,
+}
+
+impl RawCapture {
+    /// A tee bounded to `limit` retained bytes.
+    pub fn new(limit: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            total: 0,
+            limit,
+        }
+    }
+
+    /// Observe a chunk already forwarded to the client: count all of it, retain
+    /// up to the cap.
+    pub fn push(&mut self, chunk: &[u8]) {
+        self.total = self.total.saturating_add(chunk.len());
+        capture(&mut self.bytes, chunk, self.limit);
+    }
+
+    /// Total bytes seen (including those dropped past the cap).
+    pub fn total(&self) -> usize {
+        self.total
+    }
+
+    /// The retained (bounded) bytes; the kept prefix when the body overflowed.
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
 /// Relay an upstream SSE response as an axum body, observing usage on the
 /// side. The pump task ends when upstream finishes OR the client disconnects
 /// (the channel receiver is dropped, `send` fails, and we stop polling
 /// upstream — dropping the `reqwest::Response` closes the upstream stream).
 ///
-/// `finish` runs exactly once when the relay ends, with the accumulated
-/// usage, the first `capture_limit` relayed bytes (for request logging), and
-/// the upstream error if one aborted the stream. Callers move the account
-/// lease into this closure so the account stays pinned for the stream's
-/// lifetime — errors after this point propagate to the client as a broken
-/// body, never as an account switch (never switch mid-stream).
+/// `finish` runs exactly once when the relay ends, with the accumulated usage,
+/// TWO independent observe-only buffers, and the upstream error if one aborted
+/// the stream:
+/// - `captured` — the first `capture_limit` relayed bytes (the short debug
+///   request-log excerpt, typically 8 KiB).
+/// - `raw_captured` — the first `raw_capture_limit` relayed bytes (the raw-io
+///   full-payload tee, typically `max_body_bytes` = 8 MiB).
+///
+/// Both are filled from the SAME forwarded chunks but capped independently, so
+/// the debug log stays a short excerpt while raw-io retains the full (bounded)
+/// body. Each chunk is `tx.send`'d to the client FIRST; the copies are a side
+/// effect that never blocks, slows, or mutates the relayed bytes.
+///
+/// Callers move the account lease into this closure so the account stays pinned
+/// for the stream's lifetime — errors after this point propagate to the client
+/// as a broken body, never as an account switch (never switch mid-stream).
 pub fn passthrough_body<F>(
     upstream: reqwest::Response,
     capture_limit: usize,
+    raw_capture_limit: usize,
     finish: F,
 ) -> axum::body::Body
 where
-    F: FnOnce(StreamUsage, Vec<u8>, Option<String>) + Send + 'static,
+    F: FnOnce(StreamUsage, Vec<u8>, RawCapture, Option<String>) + Send + 'static,
 {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(16);
     tokio::spawn(async move {
         let mut events = EventBuffer::new();
         let mut usage = StreamUsage::default();
         let mut captured: Vec<u8> = Vec::new();
+        let mut raw_captured = RawCapture::new(raw_capture_limit);
         let mut error: Option<String> = None;
         let mut stream = Box::pin(upstream.bytes_stream());
         while let Some(item) = stream.next().await {
             match item {
                 Ok(chunk) => {
-                    if captured.len() < capture_limit {
-                        let room = capture_limit - captured.len();
-                        captured.extend_from_slice(&chunk[..chunk.len().min(room)]);
-                    }
                     for event in events.push(&chunk) {
                         if let Some(observed) = extract_usage(&event) {
                             usage.add(observed);
                         }
                     }
                     // Backpressure: bounded channel; client disconnect drops
-                    // the receiver and we stop polling upstream.
-                    if tx.send(Ok(chunk)).await.is_err() {
+                    // the receiver and we stop polling upstream. Send FIRST,
+                    // then observe — the copies never delay the client.
+                    if tx.send(Ok(chunk.clone())).await.is_err() {
                         break;
                     }
+                    capture(&mut captured, &chunk, capture_limit);
+                    raw_captured.push(&chunk);
                 }
                 Err(err) => {
                     error = Some(err.to_string());
@@ -286,7 +363,7 @@ where
                 usage.add(observed);
             }
         }
-        finish(usage, captured, error);
+        finish(usage, captured, raw_captured, error);
     });
     axum::body::Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx))
 }

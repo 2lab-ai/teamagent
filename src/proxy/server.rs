@@ -110,6 +110,23 @@ pub struct AppState {
     /// Where refreshed tokens are persisted (read-merge-write). `None`
     /// disables persistence (tests).
     pub config_path: Option<PathBuf>,
+    /// Where finished requests are appended + replayed from on startup
+    /// (req-persist A/C: stats survive restart, activity records kept with no
+    /// retention). `None` disables activity persistence (unit tests; or no
+    /// resolvable state dir). Defaults in [`Self::new`] to the state-dir
+    /// `activity.jsonl`; e2e/integration callers override it to a tempdir so a
+    /// driven request never touches the user's real log — same pattern as
+    /// `config_path`.
+    pub activity_log_path: Option<PathBuf>,
+    /// Where raw request/response payloads are appended (Feature B) + pruned to
+    /// `config.raw_io.retention_days` on startup. DISTINCT from
+    /// [`Self::activity_log_path`] (which holds per-request metadata): this holds
+    /// the actual payload bytes. `None` disables capture (unit tests; or no
+    /// resolvable state dir). Defaults in [`Self::new`] to the state-dir
+    /// `raw-io.jsonl`; e2e/integration callers override it to a tempdir so a
+    /// driven request never touches the user's real log — same pattern as
+    /// `activity_log_path`.
+    pub raw_io_path: Option<PathBuf>,
     /// Activity feed emit side. The proxy / poller / refresher `try_send` and
     /// drop on full — best-effort observability, never backpressure (see
     /// `tui::event`). The matching receiver is folded into [`Self::hub`] by
@@ -190,6 +207,8 @@ impl AppState {
             refresher: Arc::new(refresher),
             totals: Arc::new(UsageTotals::default()),
             config_path: crate::config::config_path().ok(),
+            activity_log_path: crate::cli::daemon::activity_log_path(),
+            raw_io_path: crate::cli::daemon::raw_io_path(),
             bound_port: Arc::new(AtomicU16::new(config.proxy.port)),
             config,
             events: Some(events_tx),
@@ -370,6 +389,29 @@ pub async fn serve(
     ready: Option<tokio::sync::oneshot::Sender<SocketAddr>>,
 ) -> Result<(), ProxyError> {
     let params = state.select_params();
+
+    // Arm activity persistence + resume cumulative model/account stats from the
+    // persisted log (req-persist A/C). Done once here — the single production
+    // serve chokepoint — before the fold task starts appending new finished
+    // requests, so a restarted daemon continues the totals instead of resetting
+    // them. The path comes from `state` (state dir for a real daemon, a tempdir
+    // for e2e), so this never touches the user's real log under test.
+    // Best-effort: a missing log leaves an empty hub; `None` disables it.
+    state.hub.arm_persistence(state.activity_log_path.clone());
+
+    // Prune the raw-io payload log (Feature B) to its retention window, once at
+    // startup, alongside activity persistence. Guarded by config: `enabled =
+    // false` skips it, `retention_days = 0` keeps everything (prune is a no-op).
+    // Best-effort and total — a missing/corrupt log never fails startup (see
+    // `proxy::raw_io::prune`). The path is `None` under unit/e2e callers with no
+    // state dir, which is itself a no-op.
+    if state.config.raw_io.enabled {
+        crate::proxy::raw_io::prune(
+            state.raw_io_path.as_deref(),
+            state.config.raw_io.retention_days,
+            crate::proxy::raw_io::now_ms(),
+        );
+    }
 
     // Dashboard fold: the single consumer of the activity-event channel (and,
     // in TUI mode, the tracing-bridge channel) into the hub. Spawned once —
