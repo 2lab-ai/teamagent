@@ -14,4 +14,5 @@ pub mod provider;
 pub mod proxy;
 pub mod routing;
 pub mod scheduler;
+pub mod session;
 pub mod tui;

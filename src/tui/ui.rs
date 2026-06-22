@@ -124,6 +124,7 @@ pub(crate) fn draw(
         Overlay::Accounts => draw_accounts_overlay(frame, view, &ctx, chrome),
         Overlay::Stats => draw_stats_overlay(frame, view, &ctx, chrome),
         Overlay::Logs => draw_logs_overlay(frame, view),
+        Overlay::Sessions => draw_sessions_overlay(frame, &ctx, chrome),
     }
 
     // The footer keybar is part of the chrome and reflects the active overlay /
@@ -325,6 +326,197 @@ fn draw_logs_overlay(frame: &mut Frame, view: &DashboardView) {
     let area = overlay_rect(frame.area());
     frame.render_widget(Clear, area);
     draw_logs(frame, area, view);
+}
+
+/// Sessions overlay (`s`, issue #34): the persisted raw-io log folded by
+/// `metadata.user_id` into a confidence-labeled session timeline, above a
+/// per-session detail pane for the cursored row. Renders from the snapshot held
+/// on `Chrome` (taken when the overlay opened) — metadata only, no prompt
+/// content. On a side-by-side width the detail sits beside the list; otherwise
+/// the list takes the whole rect.
+fn draw_sessions_overlay(frame: &mut Frame, ctx: &FrameCtx, chrome: &Chrome) {
+    let area = overlay_rect(frame.area());
+    frame.render_widget(Clear, area);
+    if chrome.sessions.is_empty() {
+        let empty = Paragraph::new(Line::from(Span::styled(
+            "no sessions yet — enable raw-io capture and send requests through the proxy",
+            Style::new().fg(Color::Yellow),
+        )))
+        .block(Block::new().borders(Borders::TOP).title(" sessions "));
+        frame.render_widget(empty, area);
+        return;
+    }
+    if area.width >= SIDE_BY_SIDE_AT {
+        let [list_area, detail_area] =
+            Layout::horizontal([Constraint::Fill(1), Constraint::Length(46)]).areas(area);
+        draw_sessions_table(frame, list_area, ctx, chrome);
+        draw_session_detail(frame, detail_area, ctx, chrome);
+    } else {
+        draw_sessions_table(frame, area, ctx, chrome);
+    }
+}
+
+/// The session timeline table. Columns: confidence label, user_id, request
+/// count, tokens in/out, distinct models, distinct accounts + rotation count,
+/// and the wall-clock span. The cursored row is highlighted; the title shows the
+/// cursor position so it is obvious more rows exist off-screen.
+fn draw_sessions_table(frame: &mut Frame, area: Rect, ctx: &FrameCtx, chrome: &Chrome) {
+    let total = chrome.sessions.len();
+    let cursor = chrome.session_cursor.min(total.saturating_sub(1));
+    let capacity = (area.height.saturating_sub(2) as usize).max(1); // border + header
+    let start = if cursor >= capacity {
+        cursor + 1 - capacity
+    } else {
+        0
+    };
+    let end = (start + capacity).min(total);
+
+    let rows = chrome.sessions[start..end]
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let idx = start + i;
+            let conf_color = match s.confidence {
+                crate::session::Confidence::High => Color::Green,
+                crate::session::Confidence::Low => Color::DarkGray,
+            };
+            let cells = vec![
+                Cell::from(Span::styled(
+                    s.confidence.label(),
+                    Style::new().fg(conf_color),
+                )),
+                Cell::from(session_id_label(s)),
+                Cell::from(format::human_count(s.requests)),
+                Cell::from(format::human_count(s.tokens_in)),
+                Cell::from(format::human_count(s.tokens_out)),
+                Cell::from(format::human_count(s.models.len() as u64)),
+                Cell::from(session_accounts_label(s)),
+                Cell::from(Span::styled(session_span_label(s), dim())),
+            ];
+            let row = Row::new(cells);
+            if idx == cursor {
+                row.style(Style::new().add_modifier(Modifier::REVERSED))
+            } else {
+                row
+            }
+        });
+
+    let header = vec!["conf", "session", "req", "in", "out", "mdl", "acct", "span"];
+    let constraints = vec![
+        Constraint::Length(5),
+        Constraint::Fill(1),
+        Constraint::Length(7),
+        Constraint::Length(8),
+        Constraint::Length(8),
+        Constraint::Length(5),
+        Constraint::Length(10),
+        Constraint::Length(9),
+    ];
+    let title = format!(" sessions — {} of {total} ", cursor + 1);
+    let table = Table::new(rows, constraints)
+        .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)))
+        .block(Block::new().borders(Borders::TOP).title(title));
+    frame.render_widget(table, area);
+    let _ = ctx;
+}
+
+/// Drill-down pane for the cursored session: the grouping confidence, the full
+/// user_id, the model list, the account list + rotation count, the token split,
+/// and the absolute time span. Metadata only.
+fn draw_session_detail(frame: &mut Frame, area: Rect, ctx: &FrameCtx, chrome: &Chrome) {
+    let cursor = chrome
+        .session_cursor
+        .min(chrome.sessions.len().saturating_sub(1));
+    let Some(s) = chrome.sessions.get(cursor) else {
+        return;
+    };
+    let models = if s.models.is_empty() {
+        "—".to_string()
+    } else {
+        s.models.join(", ")
+    };
+    let accounts = if s.accounts.is_empty() {
+        "—".to_string()
+    } else {
+        s.accounts.join(", ")
+    };
+    let first = format::absolute_label(ms_to_systemtime(s.first_ms), ctx.now, ctx.tz_offset);
+    let last = format::absolute_label(ms_to_systemtime(s.last_ms), ctx.now, ctx.tz_offset);
+    let lines = vec![
+        Line::from(vec![
+            Span::styled("confidence  ", dim()),
+            Span::styled(
+                s.confidence.label(),
+                match s.confidence {
+                    crate::session::Confidence::High => Style::new().fg(Color::Green),
+                    crate::session::Confidence::Low => dim(),
+                },
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("user_id     ", dim()),
+            Span::raw(s.user_id.clone().unwrap_or_else(|| "(ungrouped)".into())),
+        ]),
+        Line::from(vec![
+            Span::styled("requests    ", dim()),
+            Span::raw(format::human_count(s.requests)),
+        ]),
+        Line::from(vec![
+            Span::styled("tokens      ", dim()),
+            Span::raw(format!(
+                "{} in / {} out",
+                format::human_count(s.tokens_in),
+                format::human_count(s.tokens_out)
+            )),
+        ]),
+        Line::from(vec![Span::styled("models      ", dim()), Span::raw(models)]),
+        Line::from(vec![
+            Span::styled("accounts    ", dim()),
+            Span::raw(accounts),
+        ]),
+        Line::from(vec![
+            Span::styled("rotations   ", dim()),
+            Span::raw(s.account_rotations.to_string()),
+        ]),
+        Line::from(vec![Span::styled("first       ", dim()), Span::raw(first)]),
+        Line::from(vec![Span::styled("last        ", dim()), Span::raw(last)]),
+        Line::from(vec![
+            Span::styled("span        ", dim()),
+            Span::raw(session_span_label(s)),
+        ]),
+    ];
+    let detail = Paragraph::new(lines).block(Block::new().borders(Borders::TOP).title(" session "));
+    frame.render_widget(detail, area);
+}
+
+/// Display label for a session's grouping key: the user_id, or `(ungrouped)` for
+/// the catch-all bucket of records with no `metadata.user_id`.
+fn session_id_label(s: &crate::session::Session) -> String {
+    s.user_id.clone().unwrap_or_else(|| "(ungrouped)".into())
+}
+
+/// `acct ×N` where N is the distinct-account count; rotations are shown in the
+/// detail pane. A single account drops the multiplier.
+fn session_accounts_label(s: &crate::session::Session) -> String {
+    let n = s.accounts.len();
+    if n <= 1 {
+        n.to_string()
+    } else {
+        format!("{n} ×{}", s.account_rotations)
+    }
+}
+
+/// Wall-clock span of a session as a coarse duration ("3m 04s", "2h 11m").
+fn session_span_label(s: &crate::session::Session) -> String {
+    format::countdown(Duration::from_millis(s.span_ms()))
+}
+
+/// Millis-since-epoch → `SystemTime` for the absolute-time labels. Pure; a value
+/// that would overflow saturates to the epoch (never panics).
+fn ms_to_systemtime(ms: u64) -> SystemTime {
+    UNIX_EPOCH
+        .checked_add(Duration::from_millis(ms))
+        .unwrap_or(UNIX_EPOCH)
 }
 
 /// The rect a summoned overlay covers: the whole screen except the bottom two
@@ -2230,6 +2422,8 @@ fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome) {
                     Span::raw(" stats  "),
                     key("l"),
                     Span::raw(" logs  "),
+                    key("s"),
+                    Span::raw(" sessions  "),
                 ];
                 if attached {
                     spans.push(Span::styled("R disabled (attached)  ", dim()));
@@ -2283,6 +2477,18 @@ fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome) {
                 Span::raw(" logs — "),
                 key("l/Esc"),
                 Span::raw(" back  "),
+                key("q"),
+                Span::raw(" quit"),
+            ]),
+            // Sessions overlay (issue #34): navigation + back.
+            Overlay::Sessions => Line::from(vec![
+                Span::raw(" sessions — "),
+                key("s/Esc"),
+                Span::raw(" back  "),
+                key("↑/k ↓/j"),
+                Span::raw(" session  "),
+                key("PgUp/PgDn"),
+                Span::raw(" page  "),
                 key("q"),
                 Span::raw(" quit"),
             ]),
@@ -2425,6 +2631,8 @@ mod tests {
             expanded_activity: None,
             model_cursor: 0,
             stats_window: super::super::activity::StatsWindow::default(),
+            sessions: Vec::new(),
+            session_cursor: 0,
             add_input_len: 0,
             attach: None,
         }
@@ -2571,6 +2779,58 @@ mod tests {
             text.contains("proxy started on :3456"),
             "logs overlay shows the tail"
         );
+    }
+
+    /// Sessions overlay (issue #34): renders the folded session list with the
+    /// confidence label, the user_id, and the per-session aggregates.
+    #[test]
+    fn sessions_overlay_shows_session_rows_with_confidence_label() {
+        use crate::session::{Confidence, Session};
+        let view = view_with(Vec::new());
+        let mut chrome = chrome_overlay(Overlay::Sessions);
+        chrome.sessions = vec![
+            Session {
+                user_id: Some("u-active".into()),
+                requests: 12,
+                tokens_in: 3400,
+                tokens_out: 1200,
+                models: vec!["claude-sonnet-4".into(), "claude-opus-4".into()],
+                accounts: vec!["acct-a".into(), "acct-b".into()],
+                account_rotations: 3,
+                first_ms: 1_000_000,
+                last_ms: 1_600_000,
+                confidence: Confidence::High,
+            },
+            Session {
+                user_id: None,
+                requests: 1,
+                tokens_in: 0,
+                tokens_out: 0,
+                models: vec![],
+                accounts: vec!["acct-c".into()],
+                account_rotations: 0,
+                first_ms: 2_000_000,
+                last_ms: 2_000_000,
+                confidence: Confidence::Low,
+            },
+        ];
+        let text = render(&view, &chrome, 160, 30);
+        assert!(text.contains("sessions"), "sessions overlay titled");
+        assert!(text.contains("u-active"), "shows the user_id grouping key");
+        assert!(text.contains("high"), "shows the High confidence label");
+        assert!(
+            text.contains("low") || text.contains("(ungrouped)"),
+            "shows the ungrouped Low bucket"
+        );
+    }
+
+    /// An empty timeline (no captured raw-io) renders the hint, not a crash.
+    #[test]
+    fn sessions_overlay_empty_shows_hint() {
+        let view = view_with(Vec::new());
+        let chrome = chrome_overlay(Overlay::Sessions);
+        let text = render(&view, &chrome, 160, 30);
+        assert!(text.contains("no sessions yet"), "empty hint shown");
     }
 
     #[test]
