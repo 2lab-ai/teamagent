@@ -535,6 +535,13 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
         Err(response) => return *response,
     };
 
+    // On-demand idle probe (issue #21): real traffic to this group is the
+    // trigger to populate any windowless sibling account's 5h/7d data, so the
+    // scheduler ranks/displays them accurately. Fully gated (kill-switch +
+    // per-account cooldown) and spawned — a no-op when disabled, never adds
+    // latency to this request.
+    state.trigger_idle_probes(group);
+
     loop {
         // 1. Lease the current account for the group (evaluate on demand when
         // none).

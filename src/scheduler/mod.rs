@@ -7,6 +7,7 @@
 //! `select::pick` is a pure function over a `PoolSnapshot`.
 
 pub mod headers;
+pub mod idle_probe;
 pub mod select;
 pub mod usage;
 pub mod window;

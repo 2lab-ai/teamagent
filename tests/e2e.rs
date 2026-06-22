@@ -2163,6 +2163,149 @@ async fn oversized_request_body_returns_413_without_disturbing_in_flight() {
 }
 
 // ---------------------------------------------------------------------------
+// 11c. On-demand idle-account usage probe (issue #21)
+// ---------------------------------------------------------------------------
+
+/// Config with the idle probe (#21) enabled and a long per-account cooldown,
+/// pointed at the mock upstream. Two oauth accounts; `/api/oauth/usage` is
+/// left unscripted so the poller's 404 keeps both accounts windowless — the
+/// ONLY way a window gets populated is the on-demand `max_tokens = 1` probe.
+fn idle_probe_config(mock: &MockUpstream, cooldown_secs: u64) -> Config {
+    let mut config = Config {
+        upstream: mock.base_url(),
+        accounts: vec![oauth_account("a", "at-a"), oauth_account("b", "at-b")],
+        ..Default::default()
+    };
+    config.proxy.idle_probe.enabled = true;
+    config.proxy.idle_probe.per_account_cooldown_secs = cooldown_secs;
+    config
+}
+
+/// Poll the pool until `account` has a 5h window (the spawned probe is async),
+/// up to ~2s. Returns the window's utilization, or `None` if it never arrives.
+async fn await_five_hour(proxy: &Proxy, account: &str) -> Option<f64> {
+    for _ in 0..200 {
+        if let Some(util) = proxy
+            .pool
+            .snapshot()
+            .accounts
+            .iter()
+            .find(|a| a.id.0 == account)
+            .and_then(|a| a.five_hour)
+            .map(|w| w.utilization)
+        {
+            return Some(util);
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    None
+}
+
+/// Count how many probe-shaped requests (POST /v1/messages with `max_tokens:1`)
+/// the mock saw bearing `bearer`.
+fn probe_count(mock: &MockUpstream, bearer: &str) -> usize {
+    mock.seen()
+        .into_iter()
+        .filter(|s| {
+            s.path == "/v1/messages"
+                && s.authorization.as_deref() == Some(bearer)
+                && serde_json::from_slice::<serde_json::Value>(&s.body)
+                    .ok()
+                    .and_then(|v| v.get("max_tokens").and_then(|m| m.as_u64()))
+                    == Some(1)
+        })
+        .count()
+}
+
+/// Acceptance (#21): an idle (no-window) account is populated on demand by a
+/// single gated `max_tokens = 1` probe whose `anthropic-ratelimit-*` headers
+/// feed the 5h/7d windows; a per-account cooldown prevents a second probe.
+#[tokio::test]
+async fn idle_probe_populates_windows_once_and_respects_cooldown() {
+    let mock = MockUpstream::spawn().await;
+    // Probe responses (and the served request) all return unified headers by
+    // default — b's 5h reads 0.10 from `ScriptedResponse::ok`.
+    let proxy = Proxy::spawn_config(idle_probe_config(&mock, 3600)).await;
+
+    // Sanity: b starts windowless (poller's /api/oauth/usage 404s).
+    assert!(
+        proxy
+            .pool
+            .snapshot()
+            .accounts
+            .iter()
+            .find(|a| a.id.0 == "b")
+            .and_then(|a| a.five_hour)
+            .is_none(),
+        "b is idle (no window) before any traffic"
+    );
+
+    // First request: served by `a` (cold id-order winner); the forward path
+    // triggers an on-demand probe of the windowless sibling `b`.
+    let client = reqwest::Client::new();
+    let response = post_messages(&client, &proxy, "{}").await;
+    assert_eq!(response.status(), 200);
+
+    // b's 5h window is populated by the probe's response headers
+    // (WindowSource::Headers via record_headers).
+    let util = await_five_hour(&proxy, "b")
+        .await
+        .expect("b's 5h window populated by the idle probe");
+    assert!(
+        (util - 0.10).abs() < 1e-9,
+        "window came from the probe headers"
+    );
+    assert_eq!(
+        probe_count(&mock, "Bearer at-b"),
+        1,
+        "exactly one max_tokens=1 probe sent to the idle account"
+    );
+
+    // Second request within the cooldown: b already has a window AND is in
+    // cooldown, so NO further probe is sent to it.
+    let response = post_messages(&client, &proxy, "{}").await;
+    assert_eq!(response.status(), 200);
+    tokio::time::sleep(Duration::from_millis(100)).await; // let any spurious spawn run
+    assert_eq!(
+        probe_count(&mock, "Bearer at-b"),
+        1,
+        "cooldown + populated window suppress a second probe"
+    );
+}
+
+/// Acceptance (#21): the kill-switch (`enabled = false`) disables ALL probing
+/// — a windowless account is never probed even under traffic.
+#[tokio::test]
+async fn idle_probe_kill_switch_disables_probing() {
+    let mock = MockUpstream::spawn().await;
+    let mut config = idle_probe_config(&mock, 3600);
+    config.proxy.idle_probe.enabled = false; // kill-switch
+    let proxy = Proxy::spawn_config(config).await;
+
+    let client = reqwest::Client::new();
+    let response = post_messages(&client, &proxy, "{}").await;
+    assert_eq!(response.status(), 200);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    assert_eq!(
+        probe_count(&mock, "Bearer at-b"),
+        0,
+        "kill-switch: no probe sent to the idle account"
+    );
+    assert!(
+        proxy
+            .pool
+            .snapshot()
+            .accounts
+            .iter()
+            .find(|a| a.id.0 == "b")
+            .and_then(|a| a.five_hour)
+            .is_none(),
+        "b stays windowless with probing disabled"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // 12. Brew install (manual)
 // ---------------------------------------------------------------------------
 

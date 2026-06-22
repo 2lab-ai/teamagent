@@ -15,6 +15,7 @@ use axum::routing::{get, post};
 use axum::Router;
 use http::{header, HeaderValue, StatusCode};
 
+use super::idle_probe::ReqwestProber;
 use super::logging::RequestLogger;
 use super::{forward, ProxyError};
 use crate::auth::oauth::RefreshCoalescer;
@@ -22,6 +23,7 @@ use crate::config::{AccountConfig, AccountCredential, Config};
 use crate::dashboard::{self, DashboardHub};
 use crate::logging::LogLine;
 use crate::provider::anthropic::AnthropicPassthrough;
+use crate::scheduler::idle_probe::IdleProber;
 use crate::scheduler::select::SelectParams;
 use crate::scheduler::usage::UsagePoller;
 use crate::scheduler::{AccountId, AccountPool, PoolSnapshot};
@@ -98,6 +100,12 @@ pub struct AppState {
     /// The OpenAI Codex provider (Responses API translation) for
     /// `type: "codex"` accounts. Holds the per-process session id.
     pub codex: Arc<crate::provider::codex::CodexProvider>,
+    /// On-demand idle-account usage probe (issue #21). Fires at most one
+    /// gated `max_tokens = 1` ping for a windowless account so the scheduler's
+    /// ranking/display has real 5h/7d data — never a background loop. Disabled
+    /// by default (`config.proxy.idle_probe.enabled`); cooldown-gated per
+    /// account so traffic-driven triggers never burst.
+    pub idle_prober: Arc<IdleProber<ReqwestProber>>,
     /// Model→backend-group classifier, built from `config.routing`. When
     /// routing is disabled it is the builtin classifier and is never consulted
     /// for routing (forward passes `group = None`); it is still held so the
@@ -185,6 +193,18 @@ impl AppState {
             config.codex.upstream.clone(),
             crate::provider::codex::CodexShape::from_config(&config.codex),
         ));
+        // On-demand idle probe (issue #21): reuses the same client + provider
+        // hooks the forward path uses to send one gated `max_tokens = 1` ping.
+        let idle_prober = Arc::new(IdleProber::new(
+            pool.clone(),
+            ReqwestProber::new(
+                client.clone(),
+                config.upstream.clone(),
+                codex.clone(),
+                config.codex.default_model.clone(),
+            ),
+            config.proxy.idle_probe,
+        ));
         // The classifier is built from config.routing whether or not routing
         // is enabled (it is simply not consulted on the forward path while
         // disabled — forward passes group = None).
@@ -210,6 +230,7 @@ impl AppState {
             logger,
             provider,
             codex,
+            idle_prober,
             classifier,
             refresher: Arc::new(refresher),
             totals: Arc::new(UsageTotals::default()),
@@ -230,6 +251,31 @@ impl AppState {
 
     pub fn select_params(&self) -> SelectParams {
         SelectParams::from(&self.config.scheduler)
+    }
+
+    /// On-demand idle-account probe trigger (issue #21). For every account in
+    /// `group` (or all accounts on the legacy `None` path) that currently has
+    /// NO 5h/7d window, spawn a single gated `max_tokens = 1` probe so the
+    /// next ranking/display has real data. Each spawn is fully gated inside
+    /// `IdleProber::probe_if_idle` (kill-switch + per-account cooldown +
+    /// has-no-window re-check), so this is safe to call on every forwarded
+    /// request: a no-op when probing is disabled, and at most one send per
+    /// account per cooldown otherwise. Spawned, never awaited — the probe must
+    /// not add latency to the request that triggered it.
+    pub fn trigger_idle_probes(&self, group: Option<crate::routing::BackendGroup>) {
+        if !self.config.proxy.idle_probe.enabled {
+            return;
+        }
+        let snapshot = self.pool.snapshot();
+        for account in snapshot.accounts.iter().filter(|a| {
+            group.is_none_or(|g| a.group == g) && a.five_hour.is_none() && a.seven_day.is_none()
+        }) {
+            let prober = self.idle_prober.clone();
+            let id = account.id.clone();
+            tokio::spawn(async move {
+                prober.probe_if_idle(&id, SystemTime::now()).await;
+            });
+        }
     }
 
     /// Next activity-event correlation id (never leaves this process). 1-based
