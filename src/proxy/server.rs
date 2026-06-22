@@ -1155,10 +1155,21 @@ async fn shutdown(State(state): State<AppState>) -> Response {
 /// travel upstream.
 async fn oauth_token_relay(State(state): State<AppState>, req: axum::extract::Request) -> Response {
     let (parts, body) = req.into_parts();
-    let body = match axum::body::to_bytes(body, usize::MAX).await {
+    let body = match axum::body::to_bytes(body, state.config.proxy.max_request_bytes).await {
         Ok(body) => body,
         Err(err) => {
-            return relay_error(StatusCode::BAD_REQUEST, &format!("body read failed: {err}"))
+            // Same ingress cap as the main forward path: an over-cap body is
+            // rejected 413 before buffering; a genuine read failure stays 400.
+            if forward::is_length_limit_error(&err) {
+                return relay_error(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    &format!(
+                        "request body exceeds the {}-byte limit",
+                        state.config.proxy.max_request_bytes
+                    ),
+                );
+            }
+            return relay_error(StatusCode::BAD_REQUEST, &format!("body read failed: {err}"));
         }
     };
     let path_query = parts

@@ -2043,6 +2043,126 @@ async fn empty_codex_group_errors() {
 }
 
 // ---------------------------------------------------------------------------
+// 11b. Ingress body cap: over-cap request → 413, daemon + in-flight unaffected
+// ---------------------------------------------------------------------------
+
+/// Issue #30: the forward path buffers the whole request body (it can be
+/// replayed across account retries), so an unbounded read lets one oversized
+/// request OOM the daemon. With `proxy.max_request_bytes` set, a body over the
+/// cap must be rejected with **413 Payload Too Large** (Anthropic-shaped error
+/// body) *before* it is buffered — the daemon stays up and a concurrent normal
+/// request streaming through is unaffected.
+#[tokio::test]
+async fn oversized_request_body_returns_413_without_disturbing_in_flight() {
+    // Small test-only cap (not the 64 MiB default).
+    const CAP: usize = 256;
+
+    let mock = MockUpstream::spawn().await;
+    // One slow SSE response for the concurrent in-flight request. The oversized
+    // request is rejected at the proxy and never reaches upstream, so it
+    // consumes no scripted response — only the in-flight request does.
+    mock.push(ScriptedResponse::Sse {
+        body: SSE_BODY.to_string(),
+        chunk_size: 16,
+        chunk_delay: Duration::from_millis(30),
+        five_hour: Some((0.10, 3_600)),
+        seven_day: Some((0.10, 86_400)),
+        content_type: true,
+        extra_headers: Vec::new(),
+    });
+
+    let mut config = Config {
+        upstream: mock.base_url(),
+        accounts: vec![oauth_account("a", "at-a")],
+        ..Default::default()
+    };
+    config.proxy.max_request_bytes = CAP;
+    let proxy = Proxy::spawn_config(config).await;
+
+    let client = reqwest::Client::new();
+
+    // 1. A normal request is parked in-flight (slow SSE stream).
+    let in_flight = {
+        let client = client.clone();
+        let url = proxy.url("/v1/messages");
+        tokio::spawn(async move {
+            let response = client
+                .post(url)
+                .header("content-type", "application/json")
+                .header("x-api-key", "client-supplied-key")
+                .body(r#"{"stream":true}"#)
+                .send()
+                .await
+                .expect("in-flight request reachable");
+            (response.status(), response.bytes().await.expect("body"))
+        })
+    };
+
+    // Wait until the in-flight request is actually leased on the account
+    // (proves it is mid-relay when the oversized request arrives).
+    let mut leased = false;
+    for _ in 0..200 {
+        if proxy
+            .pool
+            .snapshot()
+            .accounts
+            .iter()
+            .find(|acct| acct.id.0 == "a")
+            .map(|acct| acct.in_flight)
+            .unwrap_or(0)
+            >= 1
+        {
+            leased = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        leased,
+        "the normal request must be in-flight before the oversized one"
+    );
+
+    // 2. An oversized POST (body well past the cap) is rejected with 413.
+    let oversized = "x".repeat(CAP * 4);
+    let response = post_messages(&client, &proxy, &oversized).await;
+    assert_eq!(
+        response.status(),
+        413,
+        "a body over proxy.max_request_bytes must be rejected with 413"
+    );
+    let value: serde_json::Value =
+        serde_json::from_slice(&response.bytes().await.expect("413 body"))
+            .expect("json error body");
+    assert_eq!(
+        value["type"], "error",
+        "413 body is Anthropic-shaped (top-level type=error)"
+    );
+    assert_eq!(
+        value["error"]["type"], "invalid_request_error",
+        "413 carries an invalid_request_error type"
+    );
+
+    // 3. The daemon stays up and the concurrent in-flight request completes
+    //    normally, byte-identical — unaffected by the rejected oversized one.
+    let (status, body) = in_flight.await.expect("in-flight task joined");
+    assert_eq!(status, 200, "the concurrent normal request is unaffected");
+    assert_eq!(
+        body.as_ref(),
+        SSE_BODY.as_bytes(),
+        "the in-flight SSE stream passed through byte-identical"
+    );
+
+    // 4. A fresh request after the rejection still succeeds (daemon is up).
+    mock.push(ScriptedResponse::ok(r#"{"id":"msg_after"}"#));
+    let after = post_messages(&client, &proxy, r#"{"model":"claude-sonnet-4-5"}"#).await;
+    assert_eq!(
+        after.status(),
+        200,
+        "the daemon serves new requests after rejecting the oversized body"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // 12. Brew install (manual)
 // ---------------------------------------------------------------------------
 

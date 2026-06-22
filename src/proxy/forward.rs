@@ -355,6 +355,23 @@ fn condense_error_body(body: &[u8]) -> String {
     }
 }
 
+/// True if an [`axum::body::to_bytes`] error was caused by the body exceeding
+/// the supplied length limit (vs. a genuine read/IO failure). axum wraps
+/// `http_body_util::LengthLimitError` as the `source()` of the returned error
+/// in that case (its documented detection contract); we walk the whole source
+/// chain so a future extra wrapper layer doesn't silently turn a 413 into a
+/// 400.
+pub(crate) fn is_length_limit_error(err: &axum::Error) -> bool {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(err);
+    while let Some(cause) = source {
+        if cause.is::<http_body_util::LengthLimitError>() {
+            return true;
+        }
+        source = cause.source();
+    }
+    false
+}
+
 /// Anthropic-style JSON error response.
 fn error_response(status: StatusCode, error_type: &str, message: &str) -> Response {
     let body = serde_json::json!({
@@ -425,26 +442,42 @@ pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response 
         method: parts.method.to_string(),
         path: path_query.clone(),
     });
-    let body = match axum::body::to_bytes(body, usize::MAX).await {
+    let body = match axum::body::to_bytes(body, state.config.proxy.max_request_bytes).await {
         Ok(body) => body,
         Err(err) => {
+            // A body over `proxy.max_request_bytes` is rejected with 413 before
+            // it pins unbounded heap; a genuine read failure stays a 400. Both
+            // free the (bounded) buffer and leave the daemon up — other
+            // in-flight requests are independent.
+            let (status, error_type, message) = if is_length_limit_error(&err) {
+                (
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "invalid_request_error",
+                    format!(
+                        "request body exceeds the {}-byte limit",
+                        state.config.proxy.max_request_bytes
+                    ),
+                )
+            } else {
+                (
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    format!("failed to read request body: {err}"),
+                )
+            };
             state.emit(ActivityEvent::RequestFinished {
                 id: activity_id,
                 method: parts.method.to_string(),
                 path: path_query,
                 account: None,
-                status: StatusCode::BAD_REQUEST.as_u16(),
+                status: status.as_u16(),
                 duration: started.elapsed(),
                 tokens: None,
                 group: None,
                 model: None,
                 effort: None,
             });
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                &format!("failed to read request body: {err}"),
-            );
+            return error_response(status, error_type, &message);
         }
     };
     let log_enabled = state.logger.is_some();
