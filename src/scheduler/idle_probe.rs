@@ -210,6 +210,9 @@ mod tests {
         IdleProbeConfig {
             enabled,
             per_account_cooldown_secs: cooldown_secs,
+            // The orchestrator never reads `sweep_secs` (the timer lives in the
+            // proxy server); the gate tests only exercise enabled + cooldown.
+            sweep_secs: 0,
         }
     }
 

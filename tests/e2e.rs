@@ -2306,6 +2306,196 @@ async fn idle_probe_kill_switch_disables_probing() {
 }
 
 // ---------------------------------------------------------------------------
+// 11d. Timer-driven idle probe keeps cold Codex accounts warm (issue #45)
+// ---------------------------------------------------------------------------
+
+/// Codex-only config with the idle probe enabled AND the timer sweep on a tight
+/// cadence (issue #45). Both codex endpoints point at the mock. With no client
+/// traffic the ONLY thing that can populate the codex account's windows is the
+/// background sweep firing a `/responses` probe.
+fn codex_sweep_config(mock: &MockUpstream, sweep_secs: u64) -> Config {
+    let mut config = codex_config(mock, vec![codex_account("cx", "at-codex")]);
+    config.proxy.idle_probe.enabled = true;
+    config.proxy.idle_probe.per_account_cooldown_secs = 3600;
+    config.proxy.idle_probe.sweep_secs = sweep_secs;
+    config
+}
+
+/// `x-codex-*` quota headers for a healthy codex account (primary 5h, secondary
+/// 7d), shaped like the live capture so the probe response feeds both windows.
+fn codex_quota_headers() -> Vec<(String, String)> {
+    let primary_reset = epoch_secs_in(275).to_string();
+    let secondary_reset = epoch_secs_in(465_379).to_string();
+    [
+        ("x-codex-primary-used-percent", "5"),
+        ("x-codex-primary-window-minutes", "300"),
+        ("x-codex-primary-reset-at", primary_reset.as_str()),
+        ("x-codex-secondary-used-percent", "20"),
+        ("x-codex-secondary-window-minutes", "10080"),
+        ("x-codex-secondary-reset-at", secondary_reset.as_str()),
+    ]
+    .iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect()
+}
+
+/// Count the `/responses` probe requests the mock saw bearing `bearer` (the
+/// codex idle probe path). The codex provider translates the `max_tokens = 1`
+/// Anthropic body into the Responses shape — which drops `max_tokens` — so the
+/// probe is identified by its endpoint (`/responses`) + the account's own
+/// bearer, the same surface the codex provider tests assert on.
+fn codex_probe_count(mock: &MockUpstream, bearer: &str) -> usize {
+    mock.seen()
+        .into_iter()
+        .filter(|s| s.path == "/responses" && s.authorization.as_deref() == Some(bearer))
+        .count()
+}
+
+/// Acceptance (#45): a cold Codex account with ZERO client traffic gains its
+/// 5h/7d windows within one sweep interval once the probe is enabled and a
+/// positive `sweep_secs` is configured. No `post_messages` is ever sent — the
+/// background timer alone drives the `/responses` probe whose `x-codex-*`
+/// headers populate the windows.
+#[tokio::test]
+async fn timer_sweep_warms_cold_codex_account_without_traffic() {
+    let mock = MockUpstream::spawn().await;
+    // Every probe response carries codex quota headers (sse_codex shape: no
+    // content-type, x-codex-* attached). 8 queued so an early sweep tick (and
+    // any cooldown-suppressed retry) is always answered.
+    for _ in 0..8 {
+        mock.push(ScriptedResponse::sse_codex(
+            CODEX_LIVE_SSE,
+            64,
+            &codex_quota_headers()
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect::<Vec<_>>(),
+        ));
+    }
+
+    // 1s sweep cadence so the test does not wait long for the first tick.
+    let proxy = Proxy::spawn_config(codex_sweep_config(&mock, 1)).await;
+
+    // The codex account starts cold (no traffic, no oauth poll for codex).
+    assert!(
+        proxy
+            .pool
+            .snapshot()
+            .accounts
+            .iter()
+            .find(|a| a.id.0 == "cx")
+            .and_then(|a| a.five_hour)
+            .is_none(),
+        "cx is cold (no window) before any sweep"
+    );
+
+    // The background sweep fires the codex `/responses` probe; its x-codex-*
+    // headers populate the 5h window via record_headers — with NO client
+    // request ever sent.
+    let util = await_five_hour(&proxy, "cx")
+        .await
+        .expect("the timer sweep populated cx's 5h window with zero traffic");
+    assert!(
+        (util - 0.05).abs() < 1e-9,
+        "window came from the sweep probe's x-codex-* headers"
+    );
+
+    // The 7d window is populated too, and the probe really was the codex
+    // `/responses` path bearing the account's own credential.
+    let account = status_account(&proxy, "cx").await;
+    assert!(
+        account["seven_day"].is_object(),
+        "7d window populated by the sweep probe: {account}"
+    );
+    assert!(
+        codex_probe_count(&mock, "Bearer at-codex") >= 1,
+        "at least one /responses probe was sent by the sweep"
+    );
+}
+
+/// Acceptance (#45): the master kill-switch (`enabled = false`) disables the
+/// timer sweep — a cold Codex account is never probed even with `sweep_secs`
+/// set, so its windows stay empty with no traffic.
+#[tokio::test]
+async fn timer_sweep_kill_switch_disables_sweep() {
+    let mock = MockUpstream::spawn().await;
+    for _ in 0..4 {
+        mock.push(ScriptedResponse::sse_codex(
+            CODEX_LIVE_SSE,
+            64,
+            &codex_quota_headers()
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect::<Vec<_>>(),
+        ));
+    }
+
+    let mut config = codex_sweep_config(&mock, 1);
+    config.proxy.idle_probe.enabled = false; // kill-switch
+    let proxy = Proxy::spawn_config(config).await;
+
+    // Give the sweep generous wall-clock time to fire several ticks were it
+    // ever going to — with the kill-switch on, none should.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert_eq!(
+        codex_probe_count(&mock, "Bearer at-codex"),
+        0,
+        "kill-switch: the sweep sends no /responses probe"
+    );
+    assert!(
+        proxy
+            .pool
+            .snapshot()
+            .accounts
+            .iter()
+            .find(|a| a.id.0 == "cx")
+            .and_then(|a| a.five_hour)
+            .is_none(),
+        "cx stays cold with probing disabled"
+    );
+}
+
+/// Acceptance (#45): `sweep_secs = 0` (the default) keeps the timer OFF even
+/// when the probe is `enabled` — a cold Codex account stays cold with no
+/// traffic (the sweep is opt-in, on-demand probing is unaffected).
+#[tokio::test]
+async fn timer_sweep_off_by_default_when_sweep_secs_zero() {
+    let mock = MockUpstream::spawn().await;
+    for _ in 0..4 {
+        mock.push(ScriptedResponse::sse_codex(
+            CODEX_LIVE_SSE,
+            64,
+            &codex_quota_headers()
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect::<Vec<_>>(),
+        ));
+    }
+
+    // enabled = true but sweep_secs = 0 ⇒ no background sweep task is spawned.
+    let proxy = Proxy::spawn_config(codex_sweep_config(&mock, 0)).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert_eq!(
+        codex_probe_count(&mock, "Bearer at-codex"),
+        0,
+        "sweep_secs = 0: no background probe even with probing enabled"
+    );
+    assert!(
+        proxy
+            .pool
+            .snapshot()
+            .accounts
+            .iter()
+            .find(|a| a.id.0 == "cx")
+            .and_then(|a| a.five_hour)
+            .is_none(),
+        "cx stays cold when the sweep is off"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // 12. Brew install (manual)
 // ---------------------------------------------------------------------------
 

@@ -299,25 +299,33 @@ impl Default for ProxyConfig {
     }
 }
 
-/// On-demand idle-account usage probe (issue #21). An account with no known
-/// 5h/7d window produces no usage data for the scheduler's ranking/display.
-/// When this is enabled, such an account can be populated on demand by a
-/// single `max_tokens = 1` `POST /v1/messages` through its own credential: the
-/// response's `anthropic-ratelimit-*` headers feed the existing
-/// [`crate::scheduler::window::WindowSource::Headers`] path. This is strictly
-/// ON-DEMAND and per-account cooldown-gated — NEVER a background poll loop —
-/// because it spends real (if minimal) quota on an otherwise-idle account.
+/// Idle-account usage probe (issue #21, extended by #45). An account with no
+/// known 5h/7d window produces no usage data for the scheduler's
+/// ranking/display. When this is enabled, such an account can be populated by a
+/// single `max_tokens = 1` request through its own credential (`POST
+/// /v1/messages` for oauth/apikey, `POST /responses` for codex): the response's
+/// `anthropic-ratelimit-*` / `x-codex-*` headers feed the existing
+/// [`crate::scheduler::window::WindowSource::Headers`] path.
 ///
-/// Two guards: a global kill-switch (`enabled = false` disables ALL probing)
-/// and a per-account cooldown so a single account is probed at most once per
-/// `per_account_cooldown_secs`. Defaults are conservative: probing OFF, and a
-/// 1-hour cooldown if it is turned on.
+/// Two delivery modes, both behind the SAME guards:
+/// - **On demand** (#21): the forward path probes idle accounts so the next
+///   ranking/display has real data.
+/// - **Timer sweep** (#45): when `sweep_secs > 0`, a background task fires the
+///   same probe for cold **Codex** accounts on a timer, so their windows stay
+///   populated with ZERO client traffic (a cold Codex account is otherwise
+///   never probed — the background usage poller covers oauth accounts only,
+///   and `/responses` is the only path that returns Codex windows).
+///
+/// Both modes share a global kill-switch (`enabled = false` disables ALL
+/// probing) and a per-account cooldown so a single account is probed at most
+/// once per `per_account_cooldown_secs`. Defaults are conservative: probing
+/// OFF, the sweep OFF, and a 1-hour cooldown if it is turned on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IdleProbeConfig {
-    /// Master kill-switch. `false` (the default) disables all idle probing;
-    /// `true` allows a single gated probe per idle account. Conservative
-    /// default: a real (if minimal) request is only ever sent when the
-    /// operator opts in.
+    /// Master kill-switch. `false` (the default) disables all idle probing
+    /// (on-demand AND the timer sweep); `true` allows a single gated probe per
+    /// idle account. Conservative default: a real (if minimal) request is only
+    /// ever sent when the operator opts in.
     #[serde(default)]
     pub enabled: bool,
     /// Minimum wall-clock gap between two probes of the SAME account, seconds.
@@ -326,6 +334,17 @@ pub struct IdleProbeConfig {
     /// account never bursts a probe per request. Default 3600 (1 hour).
     #[serde(default = "default_idle_probe_cooldown_secs")]
     pub per_account_cooldown_secs: u64,
+    /// Timer-sweep cadence for keeping cold **Codex** accounts warm (issue
+    /// #45), seconds. `0` (the default) disables the sweep entirely; the probe
+    /// then stays purely on-demand. When `> 0` and `enabled = true`, a
+    /// background task calls the existing Codex-scoped probe trigger every
+    /// `sweep_secs` seconds, reusing the same kill-switch + per-account
+    /// cooldown (so the cooldown — not this cadence — bounds cost: at most one
+    /// probe per account per `per_account_cooldown_secs` regardless of how
+    /// often the sweep ticks). Additive (`#[serde(default)]`) so a config
+    /// written before this field loads with the sweep OFF.
+    #[serde(default = "default_idle_probe_sweep_secs")]
+    pub sweep_secs: u64,
 }
 
 impl Default for IdleProbeConfig {
@@ -333,6 +352,7 @@ impl Default for IdleProbeConfig {
         Self {
             enabled: false,
             per_account_cooldown_secs: default_idle_probe_cooldown_secs(),
+            sweep_secs: default_idle_probe_sweep_secs(),
         }
     }
 }
@@ -630,6 +650,16 @@ fn default_refresh_ahead_secs() -> u64 {
 /// account is probed at most once an hour even when probing is enabled.
 fn default_idle_probe_cooldown_secs() -> u64 {
     3600
+}
+
+/// Default idle-probe timer-sweep cadence: `0` = OFF (issue #45). The sweep is
+/// opt-in: even with `enabled = true`, no background probing happens until the
+/// operator sets a positive `sweep_secs`. A sensible operating value is one
+/// tick per `per_account_cooldown_secs` (one probe / account / hour), but the
+/// conservative default keeps the timer dormant so upgrading does not start
+/// spending quota on cold accounts unannounced.
+fn default_idle_probe_sweep_secs() -> u64 {
+    0
 }
 
 /// Default raw-io retention window: 90 days (per Feature B).

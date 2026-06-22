@@ -534,6 +534,29 @@ pub async fn serve(
         }
     });
 
+    // Background: keep cold Codex accounts warm (issue #45). A cold Codex
+    // account with NO client traffic is never probed by the request path and
+    // never polled by the oauth-only usage poller, so its 5h/7d windows stay
+    // empty forever. When the idle probe is enabled AND a positive sweep cadence
+    // is configured, fire the EXISTING Codex-scoped probe trigger on a timer.
+    // `trigger_idle_probes` is fully self-gated (kill-switch + has-no-window +
+    // per-account cooldown inside `probe_if_idle`), so the per-account cooldown
+    // — not this cadence — bounds cost: at most one probe per account per
+    // `per_account_cooldown_secs`. No second cost guard is added here. Mirrors
+    // the usage poller's `tick` + `sleep` loop; aborted on shutdown.
+    let sweep_task = (state.config.proxy.idle_probe.enabled
+        && state.config.proxy.idle_probe.sweep_secs > 0)
+        .then(|| {
+            let sweep_state = state.clone();
+            let sweep_period = Duration::from_secs(state.config.proxy.idle_probe.sweep_secs);
+            tokio::spawn(async move {
+                loop {
+                    sweep_state.trigger_idle_probes(Some(crate::routing::BackendGroup::Codex));
+                    tokio::time::sleep(sweep_period).await;
+                }
+            })
+        });
+
     let tick_pool = state.pool.clone();
     let tick_events = state.events.clone();
     let tick_routing_enabled = state.config.routing.enabled;
@@ -586,6 +609,9 @@ pub async fn serve(
     poller_task.abort();
     tick_task.abort();
     refresh_task.abort();
+    if let Some(sweep_task) = sweep_task {
+        sweep_task.abort();
+    }
     if let Some(fold_task) = fold_task {
         fold_task.abort();
     }
