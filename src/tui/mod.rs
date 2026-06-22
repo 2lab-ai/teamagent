@@ -257,6 +257,9 @@ pub(crate) struct Chrome {
     /// Folded session timeline for the Sessions overlay (issue #34), snapshotted
     /// from the persisted raw-io log when the overlay was opened. Empty otherwise.
     pub sessions: Vec<crate::session::Session>,
+    /// True while a background `load_sessions` is in flight (issue: `s` froze the
+    /// TUI ~10s). The overlay shows a spinner instead of the table/empty hint.
+    pub sessions_loading: bool,
     /// Cursor row in the Sessions overlay's session list.
     pub session_cursor: usize,
     /// `Some` in attach mode.
@@ -357,6 +360,14 @@ struct App {
     /// when the Sessions overlay is opened (`s`) and held until it is reopened.
     /// A point-in-time snapshot — re-opening re-reads the file. Empty otherwise.
     sessions: Vec<crate::session::Session>,
+    /// True while the background load kicked off by `open_sessions` is running
+    /// (read+parse+fold of the multi-MB raw-io log). Cleared when the loaded
+    /// timeline arrives over `sessions_tx`. Drives the overlay loading spinner.
+    sessions_loading: bool,
+    /// Sender handed to the `spawn_blocking` load task by `open_sessions`; the
+    /// event loop owns the receiver and applies the result. `None` only in unit
+    /// tests that never run `event_loop` (they drive overlay state directly).
+    sessions_tx: Option<mpsc::Sender<Vec<crate::session::Session>>>,
     /// Cursor row in the Sessions overlay's session list.
     session_cursor: usize,
     /// API-key buffer for `Mode::AddKey`. Held outside `Mode` so the enum
@@ -387,6 +398,8 @@ impl App {
             model_cursor: 0,
             stats_window: activity::StatsWindow::default(),
             sessions: Vec::new(),
+            sessions_loading: false,
+            sessions_tx: None,
             session_cursor: 0,
             add_input: String::new(),
             pending_login: None,
@@ -421,6 +434,7 @@ impl App {
             model_cursor: self.model_cursor,
             stats_window: self.stats_window,
             sessions: self.sessions.clone(),
+            sessions_loading: self.sessions_loading,
             session_cursor: self.session_cursor,
             add_input_len: self.add_input.chars().count(),
             status_line: self.status_line().map(str::to_string),
@@ -613,15 +627,34 @@ impl App {
         self.session_cursor = next.clamp(0, (len - 1) as i64) as usize;
     }
 
-    /// Open the Sessions overlay (`s`, issue #34): read the persisted raw-io log
-    /// from `$XDG_STATE_HOME/llmux/raw-io.jsonl`, fold it into a confidence-
-    /// labeled session timeline, and open the overlay. A missing/unreadable file
-    /// folds to an empty timeline (the overlay shows an empty hint). The snapshot
-    /// is point-in-time — re-opening re-reads the file.
+    /// Open the Sessions overlay (`s`, issue #34): kick off a background read of
+    /// the persisted raw-io log from `$XDG_STATE_HOME/llmux/raw-io.jsonl`, fold it
+    /// into a confidence-labeled session timeline off the runtime, and open the
+    /// overlay immediately with a loading spinner. The read+parse+fold is blocking
+    /// IO/CPU over a multi-MB log, so running it inline inside the async event
+    /// loop froze the whole TUI ~10s — it now runs on the blocking pool and the
+    /// loaded timeline arrives over `sessions_tx`, mirroring the remote-fetch
+    /// pattern. A missing/unreadable file folds to an empty timeline (the overlay
+    /// then shows the empty hint). The snapshot is point-in-time — re-opening
+    /// re-reads the file.
     fn open_sessions(&mut self) {
-        self.sessions = load_sessions();
-        self.session_cursor = 0;
         self.overlay = Overlay::Sessions;
+        self.session_cursor = 0;
+        if self.sessions_loading {
+            return; // a load is already in flight
+        }
+        self.sessions_loading = true;
+        if let Some(tx) = self.sessions_tx.clone() {
+            // read + parse + fold is blocking IO/CPU → off the runtime onto the
+            // blocking pool so the event loop keeps rendering and taking input.
+            tokio::task::spawn_blocking(move || {
+                let sessions = load_sessions();
+                let _ = tx.blocking_send(sessions);
+            });
+        }
+        // No tx (only in unit tests that never run `event_loop`) → stays in the
+        // loading state; those tests drive overlay/sessions state directly, not
+        // this path.
     }
 
     /// Key handling for MAIN (no overlay open). `a`/`g`/`l` summon the overlays;
@@ -1409,6 +1442,11 @@ async fn event_loop(
 ) -> std::io::Result<()> {
     let mut render = tokio::time::interval(RENDER_TICK);
     render.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Sessions overlay (`s`) loads the persisted raw-io log on the blocking pool
+    // and delivers the folded timeline here — mirrors the remote fetch channel so
+    // the read+parse+fold never blocks this select (it once froze the TUI ~10s).
+    let (sess_tx, mut sess_rx) = mpsc::channel::<Vec<crate::session::Session>>(4);
+    app.sessions_tx = Some(sess_tx);
     // Input is event-driven, not polled: `EventStream` parks on the terminal fd
     // (mio) and only wakes the task when a real key/mouse/resize/paste arrives.
     // At idle (no input) this contributes zero wakeups, unlike a fixed-interval
@@ -1440,6 +1478,13 @@ async fn event_loop(
                         fetch = None;
                     }
                 }
+                true
+            }
+            // The background session load finished — swap in the folded timeline
+            // and drop the loading state so the overlay shows the table/hint.
+            Some(sessions) = sess_rx.recv() => {
+                app.sessions = sessions;
+                app.sessions_loading = false;
                 true
             }
         };
@@ -1761,6 +1806,44 @@ mod tests {
         // s/Esc close back to MAIN.
         app.on_key_sessions(KeyCode::Char('s'));
         assert_eq!(app.overlay, Overlay::None);
+    }
+
+    /// `open_sessions` must NOT block on the file read: it opens the overlay and
+    /// flips into the loading state immediately, leaving `sessions` untouched.
+    /// With no `sessions_tx` (the event loop never runs under test) the load is
+    /// never kicked off, so the file is never read and nothing populates the
+    /// list — proving the key handler returns instantly.
+    #[test]
+    fn open_sessions_is_non_blocking_and_enters_loading_state() {
+        let mut app = remote_app();
+        assert!(!app.sessions_loading);
+        assert!(app.sessions.is_empty());
+
+        app.open_sessions();
+
+        assert_eq!(app.overlay, Overlay::Sessions);
+        assert!(app.sessions_loading, "overlay enters the loading state");
+        assert_eq!(app.session_cursor, 0);
+        assert!(
+            app.sessions.is_empty(),
+            "no tx under test → load not kicked off, sessions stay empty"
+        );
+    }
+
+    /// Reopening while a load is still in flight is a no-op guard, not a second
+    /// load: it stays in the loading state and does not clear the cursor twice or
+    /// touch `sessions`.
+    #[test]
+    fn open_sessions_reopen_while_loading_is_a_noop_guard() {
+        let mut app = remote_app();
+        app.open_sessions();
+        assert!(app.sessions_loading);
+        // Move the cursor as if a prior list were shown, then reopen.
+        app.session_cursor = 5;
+        app.open_sessions();
+        // Still loading; the early-return guard ran AFTER resetting the cursor.
+        assert!(app.sessions_loading);
+        assert_eq!(app.overlay, Overlay::Sessions);
     }
 
     /// `g` opens the Stats overlay only when model usage exists; `g`/`Esc`

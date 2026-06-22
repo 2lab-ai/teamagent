@@ -337,6 +337,20 @@ fn draw_logs_overlay(frame: &mut Frame, view: &DashboardView) {
 fn draw_sessions_overlay(frame: &mut Frame, ctx: &FrameCtx, chrome: &Chrome) {
     let area = overlay_rect(frame.area());
     frame.render_widget(Clear, area);
+    // The load runs on the blocking pool (it reads + folds the multi-MB raw-io
+    // log); show a spinner while it is in flight rather than freezing or flashing
+    // a stale/empty table. Stale `sessions` from a prior open can coexist on
+    // reopen — prefer the spinner while loading.
+    if chrome.sessions_loading {
+        let glyph = anim::braille_spin(chrome.frame);
+        let loading = Paragraph::new(Line::from(vec![
+            Span::styled(format!("{glyph} "), Style::new().fg(Color::Cyan)),
+            Span::styled("loading sessions…", dim()),
+        ]))
+        .block(Block::new().borders(Borders::TOP).title(" sessions "));
+        frame.render_widget(loading, area);
+        return;
+    }
     if chrome.sessions.is_empty() {
         let empty = Paragraph::new(Line::from(Span::styled(
             "no sessions yet — enable raw-io capture and send requests through the proxy",
@@ -2632,6 +2646,7 @@ mod tests {
             model_cursor: 0,
             stats_window: super::super::activity::StatsWindow::default(),
             sessions: Vec::new(),
+            sessions_loading: false,
             session_cursor: 0,
             add_input_len: 0,
             attach: None,
@@ -2860,6 +2875,22 @@ mod tests {
         let chrome = chrome_overlay(Overlay::Sessions);
         let text = render(&view, &chrome, 160, 30);
         assert!(text.contains("no sessions yet"), "empty hint shown");
+    }
+
+    /// While the background load is in flight the overlay shows the loading
+    /// indicator — NOT the empty "no sessions yet" hint, even with empty
+    /// `sessions` — so the user sees progress instead of a frozen/empty screen.
+    #[test]
+    fn sessions_overlay_loading_shows_spinner_not_empty_hint() {
+        let view = view_with(Vec::new());
+        let mut chrome = chrome_overlay(Overlay::Sessions);
+        chrome.sessions_loading = true;
+        let text = render(&view, &chrome, 160, 30);
+        assert!(text.contains("loading sessions"), "loading indicator shown");
+        assert!(
+            !text.contains("no sessions yet"),
+            "empty hint suppressed while loading"
+        );
     }
 
     /// Issue #5 acceptance: local and attach render IDENTICALLY from the same
