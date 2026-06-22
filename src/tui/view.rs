@@ -49,6 +49,10 @@ pub(crate) struct DashboardView {
     /// Per-client request attribution rows (issue #32), already sorted by
     /// requests desc. One representation used by both document and renderer.
     pub client_usage: Vec<crate::dashboard::ClientUsageDoc>,
+    /// Windowed (24h/72h) per-account/per-model heatmap slices (issue #23),
+    /// carried straight from the document so local + attach render the same.
+    /// Best-effort: a lossy sample of the activity stream, not an exact ledger.
+    pub windowed: Vec<crate::dashboard::WindowedStatsDoc>,
     /// Live codex settings (req8.1): shown + toggled from the dashboard.
     pub codex: crate::dashboard::CodexSettingsDoc,
 }
@@ -267,6 +271,7 @@ impl DashboardView {
             logs,
             model_usage: doc.model_usage.clone(),
             client_usage: doc.client_usage.clone(),
+            windowed: doc.windowed.clone(),
             codex: doc.codex.clone(),
         }
     }
@@ -358,6 +363,15 @@ mod tests {
                   "efforts": [ { "label": "16k", "requests": 1 },
                                { "label": "none", "requests": 2 } ],
                   "endpoints": [ { "label": "messages", "requests": 3 } ] },
+            ],
+            "windowed": [
+                { "window": "24h", "window_secs": 86400,
+                  "cells": [
+                    { "group": "claude", "model": "claude-sonnet-4-5", "account": "a",
+                      "requests": 3, "ok": 2, "errors": 1, "tokens_in": 100,
+                      "tokens_out": 50, "cache_read": 4000, "cache_creation": 0,
+                      "tokens": 4150 } ] },
+                { "window": "72h", "window_secs": 259200, "cells": [] },
             ],
             "activity": {
                 "in_flight": [
@@ -569,6 +583,43 @@ mod tests {
         let doc: DashboardDoc = serde_json::from_value(value).expect("parse doc");
         let view = DashboardView::from_doc(&doc);
         assert!(view.model_usage.is_empty());
+    }
+
+    #[test]
+    fn windowed_heatmap_survives_doc_to_view_without_loss() {
+        // Local and attach both go through from_doc (issue #23), so the windowed
+        // slices must reach the renderer input intact.
+        let doc: DashboardDoc = serde_json::from_value(doc_json()).expect("parse doc");
+        let view = DashboardView::from_doc(&doc);
+        assert_eq!(view.windowed.len(), 2);
+        let day = view
+            .windowed
+            .iter()
+            .find(|w| w.window == "24h")
+            .expect("24h slice");
+        assert_eq!(day.cells.len(), 1);
+        let cell = &day.cells[0];
+        assert_eq!(cell.group, "claude");
+        assert_eq!(cell.model, "claude-sonnet-4-5");
+        assert_eq!(cell.account, "a");
+        assert_eq!(cell.requests, 3);
+        assert_eq!(cell.tokens, 4150);
+        // The 72h slice is present but empty in this fixture.
+        let three = view
+            .windowed
+            .iter()
+            .find(|w| w.window == "72h")
+            .expect("72h slice");
+        assert!(three.cells.is_empty());
+    }
+
+    #[test]
+    fn windowed_defaults_to_empty_for_older_documents() {
+        let mut value = doc_json();
+        value.as_object_mut().unwrap().remove("windowed");
+        let doc: DashboardDoc = serde_json::from_value(value).expect("parse doc");
+        let view = DashboardView::from_doc(&doc);
+        assert!(view.windowed.is_empty());
     }
 
     #[test]

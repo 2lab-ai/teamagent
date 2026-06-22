@@ -23,7 +23,7 @@ use crate::scheduler::select::{self, SelectParams};
 use crate::scheduler::{AccountSnapshot, CooldownSource, PoolSnapshot};
 use crate::tui::activity::{
     normalize_model, ActivityLog, ClientUsage, Completed, CompletedBody, InFlight, ModelUsage,
-    Totals,
+    StatsWindow, Totals, WindowedRow,
 };
 use crate::tui::logs::LogConsole;
 use crate::tui::{ActivityEvent, LastSwitch, PollHealth, TokenCounts};
@@ -180,6 +180,12 @@ impl DashboardHub {
             rpm_5m: state.log.requests_per_minute(now, RPM_WINDOW),
             model_usage: state.log.model_usage(),
             client_usage: state.log.client_usage(),
+            // Windowed heatmap rows per window (issue #23). Computed under the
+            // same lock as the rest of the view so one read is consistent.
+            windowed: StatsWindow::ALL
+                .iter()
+                .map(|&w| (w, state.log.windowed_rows(w, now)))
+                .collect(),
             logs: state.console.tail(LOG_TAIL).cloned().collect(),
         }
     }
@@ -199,6 +205,9 @@ pub(crate) struct HubView {
     pub model_usage: Vec<ModelUsage>,
     /// Per-client request attribution rows (issue #32), sorted by requests desc.
     pub client_usage: Vec<ClientUsage>,
+    /// Windowed heatmap rows per window (issue #23): one `(window, rows)` pair
+    /// per [`StatsWindow`], each already sorted by total tokens desc.
+    pub windowed: Vec<(StatsWindow, Vec<WindowedRow>)>,
     /// Oldest→newest (console renders the tail at the bottom).
     pub logs: Vec<LogLine>,
 }
@@ -384,6 +393,13 @@ pub struct DashboardDoc {
     /// renders no client panel.
     #[serde(default)]
     pub client_usage: Vec<ClientUsageDoc>,
+    /// Windowed (24h/72h) per-account/per-model token heatmap rows (issue #23).
+    /// Additive: absent in pre-#23 docs → an older client parses it empty and an
+    /// upgraded client attaching to an older daemon shows no heatmap. These are
+    /// a BEST-EFFORT sample (the activity event channel is lossy — events are
+    /// `try_send` and dropped on a full channel), not an exact ledger.
+    #[serde(default)]
+    pub windowed: Vec<WindowedStatsDoc>,
     pub activity: ActivityDoc,
     /// Tracing tail, oldest→newest.
     pub logs: Vec<LogLineDoc>,
@@ -594,6 +610,41 @@ pub struct ClientUsageDoc {
     pub errors: u64,
     pub tokens_in: u64,
     pub tokens_out: u64,
+}
+
+/// One trailing-window slice of the per-account/per-model heatmap (issue #23):
+/// a window label ("24h"/"72h") + every `(group, model, account)` cell with
+/// activity in that window, sorted by total tokens desc. Additive document
+/// type, carried in [`DashboardDoc::windowed`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WindowedStatsDoc {
+    /// Short window label ("24h" / "72h").
+    pub window: String,
+    /// Trailing duration this window covers, in seconds (so a client need not
+    /// hardcode the label→duration map).
+    pub window_secs: u64,
+    pub cells: Vec<WindowedCellDoc>,
+}
+
+/// One `(group, model, account)` heatmap cell over a window. Token fields are
+/// the in-window sums; `tokens` is the combined intensity (in+out+cache) the
+/// heatmap colours by.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WindowedCellDoc {
+    pub group: String,
+    pub model: String,
+    pub account: String,
+    pub requests: u64,
+    pub ok: u64,
+    pub errors: u64,
+    pub tokens_in: u64,
+    pub tokens_out: u64,
+    #[serde(default)]
+    pub cache_read: u64,
+    #[serde(default)]
+    pub cache_creation: u64,
+    /// Combined token intensity (in + out + cache_read + cache_creation).
+    pub tokens: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -855,6 +906,35 @@ fn model_usage_docs(
     (docs, total_cost)
 }
 
+/// Build the windowed heatmap document rows from the hub view (issue #23): one
+/// [`WindowedStatsDoc`] per retained window, each carrying every in-window
+/// `(group, model, account)` cell. The rows are already sorted by the hub.
+fn windowed_docs(hub: &HubView) -> Vec<WindowedStatsDoc> {
+    hub.windowed
+        .iter()
+        .map(|(window, rows)| WindowedStatsDoc {
+            window: window.label().to_string(),
+            window_secs: window.duration().as_secs(),
+            cells: rows
+                .iter()
+                .map(|r: &WindowedRow| WindowedCellDoc {
+                    group: r.group.clone(),
+                    model: r.model.clone(),
+                    account: r.account.clone(),
+                    requests: r.counts.requests,
+                    ok: r.counts.ok,
+                    errors: r.counts.errors,
+                    tokens_in: r.counts.tokens_in,
+                    tokens_out: r.counts.tokens_out,
+                    cache_read: r.counts.cache_read,
+                    cache_creation: r.counts.cache_creation,
+                    tokens: r.counts.tokens(),
+                })
+                .collect(),
+        })
+        .collect()
+}
+
 /// Build the dashboard document — pure over snapshot/hub/totals/params so
 /// the shape is unit-testable without a socket.
 pub(crate) fn dashboard_doc(
@@ -1057,6 +1137,7 @@ pub(crate) fn dashboard_doc(
         },
         model_usage,
         client_usage,
+        windowed: windowed_docs(hub),
         activity,
         logs: hub
             .logs
@@ -1577,6 +1658,45 @@ mod tests {
         value["totals"].as_object_mut().unwrap().remove("cost_usd");
         let parsed: DashboardDoc = serde_json::from_value(value).expect("parse");
         assert_eq!(parsed.totals.cost_usd, 0.0);
+    }
+
+    #[test]
+    fn doc_carries_windowed_heatmap_cells_per_window() {
+        // The seeded hub folds one finished codex/gpt-5.5 request on account
+        // "a" (issue #23): both the 24h and 72h windows must carry a cell for
+        // (codex, gpt-5.5, a) with the right counts.
+        let doc = seeded_doc();
+        // One slice per retained window.
+        assert_eq!(doc.windowed.len(), 2);
+        let labels: Vec<&str> = doc.windowed.iter().map(|w| w.window.as_str()).collect();
+        assert_eq!(labels, vec!["24h", "72h"]);
+
+        for slice in &doc.windowed {
+            let cell = slice
+                .cells
+                .iter()
+                .find(|c| c.group == "codex" && c.model == "gpt-5.5" && c.account == "a")
+                .unwrap_or_else(|| panic!("missing cell in {} window", slice.window));
+            assert_eq!(cell.requests, 1);
+            assert_eq!(cell.ok, 1);
+            assert_eq!(cell.errors, 0);
+            assert_eq!(cell.tokens_in, 700);
+            assert_eq!(cell.tokens_out, 300);
+            assert_eq!(cell.cache_read, 120);
+            // tokens() intensity = in + out + cache_read + cache_creation.
+            assert_eq!(cell.tokens, 700 + 300 + 120);
+        }
+    }
+
+    #[test]
+    fn doc_without_windowed_field_parses_to_empty() {
+        // A pre-#23 daemon's document predates `windowed` — the additive serde
+        // default keeps it parseable so an upgraded client can still attach.
+        let doc = seeded_doc();
+        let mut value = serde_json::to_value(&doc).expect("serialize");
+        value.as_object_mut().unwrap().remove("windowed");
+        let parsed: DashboardDoc = serde_json::from_value(value).expect("parse");
+        assert!(parsed.windowed.is_empty());
     }
 
     #[test]

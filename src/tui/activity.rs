@@ -246,6 +246,252 @@ fn sorted_counts(map: &HashMap<String, u64>) -> Vec<ModelCount> {
 }
 
 // ---------------------------------------------------------------------------
+// Windowed bucket ring (issue #23): rolling hourly counters keyed by
+// (group, normalized_model, account), so 24h / 72h per-account/per-model
+// heatmaps are computable IN MEMORY (no durable store — that is a follow-up).
+//
+// Each bucket covers one wall-clock hour (epoch-hour index = secs / 3600). The
+// ring keeps [`BUCKET_COUNT`] hours; folding a request rolls the ring forward
+// to the current hour and PRUNES expired buckets entirely (not just zeroes
+// them) so stray/typo model keys can never grow unbounded. SystemTime is not
+// monotonic — every hour computation clamps on skew rather than panicking.
+// ---------------------------------------------------------------------------
+
+/// Seconds per bucket — one wall-clock hour.
+const BUCKET_SECS: u64 = 3600;
+/// How many hourly buckets the ring retains. 73 covers a full 72h window plus
+/// the current partial hour, so a 72h view never loses a still-relevant hour
+/// to roll-forward before the window itself expires it.
+const BUCKET_COUNT: usize = 73;
+
+/// The windows the heatmap surfaces. Kept small and fixed (24h, 72h) — both fit
+/// inside the retained ring, so each is exact up to the lossy event channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum StatsWindow {
+    #[default]
+    Day,
+    ThreeDay,
+}
+
+impl StatsWindow {
+    /// All windows the dashboard renders, narrowest first.
+    pub(crate) const ALL: [StatsWindow; 2] = [StatsWindow::Day, StatsWindow::ThreeDay];
+
+    /// The next window in the cycle (24h ↔ 72h), for the `w` toggle.
+    pub(crate) fn next(self) -> StatsWindow {
+        match self {
+            StatsWindow::Day => StatsWindow::ThreeDay,
+            StatsWindow::ThreeDay => StatsWindow::Day,
+        }
+    }
+
+    /// Trailing duration this window aggregates over.
+    pub(crate) fn duration(self) -> Duration {
+        match self {
+            StatsWindow::Day => Duration::from_secs(24 * 3600),
+            StatsWindow::ThreeDay => Duration::from_secs(72 * 3600),
+        }
+    }
+
+    /// Short label for the UI ("24h" / "72h").
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            StatsWindow::Day => "24h",
+            StatsWindow::ThreeDay => "72h",
+        }
+    }
+}
+
+/// Per-bucket counters for one `(group, model, account)` key. Mirrors the
+/// cumulative `ModelStats` fields the issue calls for, but scoped to one hour.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WindowCounts {
+    pub requests: u64,
+    pub ok: u64,
+    pub errors: u64,
+    pub tokens_in: u64,
+    pub tokens_out: u64,
+    pub cache_read: u64,
+    pub cache_creation: u64,
+}
+
+impl WindowCounts {
+    fn add(&mut self, other: &WindowCounts) {
+        self.requests = self.requests.saturating_add(other.requests);
+        self.ok = self.ok.saturating_add(other.ok);
+        self.errors = self.errors.saturating_add(other.errors);
+        self.tokens_in = self.tokens_in.saturating_add(other.tokens_in);
+        self.tokens_out = self.tokens_out.saturating_add(other.tokens_out);
+        self.cache_read = self.cache_read.saturating_add(other.cache_read);
+        self.cache_creation = self.cache_creation.saturating_add(other.cache_creation);
+    }
+
+    /// Combined token count for the heatmap intensity (in + out + cache).
+    pub(crate) fn tokens(&self) -> u64 {
+        self.tokens_in
+            .saturating_add(self.tokens_out)
+            .saturating_add(self.cache_read)
+            .saturating_add(self.cache_creation)
+    }
+}
+
+/// The bucket key. Carries `group` AND `model` AND `account` so a same-named
+/// model under two providers stays two rows and the per-account axis exists.
+type WindowKey = (String, String, String);
+
+/// One hour's counters: the epoch-hour index it represents + the per-key map.
+#[derive(Debug, Default, Clone)]
+struct Bucket {
+    /// `epoch_secs / BUCKET_SECS`. A bucket is "current" when this equals the
+    /// hour derived from `now`.
+    hour: u64,
+    counts: HashMap<WindowKey, WindowCounts>,
+}
+
+/// A fixed-capacity ring of hourly buckets. Folding is O(1) amortized: roll
+/// forward to the current hour (reusing slots, clearing stale ones) then bump
+/// the one current bucket's key.
+#[derive(Debug, Default)]
+struct WindowedBuckets {
+    buckets: VecDeque<Bucket>,
+}
+
+/// Epoch-hour index for `now`, clamped on a pre-epoch clock (skew defence —
+/// never panics).
+fn epoch_hour(now: SystemTime) -> u64 {
+    now.duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() / BUCKET_SECS)
+        .unwrap_or(0)
+}
+
+impl WindowedBuckets {
+    /// Roll the ring forward so its newest bucket is `current_hour`, dropping
+    /// (pruning, not zeroing) buckets that fall out of the retained range. A
+    /// backwards clock (`current_hour` older than the newest) is ignored — we
+    /// never rewind, so skew can't corrupt or panic the ring.
+    fn roll_to(&mut self, current_hour: u64) {
+        match self.buckets.back() {
+            Some(newest) if current_hour <= newest.hour => return,
+            _ => {}
+        }
+        // Append the current hour. If the ring already has buckets and there is
+        // a gap (idle hours), we do NOT materialize the empty intermediate
+        // hours — pruning by `hour` value at read time handles the window math,
+        // and a single appended current bucket keeps roll-forward O(1).
+        self.buckets.push_back(Bucket {
+            hour: current_hour,
+            counts: HashMap::new(),
+        });
+        // Prune anything older than the retained range AND cap the deque length
+        // (an idle-then-active daemon can leave sparse old buckets).
+        let oldest_kept = current_hour.saturating_sub(BUCKET_COUNT as u64 - 1);
+        self.buckets.retain(|b| b.hour >= oldest_kept);
+        while self.buckets.len() > BUCKET_COUNT {
+            self.buckets.pop_front();
+        }
+    }
+
+    /// Fold one finished, attributed request into the current bucket.
+    #[allow(clippy::too_many_arguments)]
+    fn record(
+        &mut self,
+        group: &str,
+        model: &str,
+        account: &str,
+        status: u16,
+        tokens: Option<TokenCounts>,
+        now: SystemTime,
+    ) {
+        let hour = epoch_hour(now);
+        self.roll_to(hour);
+        // After roll_to, the matching current bucket is the newest with
+        // `hour == current`; if a backwards clock skipped the append, fold into
+        // the newest bucket we have rather than dropping the event.
+        let bucket = match self.buckets.back_mut() {
+            Some(b) => b,
+            None => {
+                self.buckets.push_back(Bucket {
+                    hour,
+                    counts: HashMap::new(),
+                });
+                self.buckets.back_mut().expect("just pushed")
+            }
+        };
+        let key = (
+            group.to_string(),
+            normalize_model(model),
+            account.to_string(),
+        );
+        let entry = bucket.counts.entry(key).or_default();
+        entry.requests = entry.requests.saturating_add(1);
+        if status < 400 {
+            entry.ok = entry.ok.saturating_add(1);
+        } else {
+            entry.errors = entry.errors.saturating_add(1);
+        }
+        if let Some(t) = tokens {
+            entry.tokens_in = entry.tokens_in.saturating_add(t.input);
+            entry.tokens_out = entry.tokens_out.saturating_add(t.output);
+            entry.cache_read = entry.cache_read.saturating_add(t.cache_read.unwrap_or(0));
+            entry.cache_creation = entry
+                .cache_creation
+                .saturating_add(t.cache_creation.unwrap_or(0));
+        }
+    }
+
+    /// Aggregate every key over the trailing `window` ending at `now`, summing
+    /// the buckets whose hour falls inside it. Returns one [`WindowedRow`] per
+    /// `(group, model, account)` with any activity in the window.
+    fn aggregate(&self, window: StatsWindow, now: SystemTime) -> Vec<WindowedRow> {
+        let current_hour = epoch_hour(now);
+        // Number of whole hours the window spans; the trailing bucket is the
+        // current hour, so a 24h window includes the current hour + 23 prior.
+        let span_hours = (window.duration().as_secs() / BUCKET_SECS).max(1);
+        let cutoff_hour = current_hour.saturating_sub(span_hours - 1);
+        let mut acc: HashMap<WindowKey, WindowCounts> = HashMap::new();
+        for bucket in &self.buckets {
+            if bucket.hour < cutoff_hour || bucket.hour > current_hour {
+                continue;
+            }
+            for (key, counts) in &bucket.counts {
+                acc.entry(key.clone()).or_default().add(counts);
+            }
+        }
+        let mut rows: Vec<WindowedRow> = acc
+            .into_iter()
+            .map(|((group, model, account), counts)| WindowedRow {
+                group,
+                model,
+                account,
+                counts,
+            })
+            .collect();
+        // Deterministic order: tokens desc, then key — the heatmap reads top-down.
+        rows.sort_by(|a, b| {
+            b.counts
+                .tokens()
+                .cmp(&a.counts.tokens())
+                .then(b.counts.requests.cmp(&a.counts.requests))
+                .then(a.group.cmp(&b.group))
+                .then(a.model.cmp(&b.model))
+                .then(a.account.cmp(&b.account))
+        });
+        rows
+    }
+}
+
+/// One aggregated windowed cell: a `(group, model, account)` triple and its
+/// summed counters over a window. The heatmap renders one of these per visible
+/// cell; the document carries the full set per window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WindowedRow {
+    pub group: String,
+    pub model: String,
+    pub account: String,
+    pub counts: WindowCounts,
+}
+
+// ---------------------------------------------------------------------------
 // Persistence (req-persist): append-only JSONL of finished requests.
 //
 // Two user requirements satisfied by ONE store: (A) model/account stats survive
@@ -400,6 +646,10 @@ pub(crate) struct ActivityLog {
     /// by [`MAX_CLIENTS`] distinct ids (the `unknown` bucket excluded). This is
     /// pure metering: counting requests/tokens per client, never gating.
     clients: HashMap<String, Totals>,
+    /// Rolling hourly bucket ring for the windowed (24h/72h) per-account
+    /// per-model heatmap (issue #23). In-memory only — durable persistence is a
+    /// follow-up. Keyed by (group, normalized_model, account).
+    windowed: WindowedBuckets,
 }
 
 /// A finished per-client attribution row (issue #32): one client identity
@@ -570,6 +820,12 @@ impl ActivityLog {
                 at.tokens_in = at.tokens_in.saturating_add(t.input);
                 at.tokens_out = at.tokens_out.saturating_add(t.output);
             }
+            // Fold the same request into the windowed bucket ring (issue #23).
+            // Only account-attributed requests get a per-account cell; the key
+            // carries group AND normalized model AND account so providers and
+            // accounts never merge. `group`/`model` are normalized inside.
+            self.windowed
+                .record(group, model, name, status, tokens, now);
         }
     }
 
@@ -681,6 +937,15 @@ impl ActivityLog {
                 .then(a.model.cmp(&b.model))
         });
         rows
+    }
+
+    /// Aggregate the windowed bucket ring over `window` ending at `now`: one
+    /// row per `(group, normalized_model, account)` with any activity in the
+    /// window, sorted by total tokens desc (issue #23). Drives the heatmap.
+    /// Best-effort — the underlying events are a lossy sample (dropped on a full
+    /// activity channel), so these numbers may undercount.
+    pub(crate) fn windowed_rows(&self, window: StatsWindow, now: SystemTime) -> Vec<WindowedRow> {
+        self.windowed.aggregate(window, now)
     }
 
     /// Completed requests per minute over the trailing `window` (notes
@@ -1469,6 +1734,250 @@ mod tests {
         // An ALREADY-tracked id keeps accumulating even past the cap.
         log.apply(finished_client(9_001, Some("c0"), None, 200), at(9_001));
         assert_eq!(log.client_totals("c0").requests, 2);
+    }
+
+    // ---- windowed bucket ring (issue #23) ----
+
+    /// One bucketed (group, model, account) cell within a window's aggregate.
+    fn cell<'a>(
+        rows: &'a [WindowedRow],
+        group: &str,
+        model: &str,
+        account: &str,
+    ) -> Option<&'a WindowCounts> {
+        rows.iter()
+            .find(|r| r.group == group && r.model == model && r.account == account)
+            .map(|r| &r.counts)
+    }
+
+    /// `now` `hours` after the epoch, for window arithmetic at hour resolution.
+    fn at_hours(hours: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(hours * 3600)
+    }
+
+    #[test]
+    fn windowed_aggregates_per_group_model_account_are_correct() {
+        let mut log = ActivityLog::new(LOG_CAPACITY);
+        // Three requests for claude/sonnet on account "a" inside the last hour.
+        for id in 0..3u64 {
+            log.apply(
+                finished_model(
+                    id,
+                    Some("a"),
+                    "claude",
+                    "claude-sonnet-4-5[1m]", // suffix is normalized away
+                    None,
+                    200,
+                    tokens(100, 40, Some(10)),
+                    "/v1/messages",
+                ),
+                at_hours(100),
+            );
+        }
+        // One failed request for the SAME model but account "b".
+        log.apply(
+            finished_model(
+                10,
+                Some("b"),
+                "claude",
+                "claude-sonnet-4-5",
+                None,
+                500,
+                None,
+                "/v1/messages",
+            ),
+            at_hours(100),
+        );
+        let now = at_hours(100);
+        let rows = log.windowed_rows(StatsWindow::Day, now);
+
+        let a = cell(&rows, "claude", "claude-sonnet-4-5", "a").expect("a cell");
+        assert_eq!(a.requests, 3);
+        assert_eq!(a.ok, 3);
+        assert_eq!(a.errors, 0);
+        assert_eq!(a.tokens_in, 300);
+        assert_eq!(a.tokens_out, 120);
+        assert_eq!(a.cache_read, 30);
+        // tokens() = in + out + cache_read + cache_creation.
+        assert_eq!(a.tokens(), 450);
+
+        let b = cell(&rows, "claude", "claude-sonnet-4-5", "b").expect("b cell");
+        assert_eq!((b.requests, b.ok, b.errors), (1, 0, 1));
+        assert_eq!(b.tokens(), 0, "failed request carried no tokens");
+
+        // Two distinct account cells for one (group, model).
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn windowed_same_model_under_two_groups_stays_two_rows() {
+        let mut log = ActivityLog::new(LOG_CAPACITY);
+        log.apply(
+            finished_model(
+                1,
+                Some("a"),
+                "claude",
+                "shared",
+                None,
+                200,
+                tokens(10, 5, None),
+                "/v1/messages",
+            ),
+            at_hours(50),
+        );
+        log.apply(
+            finished_model(
+                2,
+                Some("a"),
+                "codex",
+                "shared",
+                None,
+                200,
+                tokens(20, 7, None),
+                "/v1/messages",
+            ),
+            at_hours(50),
+        );
+        let rows = log.windowed_rows(StatsWindow::Day, at_hours(50));
+        // Same model name, same account, different group → never merged.
+        assert!(cell(&rows, "claude", "shared", "a").is_some());
+        assert!(cell(&rows, "codex", "shared", "a").is_some());
+        assert_eq!(rows.len(), 2, "dropping group would have merged to 1");
+    }
+
+    #[test]
+    fn windowed_24h_and_72h_select_the_right_buckets() {
+        let mut log = ActivityLog::new(LOG_CAPACITY);
+        // t = 200h: an old request, ~50h before "now".
+        log.apply(
+            finished_model(
+                1,
+                Some("a"),
+                "claude",
+                "m",
+                None,
+                200,
+                tokens(7, 0, None),
+                "/v1/messages",
+            ),
+            at_hours(200),
+        );
+        // t = 240h: a request 10h before "now".
+        log.apply(
+            finished_model(
+                2,
+                Some("a"),
+                "claude",
+                "m",
+                None,
+                200,
+                tokens(11, 0, None),
+                "/v1/messages",
+            ),
+            at_hours(240),
+        );
+        let now = at_hours(250);
+
+        // 24h window: only the t=240h request (10h ago) is inside.
+        let day = log.windowed_rows(StatsWindow::Day, now);
+        assert_eq!(cell(&day, "claude", "m", "a").expect("day").requests, 1);
+        assert_eq!(cell(&day, "claude", "m", "a").expect("day").tokens_in, 11);
+
+        // 72h window: both the 10h-ago and 50h-ago requests are inside.
+        let three = log.windowed_rows(StatsWindow::ThreeDay, now);
+        assert_eq!(cell(&three, "claude", "m", "a").expect("3d").requests, 2);
+        assert_eq!(cell(&three, "claude", "m", "a").expect("3d").tokens_in, 18);
+    }
+
+    #[test]
+    fn windowed_roll_forward_expires_old_buckets_and_prunes_empty_keys() {
+        let mut log = ActivityLog::new(LOG_CAPACITY);
+        // A stray/typo model key recorded long ago.
+        log.apply(
+            finished_model(
+                1,
+                Some("a"),
+                "claude",
+                "typo-model",
+                None,
+                200,
+                tokens(5, 0, None),
+                "/v1/messages",
+            ),
+            at_hours(10),
+        );
+        // Far in the future (well past the 73-bucket retention): record again so
+        // roll-forward advances the ring past the stray key's bucket.
+        log.apply(
+            finished_model(
+                2,
+                Some("a"),
+                "claude",
+                "live-model",
+                None,
+                200,
+                tokens(9, 0, None),
+                "/v1/messages",
+            ),
+            at_hours(10 + BUCKET_COUNT as u64 + 5),
+        );
+        let now = at_hours(10 + BUCKET_COUNT as u64 + 5);
+
+        // The stray key's bucket was pruned entirely (not zeroed) — it is gone
+        // from every window, so a typo key cannot grow the ring unbounded.
+        let three = log.windowed_rows(StatsWindow::ThreeDay, now);
+        assert!(
+            cell(&three, "claude", "typo-model", "a").is_none(),
+            "expired bucket must be pruned, not retained as a zero key"
+        );
+        assert!(
+            cell(&three, "claude", "live-model", "a").is_some(),
+            "the recent key survives"
+        );
+        // Internally: no empty key map lingers (pruned wholesale).
+        assert!(
+            log.windowed.buckets.iter().all(|b| !b.counts.is_empty()),
+            "no empty bucket retained after roll-forward"
+        );
+    }
+
+    #[test]
+    fn windowed_is_defensive_against_backwards_clock_skew() {
+        let mut log = ActivityLog::new(LOG_CAPACITY);
+        log.apply(
+            finished_model(
+                1,
+                Some("a"),
+                "claude",
+                "m",
+                None,
+                200,
+                tokens(10, 0, None),
+                "/v1/messages",
+            ),
+            at_hours(100),
+        );
+        // A later event with an EARLIER timestamp (NTP step back) must not panic
+        // and must still be counted somewhere in the ring.
+        log.apply(
+            finished_model(
+                2,
+                Some("a"),
+                "claude",
+                "m",
+                None,
+                200,
+                tokens(3, 0, None),
+                "/v1/messages",
+            ),
+            at_hours(99),
+        );
+        // A pre-epoch timestamp clamps to hour 0 rather than panicking.
+        let rows = log.windowed_rows(StatsWindow::ThreeDay, at_hours(100));
+        assert!(
+            cell(&rows, "claude", "m", "a").is_some(),
+            "skewed events still fold without panic"
+        );
     }
 
     // ---- persistence (req-persist A/C) ----

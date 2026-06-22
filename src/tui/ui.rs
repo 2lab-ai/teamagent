@@ -40,6 +40,12 @@ const MODEL_BAR_WIDTH: usize = 10;
 const CLIENT_PANEL_ROWS: usize = 6;
 /// A model used within this window counts as "recently active" (req15).
 const MODEL_RECENT_WINDOW: Duration = Duration::from_secs(60);
+/// Max heatmap cells shown at once (issue #23). The rows are sorted by tokens
+/// desc, so the busiest (group, model, account) cells stay visible; the panel
+/// title reports the total when more exist.
+const HEATMAP_MAX_ROWS: usize = 8;
+/// Width of the heatmap's token-intensity mini-bar.
+const HEATMAP_BAR_WIDTH: usize = 12;
 
 fn dim() -> Style {
     Style::new().fg(Color::DarkGray)
@@ -220,12 +226,21 @@ fn draw_stats_overlay(frame: &mut Frame, view: &DashboardView, ctx: &FrameCtx, c
     frame.render_widget(Clear, area);
     let snapshot = &view.snapshot;
     let table_height = (snapshot.accounts.len().max(1) as u16).saturating_add(2);
-    let [table_area, body_area] =
-        Layout::vertical([Constraint::Length(table_height), Constraint::Min(3)]).areas(area);
+    // Reserve a bottom slice for the windowed (24h/72h) per-account/per-model
+    // token heatmap (issue #23). The heatmap height tracks the visible cells,
+    // capped so the model table/drill-down above always keep room.
+    let heatmap_height = heatmap_panel_height(view, chrome.stats_window, area.height);
+    let [table_area, body_area, heatmap_area] = Layout::vertical([
+        Constraint::Length(table_height),
+        Constraint::Min(3),
+        Constraint::Length(heatmap_height),
+    ])
+    .areas(area);
     draw_accounts(frame, table_area, view, ctx, chrome);
     // Reserve a compact per-client attribution panel (issue #32) at the bottom
     // of the stats body when there is client usage to show; otherwise the
-    // models view keeps the whole body.
+    // models view keeps the whole body. The windowed heatmap (issue #23) always
+    // renders in its own reserved slice below.
     if view.client_usage.is_empty() {
         draw_models_full(frame, body_area, view, ctx, chrome);
     } else {
@@ -238,6 +253,7 @@ fn draw_stats_overlay(frame: &mut Frame, view: &DashboardView, ctx: &FrameCtx, c
         draw_models_full(frame, models_area, view, ctx, chrome);
         draw_clients_compact(frame, clients_area, view);
     }
+    draw_heatmap(frame, heatmap_area, view, chrome.stats_window);
 }
 
 /// Compact per-client request-attribution table (issue #32): top
@@ -286,6 +302,22 @@ fn draw_clients_compact(frame: &mut Frame, area: Rect, view: &DashboardView) {
         .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)))
         .block(Block::new().borders(Borders::TOP).title(title));
     frame.render_widget(table, area);
+}
+
+/// Rows the windowed heatmap panel needs: a title/header pair + one row per
+/// visible cell, capped at [`HEATMAP_MAX_ROWS`], plus the top border. Returns 0
+/// when the panel would not fit (tiny terminal) so the model view keeps the
+/// space.
+fn heatmap_panel_height(
+    view: &DashboardView,
+    window: super::activity::StatsWindow,
+    total: u16,
+) -> u16 {
+    let cells = heatmap_cells(view, window).len().min(HEATMAP_MAX_ROWS);
+    // border(1) + best-effort line(1) + header(1) + cells (≥1 for the "no
+    // activity" / first row), then never starve the model view above it.
+    let want = 3 + cells.max(1) as u16;
+    want.min(total.saturating_sub(8))
 }
 
 /// Logs overlay (`l`): a full-screen log tail (was the `l` size-cycle panel).
@@ -2067,6 +2099,108 @@ fn draw_model_detail(
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
+/// The heatmap cells for `window`, or an empty slice when the doc carries no
+/// slice for it (older daemon / no activity). Already sorted by tokens desc by
+/// the document builder.
+fn heatmap_cells(
+    view: &DashboardView,
+    window: super::activity::StatsWindow,
+) -> &[crate::dashboard::WindowedCellDoc] {
+    let label = window.label();
+    view.windowed
+        .iter()
+        .find(|w| w.window == label)
+        .map(|w| w.cells.as_slice())
+        .unwrap_or(&[])
+}
+
+/// Windowed per-account/per-model token heatmap (issue #23). One row per
+/// `(group, model, account)` cell over the selected trailing window, with a
+/// token-intensity bar coloured by the cell's share of the busiest cell. The
+/// numbers are a BEST-EFFORT sample — the activity event channel is lossy
+/// (events are dropped on a full channel) — so the panel says so explicitly and
+/// never presents them as an exact ledger.
+fn draw_heatmap(
+    frame: &mut Frame,
+    area: Rect,
+    view: &DashboardView,
+    window: super::activity::StatsWindow,
+) {
+    if area.height == 0 {
+        return;
+    }
+    let cells = heatmap_cells(view, window);
+    let total = cells.len();
+    let title = format!(" token heatmap — {} (best-effort) ", window.label());
+    let block = Block::new().borders(Borders::TOP).title(title);
+
+    let mut lines: Vec<Line> = Vec::new();
+    // The accuracy contract (mandatory): a visible best-effort qualifier so the
+    // windowed numbers are never read as exact accounting.
+    lines.push(Line::from(Span::styled(
+        " sampled from the activity feed — may undercount (lossy channel); w cycles 24h/72h",
+        dim(),
+    )));
+    if total == 0 {
+        lines.push(Line::from(Span::styled(
+            " no windowed activity yet",
+            Style::new().fg(Color::Yellow),
+        )));
+        frame.render_widget(Paragraph::new(lines).block(block), area);
+        return;
+    }
+
+    // Column header.
+    lines.push(Line::from(Span::styled(
+        format!(
+            " {:<7} {:<20} {:<14} {:>6} {:>8}  intensity",
+            "group", "model", "account", "req", "tokens"
+        ),
+        dim().add_modifier(Modifier::BOLD),
+    )));
+
+    let max_tokens = cells.iter().map(|c| c.tokens).max().unwrap_or(0).max(1);
+    let shown = total.min(HEATMAP_MAX_ROWS);
+    for c in &cells[..shown] {
+        let share = c.tokens as f64 / max_tokens as f64;
+        let bar = format::gauge_bar(share, HEATMAP_BAR_WIDTH);
+        let bar_color = level_color(format::gauge_level(share));
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!(" {:<7}", trunc(&c.group, 7)),
+                group_color(Some(c.group.as_str())),
+            ),
+            Span::raw(format!(" {:<20}", trunc(&c.model, 20))),
+            Span::styled(format!(" {:<14}", trunc(&c.account, 14)), dim()),
+            Span::raw(format!(" {:>6}", format::human_count(c.requests))),
+            Span::raw(format!(" {:>8}", format::human_count(c.tokens))),
+            Span::raw("  "),
+            Span::styled(bar, Style::new().fg(bar_color)),
+        ]));
+    }
+    if total > shown {
+        lines.push(Line::from(Span::styled(
+            format!(" …{} more cell(s)", total - shown),
+            dim(),
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+/// Truncate `s` to `width` display columns, appending `…` when clipped. Keeps
+/// the heatmap columns aligned without depending on a unicode-width crate (the
+/// model/account strings here are ASCII slugs/emails).
+fn trunc(s: &str, width: usize) -> String {
+    if s.chars().count() <= width {
+        s.to_string()
+    } else if width == 0 {
+        String::new()
+    } else {
+        let keep: String = s.chars().take(width.saturating_sub(1)).collect();
+        format!("{keep}…")
+    }
+}
+
 fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome) {
     let status = Line::from(Span::styled(
         format!(" {}", chrome.status_line.as_deref().unwrap_or("")),
@@ -2129,7 +2263,8 @@ fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome) {
                 key("q"),
                 Span::raw(" quit"),
             ]),
-            // Stats overlay: navigation + back, regardless of attach mode.
+            // Stats overlay: navigation + window cycle + back, regardless of
+            // attach mode. `w` toggles the heatmap window (issue #23).
             Overlay::Stats => Line::from(vec![
                 Span::raw(" stats — "),
                 key("g/Esc"),
@@ -2138,6 +2273,8 @@ fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome) {
                 Span::raw(" model  "),
                 key("PgUp/PgDn"),
                 Span::raw(" page  "),
+                key("w"),
+                Span::raw(" window  "),
                 key("q"),
                 Span::raw(" quit"),
             ]),
@@ -2270,6 +2407,7 @@ mod tests {
             logs: Vec::new(),
             model_usage,
             client_usage: Vec::new(),
+            windowed: Vec::new(),
             codex: crate::dashboard::CodexSettingsDoc::default(),
         }
     }
@@ -2286,6 +2424,7 @@ mod tests {
             activity_scroll: 0,
             expanded_activity: None,
             model_cursor: 0,
+            stats_window: super::super::activity::StatsWindow::default(),
             add_input_len: 0,
             attach: None,
         }
@@ -2376,6 +2515,46 @@ mod tests {
             text.contains("gpt-5.5"),
             "MAIN model data still visible underneath the overlay"
         );
+    }
+
+    /// The Stats overlay's windowed heatmap (issue #23) renders the selected
+    /// window's cells AND a visible best-effort qualifier (accuracy contract).
+    #[test]
+    fn stats_overlay_renders_windowed_heatmap_with_best_effort_label() {
+        let mut view = view_with(vec![model_row("codex", "gpt-5.5", 700, 300)]);
+        view.windowed = vec![
+            crate::dashboard::WindowedStatsDoc {
+                window: "24h".into(),
+                window_secs: 86_400,
+                cells: vec![crate::dashboard::WindowedCellDoc {
+                    group: "codex".into(),
+                    model: "gpt-5.5".into(),
+                    account: "z@2lab.ai".into(),
+                    requests: 12,
+                    ok: 11,
+                    errors: 1,
+                    tokens_in: 700,
+                    tokens_out: 300,
+                    cache_read: 120,
+                    cache_creation: 0,
+                    tokens: 1_120,
+                }],
+            },
+            crate::dashboard::WindowedStatsDoc {
+                window: "72h".into(),
+                window_secs: 259_200,
+                cells: Vec::new(),
+            },
+        ];
+        let text = render(&view, &chrome_overlay(Overlay::Stats), 160, 40);
+        assert!(text.contains("heatmap"), "heatmap panel titled");
+        assert!(
+            text.contains("best-effort"),
+            "accuracy contract: best-effort qualifier visible"
+        );
+        assert!(text.contains("z@2lab.ai"), "per-account axis rendered");
+        // The keybar advertises the window-cycle key.
+        assert!(text.contains("window"), "footer advertises w window cycle");
     }
 
     /// The Logs overlay shows the log tail.

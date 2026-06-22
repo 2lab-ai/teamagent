@@ -248,6 +248,9 @@ pub(crate) struct Chrome {
     pub expanded_activity: Option<activity::ActivityKey>,
     /// Cursor row in the Stats overlay's model table.
     pub model_cursor: usize,
+    /// Trailing window the Stats heatmap aggregates over (issue #23), cycled
+    /// with `w` while the Stats overlay is open.
+    pub stats_window: activity::StatsWindow,
     /// `Some` in attach mode.
     pub attach: Option<Attach>,
     /// Number of characters typed so far in `Mode::AddKey` — the footer shows
@@ -339,6 +342,9 @@ struct App {
     activity_chrome: ui::ActivityChrome,
     /// Cursor row in the Stats overlay's model table.
     model_cursor: usize,
+    /// Trailing window the Stats heatmap aggregates over (issue #23), cycled
+    /// with `w` in the Stats overlay.
+    stats_window: activity::StatsWindow,
     /// API-key buffer for `Mode::AddKey`. Held outside `Mode` so the enum
     /// stays `Copy` and the secret is owned in exactly one place; cleared on
     /// submit/cancel. Never rendered raw — the footer shows a masked width.
@@ -365,6 +371,7 @@ impl App {
             expanded_activity: None,
             activity_chrome: ui::ActivityChrome::default(),
             model_cursor: 0,
+            stats_window: activity::StatsWindow::default(),
             add_input: String::new(),
             pending_login: None,
         }
@@ -396,6 +403,7 @@ impl App {
             activity_scroll: self.activity_scroll,
             expanded_activity: self.expanded_activity.clone(),
             model_cursor: self.model_cursor,
+            stats_window: self.stats_window,
             add_input_len: self.add_input.chars().count(),
             status_line: self.status_line().map(str::to_string),
             attach: match &self.backend {
@@ -526,6 +534,8 @@ impl App {
         match code {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('g') | KeyCode::Esc => self.overlay = Overlay::None,
+            // Cycle the heatmap window 24h ↔ 72h (issue #23).
+            KeyCode::Char('w') => self.stats_window = self.stats_window.next(),
             KeyCode::Up | KeyCode::Char('k') => self.move_model_cursor(-1, len),
             KeyCode::Down | KeyCode::Char('j') => self.move_model_cursor(1, len),
             KeyCode::PageUp => self.move_model_cursor(-10, len),
@@ -1586,6 +1596,22 @@ mod tests {
         assert_eq!(app.overlay, Overlay::None);
     }
 
+    /// `w` in the Stats overlay cycles the heatmap window 24h ↔ 72h (issue #23)
+    /// without closing the overlay.
+    #[test]
+    fn w_cycles_the_stats_heatmap_window() {
+        let mut app = remote_app();
+        let view = stats_view();
+        app.on_key_main(KeyCode::Char('g'), Some(&view));
+        assert_eq!(app.overlay, Overlay::Stats);
+        assert_eq!(app.stats_window, activity::StatsWindow::Day);
+        app.on_key_stats(KeyCode::Char('w'), Some(&view));
+        assert_eq!(app.stats_window, activity::StatsWindow::ThreeDay);
+        assert_eq!(app.overlay, Overlay::Stats, "w stays in the overlay");
+        app.on_key_stats(KeyCode::Char('w'), Some(&view));
+        assert_eq!(app.stats_window, activity::StatsWindow::Day, "cycles back");
+    }
+
     /// The Accounts overlay houses the #3/#4 affordances: `a`→AddKey,
     /// `r`→ConfirmRemove, `s`→Select, all entering their own `Mode` over the
     /// overlay (which stays open).
@@ -1816,6 +1842,7 @@ mod tests {
             logs: Vec::new(),
             model_usage: Vec::new(),
             client_usage: Vec::new(),
+            windowed: Vec::new(),
             codex: crate::dashboard::CodexSettingsDoc::default(),
         }
     }
