@@ -27,3 +27,25 @@ pub fn version_with_build() -> String {
 pub fn version_string() -> String {
     format!("llmux {}", version_with_build())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // DIST-10: `version_with_build` is exactly "<version> (<channel> <id>)".
+    #[test]
+    fn version_with_build_formats_version_channel_and_id() {
+        assert_eq!(
+            version_with_build(),
+            format!("{VERSION} ({BUILD_CHANNEL} {BUILD_ID})")
+        );
+    }
+
+    // DIST-11: `version_string` is the build line prefixed with "llmux ".
+    #[test]
+    fn version_string_is_llmux_prefixed_build_line() {
+        let s = version_string();
+        assert!(s.starts_with("llmux "), "got {s:?}");
+        assert!(s.ends_with(&version_with_build()), "got {s:?}");
+    }
+}

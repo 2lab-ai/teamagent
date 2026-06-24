@@ -1149,6 +1149,23 @@ mod tests {
         assert_eq!(input[2]["content"][0]["text"], "again");
     }
 
+    // PROV-10: Anthropic `max_tokens` is not part of the Responses API request
+    // and must be dropped — the upstream body carries no `max_tokens` field.
+    #[test]
+    fn translate_drops_max_tokens_from_upstream() {
+        let body = json!({
+            "model": "claude-sonnet-4-5",
+            "max_tokens": 4096,
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let (upstream, _) =
+            translate_request_with(&body, "sess-1", &CodexShape::default()).expect("translate");
+        assert!(
+            upstream.get("max_tokens").is_none(),
+            "max_tokens must not be forwarded to the codex responses API, got {upstream:?}"
+        );
+    }
+
     #[test]
     fn shape_sets_configurable_model_fast_tier_and_effort() {
         let body = json!({ "model": "gpt-5.5", "messages": [{"role":"user","content":"hi"}] });

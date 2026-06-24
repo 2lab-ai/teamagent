@@ -949,6 +949,66 @@ mod tests {
         );
     }
 
+    /// Construct a `QuotaWindow` directly for `maybe_self_heal` unit tests.
+    fn window(utilization: f64, resets_at_secs: u64, fetched_at_secs: u64) -> QuotaWindow {
+        QuotaWindow {
+            utilization,
+            resets_at: at(resets_at_secs),
+            fetched_at: at(fetched_at_secs),
+            source: WindowSource::UsagePoll,
+        }
+    }
+
+    /// Park an account on a `Heuristic` cooldown set at `set_at`, returning it
+    /// ready for direct `maybe_self_heal` calls.
+    fn heuristic_parked(set_at: SystemTime) -> AccountState {
+        let mut acct = AccountState::fresh(&oauth_account("a"));
+        acct.cooldown_until = set_at.checked_add(DEFAULT_HEURISTIC_COOLDOWN);
+        acct.cooldown_source = Some(CooldownSource::Heuristic);
+        acct.cooldown_set_at = Some(set_at);
+        acct
+    }
+
+    // SCHED-15(a): newer data with every present window under 100% clears a
+    // Heuristic cooldown.
+    #[test]
+    fn maybe_self_heal_clears_heuristic_when_all_windows_have_capacity() {
+        let mut acct = heuristic_parked(now());
+        acct.five_hour = Some(window(0.30, NOW_SECS + 3600, NOW_SECS + 1));
+        acct.seven_day = Some(window(0.99, NOW_SECS + 86_400, NOW_SECS + 1));
+        acct.maybe_self_heal(at(NOW_SECS + 1));
+        assert!(acct.cooldown_until.is_none());
+        assert!(acct.cooldown_source.is_none());
+        assert!(acct.cooldown_set_at.is_none());
+    }
+
+    // SCHED-15(b): a RetryAfter park is an explicit upstream instruction and is
+    // never cleared by fresh capacity.
+    #[test]
+    fn maybe_self_heal_never_clears_retry_after_cooldown() {
+        let mut acct = AccountState::fresh(&oauth_account("a"));
+        acct.cooldown_until = Some(at(NOW_SECS + 600));
+        acct.cooldown_source = Some(CooldownSource::RetryAfter);
+        acct.cooldown_set_at = Some(now());
+        acct.five_hour = Some(window(0.0, NOW_SECS + 3600, NOW_SECS + 1));
+        acct.maybe_self_heal(at(NOW_SECS + 1));
+        assert_eq!(acct.cooldown_until, Some(at(NOW_SECS + 600)));
+        assert_eq!(acct.cooldown_source, Some(CooldownSource::RetryAfter));
+    }
+
+    // SCHED-15(c): strict-newer guard — data with `fetched_at == cooldown_set_at`
+    // (here, `now == set_at`) must not heal; the 429's own response can't clear
+    // the cooldown it just set.
+    #[test]
+    fn maybe_self_heal_requires_strictly_newer_than_cooldown_set_at() {
+        let mut acct = heuristic_parked(now());
+        acct.five_hour = Some(window(0.10, NOW_SECS + 3600, NOW_SECS));
+        // now == cooldown_set_at -> not strictly newer.
+        acct.maybe_self_heal(now());
+        assert!(acct.cooldown_until.is_some());
+        assert_eq!(acct.cooldown_source, Some(CooldownSource::Heuristic));
+    }
+
     #[test]
     fn auth_failure_marks_and_credential_update_heals() {
         let mut state = PoolState::from_accounts(&[oauth_account("a")]);

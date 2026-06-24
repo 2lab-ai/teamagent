@@ -1313,6 +1313,41 @@ async fn codex_count_tokens_is_estimated_locally() {
     );
 }
 
+/// PROXY-17 / PROV-19: a codex account only serves `/v1/messages`. Any other
+/// path (here `/v1/models`) is refused locally with HTTP 501 and never reaches
+/// the codex upstream. Focused regression anchor for the `path != "/v1/messages"`
+/// branch (forward.rs), independent of the count_tokens path.
+#[tokio::test]
+async fn codex_non_messages_endpoint_is_501_without_upstream_call() {
+    let mock = MockUpstream::spawn().await;
+    let proxy =
+        Proxy::spawn_config(codex_config(&mock, vec![codex_account("cx", "at-codex")])).await;
+
+    let client = reqwest::Client::new();
+    let response = client
+        .get(proxy.url("/v1/models"))
+        .send()
+        .await
+        .expect("reachable");
+    assert_eq!(
+        response.status(),
+        501,
+        "a codex account serving a non-/v1/messages path returns 501"
+    );
+    let doc: serde_json::Value = response.json().await.expect("json error body");
+    assert_eq!(doc["type"], "error");
+    assert!(
+        doc["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("/v1/messages")),
+        "501 body names the only supported endpoint: {doc}"
+    );
+    assert!(
+        mock.seen().is_empty(),
+        "a refused endpoint must not reach the codex upstream"
+    );
+}
+
 /// The 2026-06-12 live chatgpt.com capture, verbatim event sequence: a
 /// reasoning item with encrypted_content and an EMPTY summary (no
 /// reasoning_summary_text.delta), a message item tagged phase:"final_answer",

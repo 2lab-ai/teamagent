@@ -1839,6 +1839,66 @@ mod tests {
         assert!(headers.get("authorization").is_none());
     }
 
+    // PROXY-08: a non-length error (no `LengthLimitError` in its source chain)
+    // must NOT be classified as a length-limit hit — pins the 413-vs-400 branch
+    // so a generic body-read failure stays a 400, not a 413.
+    #[test]
+    fn is_length_limit_error_false_for_non_length_error() {
+        let io_err = std::io::Error::other("connection reset");
+        let err = axum::Error::new(io_err);
+        assert!(
+            !is_length_limit_error(&err),
+            "a plain IO error is not a length-limit error"
+        );
+    }
+
+    // PROXY-04: hop-by-hop / framing headers are stripped from the upstream
+    // response, but `content-encoding` passes through (we relay the compressed
+    // body byte-for-byte).
+    #[test]
+    fn sanitize_response_headers_strips_hop_by_hop_and_keeps_content_encoding() {
+        let mut headers = HeaderMap::new();
+        for name in [
+            "transfer-encoding",
+            "connection",
+            "keep-alive",
+            "trailer",
+            "upgrade",
+            "proxy-authenticate",
+            "content-length",
+        ] {
+            headers.insert(
+                http::header::HeaderName::from_static(name),
+                HeaderValue::from_static("x"),
+            );
+        }
+        headers.insert("content-encoding", HeaderValue::from_static("gzip"));
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+
+        let out = sanitize_response_headers(&headers);
+
+        for name in [
+            "transfer-encoding",
+            "connection",
+            "keep-alive",
+            "trailer",
+            "upgrade",
+            "proxy-authenticate",
+            "content-length",
+        ] {
+            assert!(out.get(name).is_none(), "{name} must be stripped");
+        }
+        assert_eq!(
+            out.get("content-encoding").expect("content-encoding kept"),
+            "gzip",
+            "content-encoding must pass through (body relayed byte-identically)"
+        );
+        assert_eq!(
+            out.get("content-type").expect("content-type kept"),
+            "application/json"
+        );
+    }
+
     #[test]
     fn classify_follows_the_taxonomy_table() {
         let empty = HeaderMap::new();

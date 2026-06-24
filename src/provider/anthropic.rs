@@ -250,6 +250,32 @@ mod tests {
         assert!(req.headers.get(X_API_KEY).is_none());
     }
 
+    // PROV-02: a codex credential must never authenticate against the
+    // anthropic provider — reaching `inject_credential` with one is a routing
+    // bug and is rejected as an Auth error (not silently passed through).
+    #[test]
+    fn inject_credential_rejects_codex_credential_with_auth_error() {
+        let mut headers = HeaderMap::new();
+        let err = inject_credential(
+            &mut headers,
+            &AccountCredential::Codex {
+                account_id: "acct-1".into(),
+                access_token: "at-1".into(),
+                refresh_token: "rt-1".into(),
+                expires_at_ms: 0,
+                last_refresh_ms: None,
+            },
+        )
+        .expect_err("codex credential must not auth against anthropic");
+        assert!(
+            matches!(err, ProviderError::Auth(_)),
+            "expected Auth error, got {err:?}"
+        );
+        // No credential header was injected.
+        assert!(headers.get(AUTHORIZATION).is_none());
+        assert!(headers.get(X_API_KEY).is_none());
+    }
+
     #[tokio::test]
     async fn auth_injects_api_key_for_apikey_accounts() {
         let p = provider();
