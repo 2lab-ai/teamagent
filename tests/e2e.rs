@@ -2508,3 +2508,52 @@ async fn timer_sweep_off_by_default_when_sweep_secs_zero() {
 async fn brew_installed_binary_runs() {
     unreachable!("run manually: brew install 2lab-ai/tap/llmux-preview && llmux --version")
 }
+
+// ---------------------------------------------------------------------------
+// 13. GUI-initiated OAuth login endpoints (FR4, .prd/11-llmux-islands-spec.md)
+// ---------------------------------------------------------------------------
+
+/// The daemon's `/llmux/login/*` surface is wired and validates input WITHOUT
+/// opening a browser: an unknown provider is a 400, an unknown poll state is a
+/// 404, and cancelling an unknown state is an idempotent `{"cancelled":false}`.
+/// The happy-path browser flow is a manual acceptance step (spec §Acceptance
+/// #4), so only the no-browser paths are exercised here.
+#[tokio::test]
+async fn login_endpoints_validate_input_without_a_browser() {
+    let proxy = Proxy::spawn(
+        "http://127.0.0.1:9",
+        vec![oauth_account("claude:test", "tok")],
+    )
+    .await;
+    let client = reqwest::Client::new();
+
+    // Unknown provider → 400, no browser opened.
+    let resp = client
+        .post(proxy.url("/llmux/login/start"))
+        .header("content-type", "application/json")
+        .body(r#"{"provider":"nope"}"#)
+        .send()
+        .await
+        .expect("login/start reachable");
+    assert_eq!(resp.status().as_u16(), 400, "unknown provider is rejected");
+
+    // Unknown poll state → 404.
+    let resp = client
+        .get(proxy.url("/llmux/login/status?state=does-not-exist"))
+        .send()
+        .await
+        .expect("login/status reachable");
+    assert_eq!(resp.status().as_u16(), 404, "unknown login state is 404");
+
+    // Cancelling an unknown state is idempotent: 200 + cancelled:false.
+    let resp = client
+        .post(proxy.url("/llmux/login/cancel"))
+        .header("content-type", "application/json")
+        .body(r#"{"state":"does-not-exist"}"#)
+        .send()
+        .await
+        .expect("login/cancel reachable");
+    assert_eq!(resp.status().as_u16(), 200);
+    let body: serde_json::Value = resp.json().await.expect("cancel json");
+    assert_eq!(body["cancelled"], serde_json::Value::Bool(false));
+}

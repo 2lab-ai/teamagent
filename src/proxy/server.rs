@@ -161,6 +161,10 @@ pub struct AppState {
     pub bound_port: Arc<AtomicU16>,
     /// Graceful-shutdown trigger fired by `POST /llmux/shutdown`.
     pub shutdown: Arc<tokio::sync::Notify>,
+    /// GUI-initiated OAuth login registry (FR4, `.prd/11-llmux-islands-spec.md`):
+    /// the single in-flight browser login the daemon runs on behalf of an HTTP
+    /// client (`llmux-islands`), behind `/llmux/login/{start,status,cancel}`.
+    pub logins: Arc<super::login::LoginRegistry>,
 }
 
 impl AppState {
@@ -246,6 +250,7 @@ impl AppState {
             request_counter: Arc::new(AtomicU64::new(0)),
             started: Instant::now(),
             shutdown: Arc::new(tokio::sync::Notify::new()),
+            logins: Arc::new(super::login::LoginRegistry::default()),
         })
     }
 
@@ -723,6 +728,9 @@ pub fn router(state: AppState) -> Router {
         .route("/llmux/add-account", post(add_account_endpoint))
         .route("/llmux/inject-account", post(inject_account_endpoint))
         .route("/llmux/remove-account", post(remove_account_endpoint))
+        .route("/llmux/login/start", post(login_start_endpoint))
+        .route("/llmux/login/status", get(login_status_endpoint))
+        .route("/llmux/login/cancel", post(login_cancel_endpoint))
         .route("/llmux/shutdown", post(shutdown))
         .route("/v1/oauth/token", post(oauth_token_relay))
         .fallback(forward_any)
@@ -1154,6 +1162,159 @@ async fn inject_account_endpoint(
             &format!("config write failed: {err}"),
         ),
     }
+}
+
+/// Request body for `POST /llmux/login/start`.
+#[derive(serde::Deserialize)]
+struct LoginStartRequest {
+    /// `"claude"` or `"codex"` (aliases accepted, see [`LoginProvider::parse`]).
+    provider: String,
+}
+
+/// Query for `GET /llmux/login/status`.
+#[derive(serde::Deserialize)]
+struct LoginStatusQuery {
+    state: String,
+}
+
+/// Request body for `POST /llmux/login/cancel`.
+#[derive(serde::Deserialize)]
+struct LoginCancelRequest {
+    state: String,
+}
+
+/// `POST /llmux/login/start` `{"provider":"claude"|"codex"}` — begin a
+/// GUI-initiated OAuth login (FR4, `.prd/11-llmux-islands-spec.md`). Unlike
+/// `/llmux/inject-account` (where the CLIENT runs the browser flow and relays
+/// the token), here the DAEMON runs the same PKCE browser flow the CLI uses —
+/// `cli::login::oauth_login_to_account` (Claude) /
+/// `auth::codex::login_codex_interactive` (Codex) — on the daemon host, then
+/// [`AppState::inject_account`]s the result into the live pool with no restart.
+///
+/// Single in-flight login: the OAuth callback binds a fixed localhost port, so
+/// a second `start` while one is pending is a `409`. Returns `{"state":"…"}`;
+/// poll `GET /llmux/login/status?state=` for the outcome. NO provider token
+/// crosses this boundary — only the opaque state id and, on success, the new
+/// account name. Same loopback / proxy-api-key gate as every route.
+async fn login_start_endpoint(
+    State(state): State<AppState>,
+    body: axum::extract::Json<LoginStartRequest>,
+) -> Response {
+    let Some(provider) = super::login::LoginProvider::parse(&body.provider) else {
+        return relay_error(
+            StatusCode::BAD_REQUEST,
+            "provider must be 'claude' or 'codex'",
+        );
+    };
+    if state.config_path.is_none() {
+        return relay_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "config persistence disabled; cannot add account",
+        );
+    }
+    let state_id = ulid::Ulid::new().to_string();
+    if !state.logins.begin(state_id.clone()) {
+        return relay_error(
+            StatusCode::CONFLICT,
+            "a login is already in progress; cancel it or wait for it to finish",
+        );
+    }
+
+    // Run the browser flow off the request: `start` returns immediately and the
+    // app polls `status`. The task injects the account on success and records
+    // the terminal phase against this `state`.
+    let app = state.clone();
+    let task_state = state_id.clone();
+    let handle = tokio::spawn(async move {
+        let phase = match run_login(&app, provider).await {
+            Ok(account) => super::login::LoginPhase::Done { account },
+            Err(message) => super::login::LoginPhase::Error { message },
+        };
+        app.logins.finish(&task_state, phase);
+    });
+    state.logins.attach_handle(&state_id, handle);
+
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::json!({
+            "ok": true,
+            "state": state_id,
+            "provider": provider.as_str(),
+        })
+        .to_string(),
+    )
+        .into_response()
+}
+
+/// Run the provider's browser login on the daemon and inject the resulting
+/// account. Returns the resolved account name. Errors are stringified — the
+/// `auth`/`cli` error types carry only status/shape, never the secret, so the
+/// message is token-free (AGENTS.md credential rule).
+async fn run_login(
+    state: &AppState,
+    provider: super::login::LoginProvider,
+) -> Result<String, String> {
+    use super::login::LoginProvider;
+    let account = match provider {
+        LoginProvider::Claude => {
+            crate::cli::login::oauth_login_to_account(&state.client, &state.config.upstream)
+                .await
+                .map_err(|e| e.to_string())?
+        }
+        LoginProvider::Codex => crate::auth::codex::login_codex_interactive(
+            &state.client,
+            &state.config.codex.token_url,
+        )
+        .await
+        .map_err(|e| e.to_string())?,
+    };
+    state
+        .inject_account(account)
+        .map(|(name, _outcome)| name)
+        .map_err(|e| e.to_string())
+}
+
+/// `GET /llmux/login/status?state=…` — poll a login started by
+/// `/llmux/login/start`. `{"phase":"pending"}` while the browser flow runs,
+/// `{"phase":"done","account":"…"}` once injected, `{"phase":"error","error":"…"}`
+/// on failure/cancel, or `404` for an unknown/expired state.
+async fn login_status_endpoint(
+    State(state): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<LoginStatusQuery>,
+) -> Response {
+    let body = match state.logins.status(&query.state) {
+        Some(super::login::LoginPhase::Pending) => serde_json::json!({ "phase": "pending" }),
+        Some(super::login::LoginPhase::Done { account }) => {
+            serde_json::json!({ "phase": "done", "account": account })
+        }
+        Some(super::login::LoginPhase::Error { message }) => {
+            serde_json::json!({ "phase": "error", "error": message })
+        }
+        None => return relay_error(StatusCode::NOT_FOUND, "unknown or expired login state"),
+    };
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json")],
+        body.to_string(),
+    )
+        .into_response()
+}
+
+/// `POST /llmux/login/cancel` `{"state":"…"}` — abandon an in-progress login
+/// (aborts the browser/callback wait). `{"cancelled":true}` if a pending login
+/// was cancelled, `{"cancelled":false}` if it was already terminal/unknown.
+async fn login_cancel_endpoint(
+    State(state): State<AppState>,
+    body: axum::extract::Json<LoginCancelRequest>,
+) -> Response {
+    let cancelled = state.logins.cancel(&body.state);
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::json!({ "ok": true, "cancelled": cancelled }).to_string(),
+    )
+        .into_response()
 }
 
 /// Request body for `POST /llmux/remove-account`. `confirm` must be `true` —
