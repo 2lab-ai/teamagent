@@ -23,6 +23,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Offscreen snapshot mode (LLMUX_ISLANDS_SNAPSHOT_DIR): render the
+        // closed-island label PNGs and exit before any window or daemon work.
+        // Strict no-op when the variable is absent.
+        SnapshotMode.runIfRequested()
+
         NSApplication.shared.setActivationPolicy(.accessory)
 
         windowManager = WindowManager()
