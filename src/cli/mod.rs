@@ -245,16 +245,11 @@ async fn server(args: ServerArgs) -> Result<(), CliError> {
         daemon::ServerProbe::NotRunning => {}
     }
 
-    if config.accounts.is_empty() {
-        return Err(CliError::Message(
-            "no accounts configured\n\
-             Add one first:\n  \
-             llmux import           Import from Claude Code / teamclaude\n  \
-             llmux login            OAuth login via browser\n  \
-             llmux login --api      Add an API key"
-                .into(),
-        ));
-    }
+    // An empty account list is NOT an error: the server (and its TUI / the
+    // llmux-islands app) come up so the user can add accounts from there
+    // (the `+` button → OAuth login, or `llmux login`). The scheduler simply
+    // has an empty pool until the first account lands — every downstream path
+    // (status/dashboard/islands) already tolerates zero accounts.
 
     // Tracing routing is decided before anything can log. TUI mode: the ONLY
     // output is the channel bridge into the log console pane — nothing may

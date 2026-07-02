@@ -33,6 +33,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         Task { @MainActor in
+            // Make the app self-sufficient: start the local llmux daemon in the
+            // background if it isn't already running, then begin polling it.
+            await DaemonLauncher.ensureRunning()
             IslandUsageModel.shared.start()
         }
     }
