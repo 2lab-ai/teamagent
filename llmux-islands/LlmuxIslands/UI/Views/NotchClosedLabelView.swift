@@ -25,6 +25,10 @@ struct NotchClosedLabelView: View {
     let claudeCount: Int
     /// Σ in-flight sessions over Codex accounts — drives `{m}`.
     let codexCount: Int
+    /// Whether the island is actually on screen (NotchView's `isVisible`). On
+    /// notched Macs the closed pill sits at opacity 0 until hovered — keep the
+    /// 30fps timeline paused then instead of animating an invisible view.
+    let active: Bool
 
     /// Full rainbow revolution takes this long.
     private static let rainbowLoopSeconds: Double = 3.0
@@ -44,7 +48,7 @@ struct NotchClosedLabelView: View {
     private var isAnimating: Bool { claudeCount > 0 || codexCount > 0 }
 
     var body: some View {
-        TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: !isAnimating)) { timeline in
+        TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: !(isAnimating && active))) { timeline in
             let time = timeline.date.timeIntervalSinceReferenceDate
             NotchClosedLabelContent(
                 claudeCount: claudeCount,

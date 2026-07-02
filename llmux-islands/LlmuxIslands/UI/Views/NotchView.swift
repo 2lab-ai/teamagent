@@ -192,7 +192,8 @@ struct NotchView: View {
                 // as the notch; wider content grows the pill to fit.
                 NotchClosedLabelView(
                     claudeCount: usageModel.claudeInFlight,
-                    codexCount: usageModel.codexInFlight
+                    codexCount: usageModel.codexInFlight,
+                    active: isVisible
                 )
                 .frame(minWidth: closedNotchSize.width - 20)
             } else {
