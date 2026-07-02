@@ -55,6 +55,7 @@ private struct PixelizedSnapshot<Content: View>: View {
     let content: () -> Content
 
     @Environment(\.displayScale) private var displayScale
+    @Environment(\.colorScheme) private var colorScheme
     @State private var mosaic: CGImage?
 
     init(size: CGSize, cacheKey: String, content: @escaping () -> Content) {
@@ -64,10 +65,12 @@ private struct PixelizedSnapshot<Content: View>: View {
         // Offscreen snapshot mode renders through `ImageRenderer`, which never
         // pumps `.task` — precompute the mosaic synchronously there so the
         // snapshot PNGs show the real mosaic instead of a blank gap. The live
-        // window path keeps the cached `.task` pipeline below.
+        // window path keeps the cached `.task` pipeline below. `@Environment`
+        // is not readable in init; snapshot mode always composes on the dark
+        // island backdrop (SnapshotMode.write wraps in `.dark`), so pin `.dark`.
         if SnapshotMode.isActive {
             let image = MainActor.assumeIsolated {
-                Self.makeMosaic(size: size, displayScale: SnapshotMode.scale, content: content)
+                Self.makeMosaic(size: size, displayScale: SnapshotMode.scale, colorScheme: .dark, content: content)
             }
             _mosaic = State(initialValue: image)
         }
@@ -85,20 +88,27 @@ private struct PixelizedSnapshot<Content: View>: View {
         .task(id: renderKey) { render() }
     }
 
-    /// Re-render whenever the text, the laid-out size, or the screen scale change.
+    /// Re-render whenever the text, the laid-out size, the screen scale, or
+    /// the color scheme change.
     private var renderKey: String {
-        "\(cacheKey)|\(Int(size.width.rounded()))x\(Int(size.height.rounded()))@\(displayScale)"
+        let scheme = colorScheme == .dark ? "dark" : "light"
+        return "\(cacheKey)|\(Int(size.width.rounded()))x\(Int(size.height.rounded()))@\(displayScale)|\(scheme)"
     }
 
     @MainActor
     private func render() {
-        mosaic = Self.makeMosaic(size: size, displayScale: displayScale, content: content)
+        mosaic = Self.makeMosaic(size: size, displayScale: displayScale, colorScheme: colorScheme, content: content)
     }
 
     @MainActor
-    private static func makeMosaic(size: CGSize, displayScale: CGFloat, content: () -> Content) -> CGImage? {
+    private static func makeMosaic(size: CGSize, displayScale: CGFloat, colorScheme: ColorScheme, content: () -> Content) -> CGImage? {
         guard size.width >= 1, size.height >= 1 else { return nil }
-        let renderer = ImageRenderer(content: content())
+        // `ImageRenderer` renders in a fresh default (light) environment, which
+        // flips adaptive colors like `.secondary` — thread the caller's color
+        // scheme through so the mosaic matches the surrounding rendering (the
+        // token sheet's dark background would otherwise get a near-invisible
+        // dark-gray mosaic).
+        let renderer = ImageRenderer(content: content().environment(\.colorScheme, colorScheme))
         renderer.proposedSize = ProposedViewSize(size)
         renderer.scale = displayScale
         guard let full = renderer.cgImage else { return nil }
