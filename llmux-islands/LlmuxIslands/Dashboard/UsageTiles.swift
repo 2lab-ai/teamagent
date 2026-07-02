@@ -460,6 +460,8 @@ private struct UsageProviderColumn: View {
     let claudeCodeTokenStatus: ClaudeCodeTokenStatus?
     let onSetClaudeCodeTokenEnabled: ((String, Bool) -> Void)?
 
+    @AppStorage(AppSettings.emailAnonymousEnabledKey) private var emailAnonymousEnabled = false
+
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             header
@@ -526,14 +528,21 @@ private struct UsageProviderColumn: View {
                 }
             }
 
-            Text(headerTitle)
-                .font(.system(size: headerTitleFontSize, weight: .semibold, design: .monospaced))
-                .foregroundColor(headerTitleColor)
-                .lineLimit(1)
-                .truncationMode(.middle)
-                .minimumScaleFactor(0.35)
-                .allowsTightening(true)
-                .frame(maxWidth: .infinity, alignment: .leading)
+            // The header title is the account email whenever one is known —
+            // mosaic it when "Email anonymous" is on (todo item 3).
+            EmailPixelized(
+                isActive: emailAnonymousEnabled && normalizedEmail != nil,
+                cacheKey: headerTitle
+            ) {
+                Text(headerTitle)
+                    .font(.system(size: headerTitleFontSize, weight: .semibold, design: .monospaced))
+                    .foregroundColor(headerTitleColor)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .minimumScaleFactor(0.35)
+                    .allowsTightening(true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
         }
     }
 
@@ -1018,6 +1027,8 @@ private struct ClaudeCodeTokenSheet: View {
     let onClear: () -> Void
     let onSave: () -> Void
 
+    @AppStorage(AppSettings.emailAnonymousEnabledKey) private var emailAnonymousEnabled = false
+
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(spacing: 10) {
@@ -1028,11 +1039,16 @@ private struct ClaudeCodeTokenSheet: View {
             }
 
             VStack(alignment: .leading, spacing: 6) {
-                Text(emailLine)
-                    .font(.system(size: 12, weight: .semibold, design: .monospaced))
-                    .foregroundColor(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
+                EmailPixelized(
+                    isActive: emailAnonymousEnabled && hasEmail,
+                    cacheKey: emailLine
+                ) {
+                    Text(emailLine)
+                        .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                        .foregroundColor(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
 
                 Text(displayAccountId)
                     .font(.system(size: 11, weight: .semibold, design: .monospaced))
@@ -1064,6 +1080,11 @@ private struct ClaudeCodeTokenSheet: View {
 
     private var emailLine: String {
         email?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmptyOrNil ?? "--"
+    }
+
+    /// Only mosaic a real email — the "--" placeholder stays readable.
+    private var hasEmail: Bool {
+        email?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmptyOrNil != nil
     }
 }
 

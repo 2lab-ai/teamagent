@@ -18,6 +18,7 @@ struct NotchMenuView: View {
     @ObservedObject private var screenSelector = ScreenSelector.shared
     @ObservedObject private var soundSelector = SoundSelector.shared
     @State private var launchAtLogin: Bool = false
+    @AppStorage(AppSettings.emailAnonymousEnabledKey) private var emailAnonymousEnabled = false
 
     static var appVersion: String {
         let v = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.0"
@@ -39,6 +40,16 @@ struct NotchMenuView: View {
             // Appearance settings
             ScreenPickerRow(screenSelector: screenSelector)
             SoundPickerRow(soundSelector: soundSelector)
+
+            // Pixelize emails in the Usage area (todo item 3: "email anonymous").
+            MenuToggleRow(
+                icon: "eye.slash",
+                label: "Email anonymous",
+                isOn: emailAnonymousEnabled
+            ) {
+                emailAnonymousEnabled.toggle()
+            }
+
             LlmuxConnectionSection()
 
             Divider()
