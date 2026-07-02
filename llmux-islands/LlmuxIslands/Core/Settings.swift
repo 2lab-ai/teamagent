@@ -39,6 +39,7 @@ enum AppSettings {
     private enum Keys {
         static let notificationSound = "notificationSound"
         static let usageResetAlertsEnabled = "usageResetAlertsEnabled"
+        static let emailAnonymousEnabled = "emailAnonymousEnabled"
     }
 
     // MARK: - Notification Sound
@@ -69,6 +70,23 @@ enum AppSettings {
         }
         set {
             defaults.set(newValue, forKey: Keys.usageResetAlertsEnabled)
+        }
+    }
+
+    // MARK: - Email Anonymous
+
+    /// UserDefaults key for the email-anonymous setting, exposed so SwiftUI
+    /// views can observe it live via `@AppStorage`.
+    static let emailAnonymousEnabledKey = Keys.emailAnonymousEnabled
+
+    /// Whether emails in the Usage area are mosaic-pixelized to illegibility.
+    /// Defaults to off — emails render as-is.
+    static var emailAnonymousEnabled: Bool {
+        get {
+            defaults.bool(forKey: Keys.emailAnonymousEnabled)
+        }
+        set {
+            defaults.set(newValue, forKey: Keys.emailAnonymousEnabled)
         }
     }
 }
