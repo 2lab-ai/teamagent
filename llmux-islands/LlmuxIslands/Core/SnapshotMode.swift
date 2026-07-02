@@ -15,6 +15,14 @@
 //  p0..p3 = phase 0 / 0.25 / 0.5 / 0.75 of the jump cycle (the rainbow hue
 //  advances with the same phases).
 //
+//  Wall-clock mode: setting `LLMUX_ISLANDS_SNAPSHOT_T=<seconds>` additionally
+//  renders ONE frame at that absolute time instead of the 4 normalized phases,
+//  mapped through the app's real count→period function (`jumpOffset(time:)` /
+//  `rainbowHue(time:)` — the phase is computed inside jumpPeriod, never
+//  precomputed here), so jump SPEED scaling across counts is exercisable:
+//  the same t lands on different cycle phases for different counts. Output:
+//  `t{t*100 as %03d}-c{claude}.png` (e.g. t=0.3, claude=3 → `t030-c3.png`).
+//
 
 import AppKit
 import SwiftUI
@@ -25,15 +33,18 @@ enum SnapshotMode {
     static let phases: [Double] = [0, 0.25, 0.5, 0.75]
 
     enum SnapshotError: Error, CustomStringConvertible {
-        case renderFailed(phase: Double)
+        case renderFailed(String)
         case pngEncodeFailed(String)
+        case invalidWallClock(String)
 
         var description: String {
             switch self {
-            case .renderFailed(let phase):
-                return "ImageRenderer produced no image at phase \(phase)"
+            case .renderFailed(let file):
+                return "ImageRenderer produced no image for \(file)"
             case .pngEncodeFailed(let file):
                 return "PNG encoding failed for \(file)"
+            case .invalidWallClock(let raw):
+                return "LLMUX_ISLANDS_SNAPSHOT_T must be a non-negative number of seconds, got \"\(raw)\""
             }
         }
     }
@@ -59,26 +70,42 @@ enum SnapshotMode {
         }
     }
 
-    /// Render every phase for the current (env-forced) counts. Returns the
-    /// absolute paths written, in phase order.
+    /// Render the requested frames for the current (env-forced) counts and
+    /// return the absolute paths written: one wall-clock frame when
+    /// `LLMUX_ISLANDS_SNAPSHOT_T` is set, else the 4 fixed phases.
     static func renderAll(into dir: URL) throws -> [String] {
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let claude = DemoMode.forcedInFlight?.claude ?? 0
         let codex = DemoMode.forcedInFlight?.codex ?? 0
 
+        if let raw = ProcessInfo.processInfo.environment["LLMUX_ISLANDS_SNAPSHOT_T"], !raw.isEmpty {
+            guard let t = TimeInterval(raw), t >= 0, t.isFinite else {
+                throw SnapshotError.invalidWallClock(raw)
+            }
+            let name = String(format: "t%03d-c%d.png", Int((t * 100).rounded()), claude)
+            let url = dir.appendingPathComponent(name)
+            let view = ClosedIslandSnapshotView(claudeCount: claude, codexCount: codex, clock: .wallClock(t))
+            try render(view, to: url)
+            return [url.path]
+        }
+
         var written: [String] = []
         for (index, phase) in phases.enumerated() {
-            let view = ClosedIslandSnapshotView(claudeCount: claude, codexCount: codex, phase: phase)
-            let renderer = ImageRenderer(content: view)
-            renderer.scale = 2
-            guard let cgImage = renderer.cgImage else {
-                throw SnapshotError.renderFailed(phase: phase)
-            }
             let url = dir.appendingPathComponent("label-c\(claude)x\(codex)-p\(index).png")
-            try writePNG(cgImage, to: url)
+            let view = ClosedIslandSnapshotView(claudeCount: claude, codexCount: codex, clock: .phase(phase))
+            try render(view, to: url)
             written.append(url.path)
         }
         return written
+    }
+
+    private static func render(_ view: ClosedIslandSnapshotView, to url: URL) throws {
+        let renderer = ImageRenderer(content: view)
+        renderer.scale = 2
+        guard let cgImage = renderer.cgImage else {
+            throw SnapshotError.renderFailed(url.lastPathComponent)
+        }
+        try writePNG(cgImage, to: url)
     }
 
     private static func writePNG(_ image: CGImage, to url: URL) throws {
@@ -97,21 +124,47 @@ enum SnapshotMode {
 /// NotchView itself, which requires a live NotchViewModel/window — see the
 /// fidelity notes in the PR.
 struct ClosedIslandSnapshotView: View {
+    /// How the animation instant is specified.
+    enum Clock {
+        /// Fixed 0..<1 position within the jump cycle (hue uses the same phase).
+        case phase(Double)
+        /// Absolute wall-clock seconds, mapped through the app's real
+        /// count→period function — exercises jumpPeriod's speed scaling/clamp.
+        case wallClock(TimeInterval)
+    }
+
     let claudeCount: Int
     let codexCount: Int
-    /// 0..<1 position within the jump cycle; the rainbow hue uses the same phase.
-    let phase: Double
+    let clock: Clock
 
     /// Non-notch fallback island size (Ext+NSScreen.notchSize fallback).
     private static let closedNotchSize = CGSize(width: 224, height: 38)
+
+    private var jumpOffset: CGFloat {
+        switch clock {
+        case .phase(let phase):
+            return NotchClosedLabelView.jumpOffset(phase: phase, claudeSessions: claudeCount)
+        case .wallClock(let t):
+            return NotchClosedLabelView.jumpOffset(time: t, claudeSessions: claudeCount)
+        }
+    }
+
+    private func hue(seed: Double) -> Double {
+        switch clock {
+        case .phase(let phase):
+            return NotchClosedLabelView.rainbowHue(phase: phase, seed: seed)
+        case .wallClock(let t):
+            return NotchClosedLabelView.rainbowHue(time: t, seed: seed)
+        }
+    }
 
     var body: some View {
         NotchClosedLabelContent(
             claudeCount: claudeCount,
             codexCount: codexCount,
-            jumpOffset: NotchClosedLabelView.jumpOffset(phase: phase, claudeSessions: claudeCount),
-            claudeHue: NotchClosedLabelView.rainbowHue(phase: phase, seed: NotchClosedLabelView.claudeHueSeed),
-            codexHue: NotchClosedLabelView.rainbowHue(phase: phase, seed: NotchClosedLabelView.codexHueSeed)
+            jumpOffset: jumpOffset,
+            claudeHue: hue(seed: NotchClosedLabelView.claudeHueSeed),
+            codexHue: hue(seed: NotchClosedLabelView.codexHueSeed)
         )
         .frame(minWidth: Self.closedNotchSize.width - 20)
         .frame(height: max(24, Self.closedNotchSize.height))
