@@ -20,6 +20,7 @@ private let cornerRadiusInsets = (
 struct NotchView: View {
     @ObservedObject var viewModel: NotchViewModel
     @StateObject private var activityCoordinator = NotchActivityCoordinator.shared
+    @ObservedObject private var usageModel = IslandUsageModel.shared
     @State private var isVisible: Bool = false
     @State private var isHovering: Bool = false
     @State private var isBouncing: Bool = false
@@ -186,9 +187,14 @@ struct NotchView: View {
             if viewModel.status == .opened {
                 openedHeaderContent
             } else if !showClosedActivity {
-                Rectangle()
-                    .fill(.clear)
-                    .frame(width: closedNotchSize.width - 20)
+                // Closed island: render the info label instead of a black box
+                // (todo.md items 1–2). minWidth keeps the pill at least as wide
+                // as the notch; wider content grows the pill to fit.
+                NotchClosedLabelView(
+                    claudeCount: usageModel.claudeInFlight,
+                    codexCount: usageModel.codexInFlight
+                )
+                .frame(minWidth: closedNotchSize.width - 20)
             } else {
                 Rectangle()
                     .fill(.black)

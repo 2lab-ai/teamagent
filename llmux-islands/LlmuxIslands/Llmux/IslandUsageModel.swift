@@ -16,6 +16,13 @@ final class IslandUsageModel: ObservableObject {
     @Published var lastError: String?
     @Published var login: LoginFlow?
 
+    /// Per-provider Σ of `in_flight` over the daemon's accounts, feeding the
+    /// closed-island label (`[claude]{n} [codex]{m}`) and the mascot jump speed.
+    /// Seeded from `DemoMode.forcedInFlight` so a forced count shows before the
+    /// first poll completes (and even when the daemon is unreachable).
+    @Published var claudeInFlight: Int = DemoMode.forcedInFlight?.claude ?? 0
+    @Published var codexInFlight: Int = DemoMode.forcedInFlight?.codex ?? 0
+
     enum Connection: Equatable {
         case connecting
         case online
@@ -52,10 +59,35 @@ final class IslandUsageModel: ObservableObject {
                 let tile = Self.tile(from: account)
                 return DemoMode.isActive ? Self.demoMasked(tile, index: index) : tile
             }
+            let counts = Self.inFlightCounts(status.accounts)
+            claudeInFlight = DemoMode.forcedInFlight?.claude ?? counts.claude
+            codexInFlight = DemoMode.forcedInFlight?.codex ?? counts.codex
             connection = .online
         } catch {
             connection = .offline(error.localizedDescription)
         }
+    }
+
+    /// Σ `in_flight` per provider. Anything that isn't codex counts as claude,
+    /// mirroring the provider split used for the usage tiles.
+    static func inFlightCounts(_ accounts: [LlmuxAccountRecord]) -> (claude: Int, codex: Int) {
+        var claude = 0
+        var codex = 0
+        for account in accounts {
+            let sessions = account.inFlight ?? 0
+            if Self.provider(of: account) == .codex {
+                codex += sessions
+            } else {
+                claude += sessions
+            }
+        }
+        return (claude, codex)
+    }
+
+    /// The provider an llmux account record maps onto (single source of the
+    /// claude/codex split — used by both the tiles and the in-flight sums).
+    static func provider(of a: LlmuxAccountRecord) -> UsageProvider {
+        (a.group?.lowercased() == "codex" || a.type.lowercased() == "codex") ? .codex : .claude
     }
 
     /// Replace an account's real email/label with a stable fake so a public demo
@@ -79,8 +111,7 @@ final class IslandUsageModel: ObservableObject {
 
     /// Map one llmux account record onto the agent-island tile model.
     static func tile(from a: LlmuxAccountRecord) -> UsageAccountTile {
-        let provider: UsageProvider =
-            (a.group?.lowercased() == "codex" || a.type.lowercased() == "codex") ? .codex : .claude
+        let provider = Self.provider(of: a)
 
         let email: String? = {
             if let colon = a.name.firstIndex(of: ":") {
