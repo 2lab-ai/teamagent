@@ -57,6 +57,22 @@ private struct PixelizedSnapshot<Content: View>: View {
     @Environment(\.displayScale) private var displayScale
     @State private var mosaic: CGImage?
 
+    init(size: CGSize, cacheKey: String, content: @escaping () -> Content) {
+        self.size = size
+        self.cacheKey = cacheKey
+        self.content = content
+        // Offscreen snapshot mode renders through `ImageRenderer`, which never
+        // pumps `.task` — precompute the mosaic synchronously there so the
+        // snapshot PNGs show the real mosaic instead of a blank gap. The live
+        // window path keeps the cached `.task` pipeline below.
+        if SnapshotMode.isActive {
+            let image = MainActor.assumeIsolated {
+                Self.makeMosaic(size: size, displayScale: SnapshotMode.scale, content: content)
+            }
+            _mosaic = State(initialValue: image)
+        }
+    }
+
     var body: some View {
         ZStack {
             if let mosaic {
@@ -76,18 +92,23 @@ private struct PixelizedSnapshot<Content: View>: View {
 
     @MainActor
     private func render() {
-        guard size.width >= 1, size.height >= 1 else {
-            mosaic = nil
-            return
-        }
+        mosaic = Self.makeMosaic(size: size, displayScale: displayScale, content: content)
+    }
+
+    @MainActor
+    private static func makeMosaic(size: CGSize, displayScale: CGFloat, content: () -> Content) -> CGImage? {
+        guard size.width >= 1, size.height >= 1 else { return nil }
         let renderer = ImageRenderer(content: content())
         renderer.proposedSize = ProposedViewSize(size)
         renderer.scale = displayScale
-        guard let full = renderer.cgImage else {
-            mosaic = nil
-            return
-        }
-        mosaic = Self.downsample(full, to: size, blockSize: EmailPixelize.blockSize)
+        guard let full = renderer.cgImage else { return nil }
+        guard let small = downsample(full, to: size, blockSize: EmailPixelize.blockSize) else { return nil }
+        // Blow the tiny image back up to full pixel size with nearest-neighbor
+        // HERE (not at display time): view-level `.interpolation(.none)` is not
+        // honored on every render path (offscreen NSHostingView snapshots smooth
+        // it into a blur), and a pre-upscaled bitmap draws 1:1 with hard block
+        // edges everywhere.
+        return upscale(small, toPixelWidth: full.width, height: full.height)
     }
 
     /// Average the full-resolution snapshot down to one pixel per
@@ -96,6 +117,15 @@ private struct PixelizedSnapshot<Content: View>: View {
         let block = max(1, blockSize)
         let width = max(1, Int((pointSize.width / block).rounded(.up)))
         let height = max(1, Int((pointSize.height / block).rounded(.up)))
+        return redraw(image, width: width, height: height, quality: .high)
+    }
+
+    /// Nearest-neighbor upscale of the mosaic back to the snapshot's pixel size.
+    private static func upscale(_ image: CGImage, toPixelWidth width: Int, height: Int) -> CGImage? {
+        redraw(image, width: max(1, width), height: max(1, height), quality: .none)
+    }
+
+    private static func redraw(_ image: CGImage, width: Int, height: Int, quality: CGInterpolationQuality) -> CGImage? {
         guard let context = CGContext(
             data: nil,
             width: width,
@@ -105,7 +135,7 @@ private struct PixelizedSnapshot<Content: View>: View {
             space: CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB(),
             bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
         ) else { return nil }
-        context.interpolationQuality = .high
+        context.interpolationQuality = quality
         context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
         return context.makeImage()
     }
